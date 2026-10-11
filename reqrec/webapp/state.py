@@ -562,6 +562,18 @@ class AppState:
         self.proxy_backup: Optional[dict] = None
         self.proxy_server: Optional[str] = None
         self.record_append = False
+        #: ``browser`` of the running recording (``"iehost"`` / ``"none"``), ``None`` when idle.
+        self.record_browser_kind: Optional[str] = None
+        self.record_https_passthrough = True
+        #: Screen that started the running recording: ``"easy"`` (かんたん画面) or ``"advanced"``
+        #: (詳細設定); ``None`` when idle.  Only an easy-started recording may be stopped automatically
+        #: by the easy screen when its recording browser is closed (survives a page reload).
+        self.record_origin: Optional[str] = None
+        #: Last ``iehost.launch`` failure of this session (e.g. the exe blocked by AppLocker), for the page.
+        self.iehost_error: Optional[str] = None
+        #: The in-app recording browser (``reqrec.iehost.BrowserProcess``) of the current / last
+        #: recording started with ``browser: "iehost"`` (DESIGN.md §13.12); ``None`` otherwise.
+        self.browser: Optional[Any] = None
         self.last_message: Optional[str] = None
         self._atexit_registered = False
         self.ensure_dirs()
@@ -680,9 +692,27 @@ class AppState:
         atexit.register(_restore_at_exit)
         self._atexit_registered = True
 
+    # ------------------------------------------------------------------ recording browser
+
+    def close_browser(self, timeout: float = 5.0) -> Optional[int]:
+        """Close the in-app recording browser (if any) and forget it; returns its exit code.
+
+        Never raises: a browser that cannot be closed is still dropped from the state so the GUI
+        is not stuck with it.  ``None`` when there was no browser or it did not exit in time.
+        """
+        browser = self.browser
+        if browser is None:
+            return None
+        self.browser = None
+        try:
+            return browser.close(timeout=timeout)
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------ shutdown
 
     def close(self) -> None:
+        self.close_browser()
         self.recorder.close()
         self.runner.close()
 
@@ -700,3 +730,30 @@ def _plain_meta(meta: dict[str, Any]) -> dict[str, Any]:
         else:
             out[k] = str(v)
     return out
+
+
+# --------------------------------------------------------------------------- free port (かんたんモード)
+
+def find_free_port(host: str = "127.0.0.1", preferred: int = 8080, avoid: Iterable[int] = (), attempts: int = 40) -> int:
+    """A TCP port the recording proxy can bind: ``preferred`` first, then the following ports,
+    finally one chosen by the OS.  Ports in ``avoid`` (the GUI's own) are skipped.
+
+    The easy mode uses this so the user never has to know what a port is.
+    """
+    import socket
+
+    skip = {int(p) for p in avoid}
+    bind_host = "127.0.0.1" if host in ("0.0.0.0", "", "*") else host
+    family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+    for port in range(int(preferred), int(preferred) + max(1, int(attempts))):
+        if port in skip or not 1 <= port <= 65535:
+            continue
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind((bind_host, port))
+            except OSError:
+                continue
+            return port
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.bind((bind_host, 0))
+        return int(sock.getsockname()[1])

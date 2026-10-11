@@ -488,7 +488,10 @@ class TestStopChild:
         expired = subprocess.TimeoutExpired(cmd="mitmdump", timeout=0.01)
         proc = _FakeProc([expired, 0])
         assert stop_child(proc, grace=0.01) == 0
-        assert not proc.terminated and not proc.killed
+        if os.name == "nt":  # Windows has no reliable Ctrl+C for a child: terminate() is the "SIGINT" step
+            assert proc.terminated and not proc.killed
+        else:
+            assert proc.signals == [signal.SIGINT] and not proc.terminated and not proc.killed
 
     def test_second_ctrl_c_kills(self, monkeypatch):
         proc = _FakeProc([KeyboardInterrupt(), 137])

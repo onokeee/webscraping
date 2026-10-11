@@ -582,3 +582,221 @@ HAR: DevTools 設定「ポップアップに対して DevTools を自動的に�
 
 Nobody edits `model.py`, `util.py`, `pyproject.toml` or another owner's files. No `git` commands.
 `tests/test_integration.py` and `tests/e2e/**` belong to the integrator.
+
+## 13.11 かんたんモード (easy mode)  (reqrec/webapp/, reqrec/webapp/launch.py)
+
+Target users are factory-floor staff who must not have to know what a port, a proxy or a CA
+certificate is.  The GUI therefore opens in **easy mode** by default: one screen with
+**[記録をはじめる] → operate the site in the browser → [記録をおわる]**, and everything else is
+automatic.  The five detailed panels of §13.6 stay intact behind the **[詳細設定を表示]** toggle
+in the top bar (`body.easy-mode` hides the nav + panels via CSS; the choice is kept in
+`localStorage["reqrec.mode"]`).  No new state lives in the browser: the easy screen is a thin
+client over the existing API plus the three endpoints below, and it keeps the advanced panels in
+sync (`Record.render`, `Load.applySummary`, `Steps.replan`, `Code.renderSecrets`, `Run`).
+
+**Flow (static/app.js, module `Easy`):**
+1. **start** — `POST /api/record/start {port: "auto", hosts: [], listen_host: "127.0.0.1",
+   set_system_proxy: false, append: false, origin: "easy", browser: "iehost" (Windows with the recording browser) |
+   "none" (other OSes), start_url: <address box>, https_passthrough: <iehost>, emulation: "keep"}`.
+   `"auto"` makes the server pick a free port with `state.find_free_port(listen_host,
+   preferred=8080, avoid=(gui port,))`; the response carries `port`, `auto_port`, `browser_kind`,
+   `browser` and `warnings`.  With `browser: "iehost"` the server waits for the proxy and opens the
+   in-app recording browser itself (§13.12): no certificate, no system proxy, no Edge.
+   `emulation: "keep"` = the easy screen never touches 表示モード (only 詳細設定 does).
+2. **no automatic fallback on Windows** — when the recording browser is unavailable (`data-iehost-
+   available="false"`) the easy screen does **not** change the system proxy or install the CA; it
+   explains the reason and points to 詳細設定 → 記録方式 「自分でブラウザを設定する」.  A launch
+   failure at run time (e.g. the exe blocked by AppLocker) is shown with guidance for the
+   administrator (`python -m reqrec.iehost build` + allow that folder) and kept in
+   `/api/state` → `iehost.last_error` for the readiness list.
+3. **browser (other OSes)** — `POST /api/browser/open {url}` opens the default browser (Edge when
+   found: `launch.find_edge`) at the optional address (`launch.validate_url`: `http(s)://` only,
+   bare host names and `host:port` get `http://`, other schemes such as `javascript:` are
+   rejected); the user sets the proxy shown on screen by hand.  `{browser: "iehost"}` re-opens the
+   recording browser instead (only for an iehost recording).
+4. **recording** — live count from the `Record` poller (`Record.subscribe`), [記録をおわる],
+   [ブラウザをもう一度開く], [やめる] (`POST /api/record/stop {discard: true}`: nothing is loaded and
+   the file is deleted).  Closing the recording browser stops automatically (once it was seen
+   running; exit code 4 = its proxy could not be set → discard + message).  Switching back from
+   詳細設定 re-reads `/api/record/status` so a recording started there is followed.
+5. **stop** — `POST /api/record/stop {}` (the append choice stored at start applies; loads the recording, restores the proxy;
+   no recording file at all = 「何も記録されませんでした」 400 with `empty: true`),
+   then **`POST /api/easy/build`**: `build_plan` with the current `PlanOptions` → `generate` →
+   save to `scripts/<scrape_<host>_YYYYmmdd_HHMM>.py` (or `{"name": ...}`), returns
+   `{name, path, download_url, steps, steps_view: [{index, method, url, loop, extracts}],
+   final_step_index, final_url, final_method, flows_total, warnings, secrets, auth, summary,
+   code, sources}`.  A plan with no steps is a 400 with a plain-language explanation.
+6. **done** — file name / path / step list / warnings (common English warnings are shown in
+   Japanese server-side by `routes.warning_message` → `warning_details` / `note_details`), [ダウンロード], [保存先フォルダを開く] (`POST /api/folder/open
+   {folder: "scripts"|"outputs"|"recordings"|"uploads"|"workdir"}` → `launch.open_folder`:
+   `os.startfile` / `open` / `xdg-open`; anything else is a 400), [試しに実行する] (env inputs
+   for `secrets`, `Run.start` / `Run.stop`, output console, a plain-language hint for the common
+   failures via `errorHint`, [結果をファイルに保存]), [もう一度記録する].
+   A recording loaded from the advanced panels (DevTools HAR) can be built from the idle screen
+   too ([読み込み済みの記録からスクリプトを作る]).
+
+**Security:** the new endpoints are `POST` and therefore covered by the token / Host / Origin
+hook of `create_app`.  `/api/browser/open` only ever launches a URL that passed `validate_url`;
+`/api/folder/open` only opens the fixed work-folder subdirectories.
+
+**Tests:** `tests/test_webapp_easy.py` — page markup, `find_free_port`, `port: "auto"` with a
+fake recorder, `/api/easy/build` on `login_flow_chrome.har` (file written, secrets reported,
+`last_script` updated, unsafe names rejected, token required), `/api/browser/open` and
+`/api/folder/open` with the launchers monkeypatched, and the `launch` helpers with injected
+fakes (Edge discovery through paths / registry, URL validation, fallbacks).
+
+## 13.12 In-app IE-engine recording browser  (reqrec/iehost/, reqrec/webapp/)
+
+**Why.** Factory PCs commonly use Edge IE mode for legacy intranet sites, have a PAC / auto-detect
+proxy configuration, and forbid installing certificates or changing Internet Options.  Edge IE mode
+only honours the *system* proxy, and on such PCs the Windows proxy auto-configuration wins over a
+manually written proxy, so the §13.6 flow records nothing.  Instead reqrec ships a tiny browser
+that hosts **the same engine** (the WebBrowser control: ieframe / MSHTML / Trident 7) in its own
+process and routes **only that process** through the recorder.  Nothing in Windows, Internet
+Options or Edge changes, and no certificate is needed because only plain `http://` is recorded.
+
+**Proven facts (Windows 11, verified on the development PC; keep them):**
+* Per-process proxy: `InternetSetOptionA(NULL, INTERNET_OPTION_PROXY=38, INTERNET_PROXY_INFOA{3, "127.0.0.1:PORT", ""})`
+  with **ANSI** strings, before any WebBrowser control exists.  The W variant (and
+  `UrlMkSetSessionOption` with UTF-16 strings) returns TRUE but installs a bogus proxy.  It
+  overrides the user's auto-detect / PAC for this process only; the registry is untouched
+  (checked by export before/after).  `INTERNET_OPTION_PER_CONNECTION_OPTION` with a NULL handle
+  writes the registry and must never be used.
+* Bypass list is **empty**: `<local>` would exclude dotless intranet hosts (`http://kanri/`).
+  WinINet always bypasses the proxy for literal loopback addresses; tests therefore use
+  `127.0.0.1.nip.io` (or `--bypass "<-loopback>"` offline).
+* New windows: a `[ComImport]` `DWebBrowserEvents2` sink (`NewWindow3` 273, `NewWindow2` 251)
+  answers with a fresh, handle-created control's `ActiveXInstance` in `ppDisp`; the engine then
+  navigates it itself, so `window.opener`, `window.name`, `<form target=_blank>` POST bodies and the
+  session survive.  `showModalDialog` / `showModelessDialog` (`dialogArguments`, `returnValue`)
+  work in-process without host code.  All of it goes through the per-process proxy.
+* `window.close()` arrives as `OLECMDID_CLOSE` (45) at the control site's `IOleCommandTarget`
+  (`CreateWebBrowserSiteBase` override), **not** as `DWebBrowserEvents2.WindowClosing` (kept as a
+  fallback).  Closing the last tab opens a fresh `about:blank` tab.
+* Without `FEATURE_BROWSER_EMULATION` the control renders in IE7 mode and sends an `MSIE 7.0 ...
+  Trident/7.0` user agent (like IE mode's Compatibility View for intranet sites); Enterprise Mode
+  is not available to hosted controls.
+* `INTERNET_OPTION_END_BROWSER_SESSION` + `INTERNET_SUPPRESS_COOKIE_PERSIST` at start-up: every
+  recording starts from an empty session, so the login is always recorded.
+
+**`RecBrowser.cs`** (C# 5, compiled by `iehost.build_command`: `csc -nologo -target:winexe
+-platform:x86 -r:System.Windows.Forms.dll -r:System.Drawing.dll` — always 32-bit, like IE mode's content process, so 32-bit in-process ActiveX controls load; the former rule was x86 only when only the 32-bit
+`Framework` compiler exists, i.e. on 32-bit Windows): command line `--proxy HOST:PORT [--bypass ""]
+[--url URL] [--title T] [--log PATH] [--https] [--selftest] [--seconds N]`.  Window title
+`<title> — 記録中`; toolbar 戻る / 進む / 更新 / address box / タブを閉じる / red **■ 記録をおわる**;
+tabs for popups; status strip that says only `http://` is recorded and announces an `https://`
+page / download as 「記録されません」 (unless `--https`: the recorder intercepts HTTPS).  Not
+`Silent` (`ScriptErrorsSuppressed = false`): Silent would also hide the 「Windows セキュリティ」
+credential prompt of Basic / Windows authentication; only `OLECMDID_SHOWSCRIPTERROR` (40, group
+`CGID_DocHostCommandHandler`) is answered at the site (no dialog, keep running scripts).  Exit
+codes: 0 normal close (X, 記録をおわる, WM_CLOSE), 2 bad arguments (e.g. no `--proxy`), 3
+`--seconds` guard, 4 the per-process proxy could not be set (a message box explains; nothing would
+be recorded).  Log lines `HH:mm:ss.fff text` (UTF-8, no BOM, auto-flushed); one of the first lines
+is `proxy <server> -> ok|FAILED`.  No registry access.
+
+**`reqrec/iehost/__init__.py`** (importable everywhere; injectable `exists` / `run` / `popen` /
+`winreg`): `csc_path`, `availability(workdir) -> {available, reason, exe, built, source, csc,
+prebuilt}`, `exe_path(workdir) = <workdir>/bin/RecBrowser.exe`, `ensure_built` (rebuild when the
+exe is missing, the digest in `bin/RecBrowser.cs.sha256` differs (`_build_digest`: SHA-256 of the source **plus the build settings**, e.g. `platform=x86`, so changing build options alone rebuilds once), or `force`; a prebuilt exe next
+to the source is copied when there is no `csc.exe`; a **shipped** exe — built next to the source
+by `python -m reqrec.iehost build` with `RecBrowser.exe.sha256` matching the source — is run in
+place, so an AppLocker / SRP policy only has to allow the distribution folder), `launch(workdir,
+proxy, url, title, https_recorded) -> BrowserProcess` (log under
+`<workdir>/logs/recbrowser_<timestamp>.log`; job object `KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK`:
+the browser dies with the GUI, programs it starts such as Excel do not), `BrowserProcess.close()`
+(`taskkill /PID` = WM_CLOSE → wait → `terminate` → `kill`; releases the job handle),
+`EMULATION_LEVELS = {default: None,
+ie8: 8000, ie11: 11000, ie11_force: 11001}`, `set_emulation` / `get_emulation` (the only registry
+value reqrec ever writes: `HKCU\Software\Microsoft\Internet Explorer\Main\FeatureControl\
+FEATURE_BROWSER_EMULATION\RecBrowser.exe`, and only for a non-default 表示モード; `default`
+deletes it, after a read-only check; `record_start` also accepts `emulation: "keep"` = no registry
+access at all, which the easy screen always sends; `/api/state` → `iehost.emulation` reports the
+current preset so the 詳細設定 select starts there).
+
+**GUI / API.** `POST /api/record/start` takes `browser: "iehost"|"none"`, `start_url`,
+`https_passthrough` (default true for iehost → mitmdump `--ignore-hosts .*`: in regular proxy mode mitmproxy checks `ignore_hosts` only for CONNECT tunnels, so every HTTPS port is passed through untouched while plain `http://` is recorded — verified with mitmdump 12.2.3) and `emulation`;
+`browser: "iehost"` requires Windows and `availability()["available"]`, refuses
+`set_system_proxy`, starts the recorder, then `set_emulation` and `launch`; any failure stops the
+recorder.  `GET /api/record/status` reports `browser: {kind, running, pid, exit_code}`;
+`POST /api/record/stop` closes the browser **before** the recorder and reports
+`browser_exit_code`; `POST /api/browser/open {browser: "iehost"}` relaunches it against the running
+recorder.  `AppState.browser` / `close_browser()`; `AppState.close()` closes it on exit.  The page
+gets `data-iehost-available` / `data-iehost-reason`.  `record_start` waits (without the lock, up
+to `PROXY_READY_TIMEOUT` = 20 s) for `RecorderManager.wait_until_listening()` before opening the
+browser, re-checks under the lock that the same recording is still running, and remembers the mode
+in `AppState.record_browser_kind` (exposed as `browser_kind` / `record_browser_kind`; `/api/browser/open`
+refuses to open the recording browser for a non-iehost recording).  For 表示モード 既定 nothing is
+opened for writing unless a leftover value exists, and failing to remove it is only a warning.
+`POST /api/record/stop {discard: true}` (easy screen [やめる]) closes and stops everything but loads
+nothing and deletes the half-made file.  `iehost.launch` puts the browser in a Windows job object
+with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`kill_on_close_job`), so it dies with the GUI process.
+The easy screen (§13.11) uses the recording browser whenever it is available (no certificate step,
+no system proxy) and stops automatically when the recording browser is closed; on Windows without
+the recording browser it does **not** fall back to changing the system proxy / installing the CA —
+it explains why and points to 詳細設定, where 記録方式, 最初に開くアドレス, 表示モード and the
+HTTPS pass-through switch are exposed.
+
+**Tests.** `tests/test_iehost.py` (pure logic with fakes), `tests/test_webapp_iehost.py` (API with a
+fake recorder and a fake `BrowserProcess`), `tests/test_iehost_engine.py` (opt-in real engine:
+`REQREC_IEHOST_TESTS=1`; compiles the host, runs the fixture site `tests/iehost_fixtures/testsite.py`
+and mitmdump on free ports, runs `--selftest`, checks the recording and that the registry is
+unchanged).
+
+## 13.13 Factory scenario findings (deps.py, plan.py, codegen.py, webapp)
+
+End-to-end runs of a realistic legacy intranet (`tests/iehost_fixtures/factory_site.py`: Shift_JIS
+WebForms, session id rotated at login, one-time `__VIEWSTATE` / `__EVENTVALIDATION`, a per-session
+URL key in `window.open`, autopostback dropdowns, a `showModalDialog` picker, grid paging, an Excel
+export with a percent-encoded Japanese file name) recorded in the recording browser and replayed
+against a fresh server led to these rules:
+
+* **Route-like path segments** (`deps.is_route_like` / `is_structural_path_segment`): words, page /
+  file names and screen ids (`Login.aspx`, `orders`, `SC0010.aspx`, `KJ010Search.aspx`) stay trace
+  candidates, but only exact header / JSON / `<input>` / `<meta>` / cookie matches are accepted for
+  them (never `html_attr`, `html_text`, regex or URL patterns — the URL must not depend on
+  `action="Login.aspx"` markup), and they never become Constants.  An all-uppercase session key in the
+  path (`/s/QZVBNMWRTYPXSDFKHJ/items`) is still traced to the JSON leaf that produced it.
+* **Random letters** (`deps.looks_random_letters`): letters-only values (parts split at `-` / `_`, the
+  stem before one extension) of ≥ 12 characters are judged by their case runs: identifiers with
+  acronyms anywhere (`txtTokuisakiCD`, `hdnSearchKEY`, `getXMLHttpRequest`, `getElementById`) are
+  words; irregular mixed case (`xBBHOHpXYZgFKyNZpuWy`, `xBBHOH-pXYZgFKyNZpuWy`) is a token (dynamic-
+  looking, not route-like, may be traced by regex).  Measured on 20 000 random tokens: 96 % of 16–24
+  character letter tokens and 96 % of digit-free base64url tokens are detected.
+* **Referer** (`plan._referer_with_fresh_values`): the recorded `Referer` is split into scheme+host,
+  path, query and fragment; only whole path segments, `;name=value` path parameters and whole query
+  values equal to a value traced for the same step (≥ 8 characters) are substituted — host / scheme
+  stay literal; the percent-encoded spelling is handled (`str(X)` when the ref is `unquote(X)`, else
+  `requests.utils.quote(str(ref), safe='')`); secret query items are replaced by their secret constant.
+* **Secrets** (`plan`): every field whose name looks secret becomes a secret constant whatever its
+  length or the candidate filters (`admin`, `123`), and the value cache is keyed by (value, secret-
+  looking name), so a password equal to the user id is never emitted as a literal.
+* **Required secrets** (`codegen._required_secret_envs`): `main()` first checks the CONSTANTS it uses
+  (`missing = [env for env, value in [(ENV, CONST), …] if not value]`) — secrets recorded non-empty
+  plus the Basic / Digest auth password, never NTLM / Negotiate — and exits with 「環境変数 … が
+  設定されていません」 before any request; a value typed into the constant block works.
+* **Downloads** (`codegen._DOWNLOAD_HELPERS_SRC`, `util.is_attachment_disposition`,
+  `util.download_filename`): a response is an attachment when `Content-Disposition` starts with
+  `attachment`, or contains `filename` and does not start with `inline`.  Every step (any kind,
+  including HTML-table exports, loop iterations and the final step) saves binary bodies and
+  attachments right after its call (`_save_if_attachment` / `_save_download`, `REQREC_OUTPUT_DIR` or
+  cwd; the GUI run sets `<workdir>/outputs`).  Names: RFC 6266 / IE percent-encoding / raw UTF-8 or
+  Shift_JIS / RFC 2047 encoded words; Windows reserved names get `_`, names over 150 characters are
+  shortened; unique within a run (`name (2).ext`).  `routes._downloads_of` lists exactly the steps the
+  script saves (verified on both factory recordings × 8 option variants).
+* **Easy build payload** adds `downloads: [{index, method, url, filename, mime}]` (shown as
+  「保存されるファイル」), and splits plan warnings into `warnings` (actionable) and `notes`
+  (Shift_JIS re-encoding, "looks like a credential" — informational, not shown under 確認してください);
+  every warning gets a plain-Japanese `message` (`routes.warning_message`; a test checks all warnings
+  `build_plan` produces on the fixtures).  Error kinds are distinct (`proxy` / `emulation` / `iehost`
+  launch); only a launch failure gets the AppLocker / `python -m reqrec.iehost build` guidance.
+  Recordings remember their `origin` (`easy` / `advanced`); only easy-started recordings auto-stop
+  in easy mode.  The 試しに実行 inputs use friendly labels (「パスワード (入力欄: txtPassword)」;
+  NTLM / Negotiate entries keep their "leave blank with sspi" instruction).
+
+Tests: `tests/e2e/test_factory_replay.py` (always on; the two recordings in
+`tests/fixtures/factory_ie_recording_{digit,letter}_key.json` are generated and replayed against a
+fresh `factory_site` — full event sequence, Excel rows and name, no recorded session value in the
+code, second run, missing / wrong password), `tests/test_factory_site.py`, and the opt-in
+`tests/test_iedriver.py` (external driver `tests/iehost_fixtures/IEDriver.cs` / `iedriver.py`
+operating RecBrowser via `WM_HTML_GETOBJECT`) and `tests/iehost_fixtures/factory_scenario.py`
+(records the scenario in the real recording browser).

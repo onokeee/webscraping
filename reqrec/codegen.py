@@ -20,6 +20,11 @@ Phase 2 (DESIGN.md §13)
   pages served without a charset do not become mojibake.
 * A ``raw`` body that carries ``Step.form`` (a form recorded percent-encoded in a legacy charset) is
   rebuilt with ``urlencode`` from the form pairs, so fresh ``__VIEWSTATE``-style values reach the server.
+* Downloads (DESIGN.md §13.13): right after its own request, every step's response is saved as a
+  file when it is binary or ``Content-Disposition`` names an attachment (any response kind, loop
+  iterations included; ``_save_download`` / ``_save_if_attachment``, unique names per run); the final
+  print block only prints.  ``main()`` first checks the required secret *constants* (recorded
+  non-empty secrets and the Basic / Digest password) and exits with a plain message.
 
 Security boundary
 -----------------
@@ -364,7 +369,10 @@ class _Generator:
                 if var in self.constant_names:
                     raise CodegenError(f"extractor variable {var!r} collides with a constant")
             if step.loop is not None:
-                self.loop_vars.add(_check_identifier(step.loop.var, "loop variable"))
+                var = _check_identifier(step.loop.var, "loop variable")
+                if var in self.constant_names:  # main() reads constants (required secrets) before the loop
+                    raise CodegenError(f"loop variable {var!r} collides with a constant")
+                self.loop_vars.add(var)
         self._prepare_auth()
         # unique function names (the plan should already guarantee this; be safe)
         reserved = set(self.constant_names) | {
@@ -372,9 +380,9 @@ class _Generator:
             "os", "sys", "time", "ssl", "warnings", "unquote", "urlencode", "urljoin", "BeautifulSoup",
             "TIMEOUT", "DELAY", "VERIFY_TLS", "BASE_HEADERS", "INITIAL_COOKIES",
             "_soup", "_check", "_regex", "_json_path", "_select", "_attr", "_elem_text", "_text", "_charset",
-            "_normalise_charset", "final_resp", "final_results", "_LegacyTLSAdapter",
+            "_normalise_charset", "final_resp", "final_results", "final_saved", "_LegacyTLSAdapter",
             "HttpNegotiateAuth", "HttpNtlmAuth",
-        }
+        } | _DOWNLOAD_HELPER_NAMES
         for step in self.plan.steps:
             base = _check_identifier(step.func_name or f"step_{step.index:02d}", "step function name")
             self.func_names.append(util.unique_name(base, reserved))
@@ -388,6 +396,31 @@ class _Generator:
         self.final_step = self._resolve_final_step()
         if self.final_step is not None and self.opts.print_final and self.final_step.response_kind == "html":
             self.helpers_needed.add("_soup")
+        if self.plan.steps:
+            # DESIGN.md §13.13 download rule: every step's response may turn out to be a file (binary
+            # bodies always; any kind, HTML included, when Content-Disposition says attachment)
+            self.helpers_needed.add("_save_download")
+
+    def _required_secrets(self) -> list[tuple[str, str]]:
+        """``(env_var, constant_name)`` pairs main() insists on before the first request.
+
+        Secrets recorded with a non-empty value (an empty password field stays optional), plus the
+        HTTP Basic / Digest password constant whatever was recorded: a Digest password never
+        appears on the wire and a synthesised ``AUTH_PASSWORD`` has no recorded value, yet both are
+        needed.  NTLM / Negotiate need none (SSPI uses the logged-in user).  The check tests the
+        *constant*, so a value typed into the constant block works as well as the variable.
+        Sending an empty password silently would only end in a confusing failure later."""
+        out: list[tuple[str, str]] = []
+        for const in self._all_constants():
+            if not const.secret:
+                continue
+            name = _check_identifier(const.name, "constant name")
+            if str(const.value or "") == "" and name != self.auth_pw_const:
+                continue
+            pair = (_env_name(const), name)
+            if pair not in out:
+                out.append(pair)
+        return out
 
     def _resolve_final_step(self) -> Optional[Step]:
         """The step whose result ``main()`` prints: ``Plan.final_step_index`` or the last step."""
@@ -815,7 +848,7 @@ class _Generator:
             self._c(const.comment)
         if const.secret:
             env = _env_name(const)
-            self._c(f"記録時の値は安全のため出力していません。環境変数 {env} で指定してください")
+            self._c(f"記録時の値は安全のため出力していません。環境変数 {env} で指定してください（下の行の '' に直接書いても動きます）")
             w.line(f"{name} = os.environ.get({_lit(env)}, '')")
         else:
             w.line(f"{name} = {_lit(const.value)}")
@@ -923,6 +956,11 @@ class _Generator:
             with w.indent():
                 w.line('"""CSS セレクタに一致する最初の要素のテキスト（前後の空白を除く）を返す。"""')
                 w.line("return _select(soup, selector).get_text(strip=True)")
+
+        if "_save_download" in self.helpers_needed:
+            w.blank(2)
+            for ln in _DOWNLOAD_HELPERS_SRC.strip("\n").split("\n"):
+                w.line(ln)
 
         if self.opts.legacy_tls:
             self._emit_legacy_adapter()
@@ -1322,6 +1360,15 @@ class _Generator:
         steps = self.plan.steps
         w.line("def main():")
         with w.indent():
+            required = self._required_secrets()
+            if required:
+                self._c("パスワードなど、実行時に入力が必要な値（環境変数、または定数に直接書いた値）がそろっているか先に確認する")
+                items = [([f"({_lit(env)}, {name})"], None) for env, name in required]
+                pairs = _container("[", "]", items, inline_ok=len(required) <= 2)
+                w.block(_join_first("missing = [env for env, value in ", pairs, " if not value]"))
+                w.line("if missing:")
+                with w.indent():
+                    w.line('sys.exit("環境変数 " + ", ".join(missing) + " が設定されていません（パスワードなど、実行時に入力が必要な値です）")')
             w.line("session = requests.Session()")
             self._emit_session_auth()
             self._cl("session.verify = VERIFY_TLS", "証明書の検証（設定ブロックの VERIFY_TLS を参照）")
@@ -1406,6 +1453,19 @@ class _Generator:
             return [line]
         return [f"resp, out = {fname}("] + _indent_block([a + "," for a in args]) + [")"]
 
+    @staticmethod
+    def _final_needs_saved(step: Step) -> bool:
+        """Whether the final print block depends on ``final_saved`` (the step was saved as a file)."""
+        return step.loop is None and (step.response_kind or "empty") in ("json", "html", "empty")
+
+    def _emit_save(self, step: Step, *, target: str = "") -> None:
+        """Save the response just received when it is a file (DESIGN.md §13.13 download rule):
+        a binary body always, any other kind when ``Content-Disposition`` says attachment."""
+        if step.response_kind == "binary":
+            self._cl(target + "_save_download(resp)", "ダウンロードしたファイル（Excel など）を、サーバーが付けた名前で保存する")
+        else:
+            self._cl(target + "_save_if_attachment(resp)", "ファイル（Excel / CSV など）として返ってきたら保存する")
+
     def _emit_main_step(self, step: Step, fname: str, *, sleep: bool, final: bool = False) -> None:
         w = self.w
         desc = step.comment or f"{str(step.method).upper()} {self._url_display(step.url)}"
@@ -1415,6 +1475,8 @@ class _Generator:
             w.line("ctx.update(out)")
             if final:
                 self._cl("final_resp = resp", "このステップの結果を最後に表示する")
+            # a file is saved right after its own request, so a later failing step cannot lose it
+            self._emit_save(step, target="final_saved = " if final and self._final_needs_saved(step) else "")
             if sleep:
                 w.line("time.sleep(DELAY)")
             return
@@ -1430,7 +1492,11 @@ class _Generator:
         w.line(f"for {var} in {iterable}:")
         with w.indent():
             w.block(self._call(step, fname))
-            w.line("results.append(" + ("resp.json()" if step.response_kind == "json" else "_text(resp)") + ")")
+            if step.response_kind == "binary":
+                self._cl("results.append(_save_download(resp))", "ファイルを保存し、保存先のパスを結果に入れる")
+            else:
+                self._emit_save(step)
+                w.line("results.append(" + ("resp.json()" if step.response_kind == "json" else "_text(resp)") + ")")
             if sleep:
                 w.line("time.sleep(DELAY)")
         w.line("ctx.update(out)")
@@ -1464,8 +1530,13 @@ class _Generator:
             self._c(f"===== 結果を表示（{label}） =====")
         else:
             self._c(f"===== 最後のステップの結果を表示（{label}） =====")
+        # Files were already saved right after the step's own request (_emit_main_step): this block
+        # only prints / previews, it never saves a second time.
         if looped and kind == "json":
             w.line("print(json.dumps(final_results, ensure_ascii=False, indent=2))")
+            return
+        if looped and kind == "binary":
+            self._c("各回のファイルは上で保存済みです（final_results に保存先のパスが入っています）")
             return
         if looped:
             self._c("final_results に各ページの本文（文字列）が入っています")
@@ -1473,29 +1544,212 @@ class _Generator:
             with w.indent():
                 w.line("print(text[:2000])")
             return
+        if kind == "binary":
+            self._c("ダウンロードしたファイルは上（このステップの直後）で保存済みです")
+            return
+        if not self._final_needs_saved(step):  # text / xml / unknown: the same preview either way
+            w.line("print(_text(final_resp)[:2000])")
+            return
         if kind == "json":
-            w.line("try:")
-            with w.indent():
-                w.line("print(json.dumps(final_resp.json(), ensure_ascii=False, indent=2))")
-            w.line("except ValueError:")
+            self._c("ファイルとして保存した場合は先頭だけ表示する")
+            w.line("if final_saved:")
             with w.indent():
                 w.line("print(_text(final_resp)[:2000])")
-        elif kind == "html":
-            w.line("soup = _soup(final_resp)")
-            w.line("print(soup.title.get_text(strip=True) if soup.title else final_resp.url)")
-            self._c("TODO: 必要なデータを soup から取り出してください（例: soup.select('table tr')）")
-        elif kind == "binary":
-            w.line("with open('output.bin', 'wb') as fh:")
+            w.line("else:")
             with w.indent():
-                w.line("fh.write(final_resp.content)")
-            w.line('print(f"output.bin に保存しました ({len(final_resp.content)} バイト)")')
-        elif kind == "empty":
-            w.line("print(final_resp.status_code, final_resp.url)")
-        else:  # text / xml / unknown
-            w.line("print(_text(final_resp)[:2000])")
+                w.line("try:")
+                with w.indent():
+                    w.line("print(json.dumps(final_resp.json(), ensure_ascii=False, indent=2))")
+                w.line("except ValueError:")
+                with w.indent():
+                    w.line("print(_text(final_resp)[:2000])")
+            return
+        self._c("ファイルとして保存した場合は、上の「保存しました」の表示だけ")
+        w.line("if not final_saved:")
+        with w.indent():
+            if kind == "html":
+                w.line("soup = _soup(final_resp)")
+                w.line("print(soup.title.get_text(strip=True) if soup.title else final_resp.url)")
+                self._c("TODO: 必要なデータを soup から取り出してください（例: soup.select('table tr')）")
+            else:  # empty
+                w.line("print(final_resp.status_code, final_resp.url)")
 
 
 # =========================================================================== module-level helpers
+
+#: Emitted verbatim (top level) whenever the plan has steps: the DESIGN.md §13.13 download rule.
+#:
+#: * ``_is_attachment``: ``Content-Disposition`` (stripped, lower-cased) starts with ``attachment``,
+#:   or contains ``filename`` and does not start with ``inline`` (``inline; filename=f.txt`` is
+#:   Spring's RFD protection on every JSON response, not a download).  ``util.is_attachment_disposition``
+#:   is the same rule for the GUI.
+#: * ``_download_name``: RFC 6266 ``filename*=``, RFC 2047 encoded words (``=?UTF-8?B?...?=`` from
+#:   .NET), IE-style percent-encoded UTF-8, or raw UTF-8 / Shift_JIS bytes that http.client decoded
+#:   as Latin-1; else the URL's last segment; else ``output`` + an extension from the MIME type.
+#:   ``_safe_file_name`` removes path parts and characters Windows forbids, prefixes reserved device
+#:   names (``CON``, ``NUL``, ``COM1`` ... with any extension) with ``_`` and shortens names longer
+#:   than 150 characters keeping the extension.  ``util.download_filename`` mirrors it.
+#: * ``_save_download``: writes into ``REQREC_OUTPUT_DIR`` or the current directory and prints the
+#:   path; a second file with the same name in one run becomes ``name (2).ext``, then ``(3)``
+#:   (``_SAVED_PATHS``, module level = one run); a file left by a previous run is overwritten.
+#: * ``_save_if_attachment``: ``_save_download`` when ``_is_attachment``, else None.
+#:
+#: No ``#`` comments (``comments=False`` must produce a comment-free script); Python 3.8 syntax.
+_DOWNLOAD_HELPERS_SRC = r'''
+def _is_attachment(resp):
+    """サーバーが「ファイルとして保存」を指示しているか（Content-Disposition を見る）。
+
+    attachment で始まるか、filename を含む（inline で始まるものを除く）ときに True。
+    "inline; filename=..." は「画面に表示してよい」という指示なので保存しない。
+    """
+    disposition = (resp.headers.get("Content-Disposition") or "").strip().lower()
+    if disposition.startswith("attachment"):
+        return True
+    return "filename" in disposition and not disposition.startswith("inline")
+
+
+_PAGE_EXTENSIONS = {
+    "aspx", "asp", "ashx", "asmx", "axd", "php", "jsp", "jspx", "do", "action", "cgi", "pl", "py",
+    "html", "htm", "shtml", "xhtml", "cfm", "nsf",
+}
+_RESERVED_FILE_NAME_RE = re.compile(r"(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3])", re.I)
+_MAX_FILE_NAME = 150
+_SAVED_PATHS = set()
+
+
+def _unquote(text, encoding):
+    """URL エンコードされたファイル名を戻す（知らない文字コード名なら UTF-8 として読む）。"""
+    from urllib.parse import unquote
+    try:
+        return unquote(text, encoding=encoding or "utf-8", errors="replace")
+    except LookupError:
+        return unquote(text, encoding="utf-8", errors="replace")
+
+
+def _decode_words(text):
+    """=?UTF-8?B?...?= / =?Shift_JIS?Q?...?= の形（RFC 2047。.NET などが付ける）を元の文字に戻す。"""
+    from email.header import decode_header
+    try:
+        parts = decode_header(text)
+    except Exception:
+        return text
+    out = []
+    for part, charset in parts:
+        if isinstance(part, str):
+            out.append(part)
+        elif charset:
+            out.append(part.decode(_normalise_charset(charset) or "utf-8", "replace"))
+        else:
+            out.append(part.decode("raw-unicode-escape", "replace"))
+    return "".join(out)
+
+
+def _safe_file_name(name):
+    """Windows でそのまま使えるファイル名にする。
+
+    フォルダ部分と使えない文字を除き、予約名（CON, NUL, COM1 など。拡張子付きも）には先頭に _ を付け、
+    150 文字を超える名前は拡張子を残して短くする。
+    """
+    name = (name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
+    if not name:
+        return ""
+    if _RESERVED_FILE_NAME_RE.fullmatch(name.split(".", 1)[0].rstrip(" ")):
+        name = "_" + name
+    if len(name) > _MAX_FILE_NAME:
+        stem, ext = os.path.splitext(name)
+        if len(ext) > 16:
+            stem, ext = name, ""
+        name = stem[:_MAX_FILE_NAME - len(ext)].rstrip(" .") + ext
+    return name
+
+
+def _download_name(resp):
+    """保存するファイル名: Content-Disposition のファイル名 → URL の末尾 → output + 拡張子。
+
+    filename*=UTF-8''...（RFC 6266）、=?UTF-8?B?...?=（RFC 2047）、IE 向けに URL エンコードされた
+    UTF-8、Shift_JIS / UTF-8 の生バイト（requests は Latin-1 として読むので元に戻して読み直す）に対応する。
+    """
+    from urllib.parse import urlsplit
+    import mimetypes
+
+    disposition = resp.headers.get("Content-Disposition") or ""
+    name = None
+    m = re.search(r"filename\*\s*=\s*([^';]*)'[^']*'([^;]+)", disposition, re.I)
+    if m:
+        name = _unquote(m.group(2).strip().strip('"'), m.group(1).strip())
+    else:
+        m = re.search(r'filename\s*=\s*(?:"([^"]*)"|([^;]+))', disposition, re.I)
+        if m:
+            raw = (m.group(1) if m.group(1) is not None else m.group(2)).strip()
+            decoded = _decode_words(raw) if "=?" in raw else raw
+            if decoded != raw:
+                name = decoded
+            elif re.search(r"%[0-9A-Fa-f]{2}", raw):
+                name = _unquote(raw, "utf-8")
+            else:
+                name = raw
+                for codec in ("utf-8", "cp932"):
+                    try:
+                        name = raw.encode("latin-1").decode(codec)
+                        break
+                    except (UnicodeEncodeError, UnicodeDecodeError):
+                        continue
+    name = _safe_file_name(name)
+    if not name:
+        last = _unquote(urlsplit(resp.url).path.rsplit("/", 1)[-1], "utf-8")
+        ext = last.rsplit(".", 1)[-1].lower() if "." in last else ""
+        name = _safe_file_name(last) if ext and ext not in _PAGE_EXTENSIONS else ""
+    if not name:
+        mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        known = {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+            "application/vnd.ms-excel": ".xls",
+            "text/csv": ".csv",
+            "application/pdf": ".pdf",
+            "application/zip": ".zip",
+            "text/plain": ".txt",
+            "application/octet-stream": ".bin",
+        }
+        name = "output" + (known.get(mime) or mimetypes.guess_extension(mime or "") or ".bin")
+    return name
+
+
+def _save_download(resp):
+    """本文をファイルに保存し、保存先を表示してパスを返す。
+
+    保存先は環境変数 REQREC_OUTPUT_DIR（無ければ実行したフォルダ）。1 回の実行で同じ名前のファイルが
+    2 つ目以降に来たら「名前 (2).xlsx」「名前 (3).xlsx」のように番号を付ける（前回の実行で残った
+    ファイルは上書きする）。
+    """
+    folder = os.environ.get("REQREC_OUTPUT_DIR") or os.getcwd()
+    os.makedirs(folder, exist_ok=True)
+    stem, ext = os.path.splitext(_download_name(resp))
+    path = os.path.join(folder, stem + ext)
+    number = 2
+    while os.path.normcase(os.path.abspath(path)) in _SAVED_PATHS:
+        path = os.path.join(folder, "{} ({}){}".format(stem, number, ext))
+        number += 1
+    _SAVED_PATHS.add(os.path.normcase(os.path.abspath(path)))
+    with open(path, "wb") as fh:
+        fh.write(resp.content)
+    print("{} に保存しました ({} バイト)".format(path, len(resp.content)))
+    return path
+
+
+def _save_if_attachment(resp):
+    """サーバーが「ファイルとして保存」を指示していれば保存してパスを返す（それ以外は None）。"""
+    if _is_attachment(resp):
+        return _save_download(resp)
+    return None
+'''
+
+#: Names the download helpers define at module level (step functions must not reuse them).
+_DOWNLOAD_HELPER_NAMES = frozenset({
+    "_is_attachment", "_PAGE_EXTENSIONS", "_RESERVED_FILE_NAME_RE", "_MAX_FILE_NAME", "_SAVED_PATHS",
+    "_unquote", "_decode_words", "_safe_file_name", "_download_name", "_save_download", "_save_if_attachment",
+})
+
 
 def _env_name(const: Constant) -> str:
     env = const.env_var or f"REQREC_{const.name}"

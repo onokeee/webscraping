@@ -7,6 +7,7 @@ repeated literal (``Constant``) by a ``Ref`` that the generated script resolves 
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from dataclasses import dataclass, field
@@ -88,6 +89,14 @@ def _json_leaf_name(path: Optional[list]) -> str:
     return last
 
 
+_DOTTED_PART_RE = re.compile(r"\[(\d+)\]|([^.\[\]]+)")
+
+
+def _dotted_to_path(dotted: str) -> list:
+    """``"a.b[0].c"`` -> ``["a", "b", 0, "c"]`` (inverse of ``deps.json_dotted`` for naming)."""
+    return [int(m.group(1)) if m.group(1) is not None else m.group(2) for m in _DOTTED_PART_RE.finditer(dotted or "")]
+
+
 def _path_seg_name(segments: list[str], index: int) -> str:
     """Variable base name for a dynamic path segment: ``orgs/77`` -> ``org_id``."""
     prev = segments[index - 1] if 0 < index <= len(segments) else ""
@@ -115,8 +124,19 @@ def _is_reserved_name(base: str) -> bool:
 
 
 def _route_like(value: str) -> bool:
-    """Plain words and file names (``dashboard``, ``Default.aspx``) are route names, not tokens."""
-    return _WORD_RE.match(value) is not None or _FILENAME_RE.match(value) is not None
+    """Plain words, file names and screen-id pages (``dashboard``, ``Default.aspx``,
+    ``SC0010.aspx``) are route names, not tokens; a value with random-looking letters
+    (``xBBHOHpXYZgFKyNZpuWy``, also before an extension or between ``-`` / ``_``) is a token.
+    See ``deps.is_route_like``."""
+    return deps.is_route_like(value)
+
+
+#: Locators that read markup or match a pattern.  A route-like path segment (``Login.aspx``) found
+#: there is a coincidence (``action="Login.aspx"``), never the source of the value.
+_MARKUP_KINDS = frozenset({"html_attr", "html_text", "regex", "url"})
+#: What a route-like path segment may still be traced to: exact structural matches (an all-uppercase
+#: session key ``/s/QZVBNMWRTYPXSDFKHJ/`` can be a JSON leaf or a header of an earlier response).
+_ROUTE_SEGMENT_KINDS = frozenset({"header", "json", "html_input", "html_meta"})
 
 
 def _name_hint_from_pattern(pattern: Optional[str]) -> Optional[str]:
@@ -139,6 +159,127 @@ def _with_prefix(prefix: str, ref: Ref) -> Ref:
     if ref.kind == "expr" and (" + " in src or " if " in src or " or " in src):
         src = f"({src})"
     return Ref.expr(f"{json.dumps(prefix)} + {src}")
+
+
+#: Traced values shorter than this are not substituted inside a ``Referer`` (a short id could equal
+#: an unrelated query value or path segment by coincidence).
+_REFERER_MIN_VALUE = 8
+#: ``scheme://host[:port]`` | path | ``?query`` | ``#fragment`` of an absolute URL, split so that
+#: joining the groups gives back the exact recorded text.
+_ABS_URL_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*://[^/?#]*)([^?#]*)(?:\?([^#]*))?(?:#(.*))?$", re.S)
+
+
+def _unquoted_source(ref: Ref) -> Optional[str]:
+    """``X`` for a Ref ``unquote(X)`` (a value whose recorded source spelling was percent-encoded),
+    else None."""
+    if ref.kind != "expr":
+        return None
+    try:
+        node = ast.parse(ref.value, mode="eval").body
+    except SyntaxError:
+        return None
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "unquote"
+            and len(node.args) == 1 and not node.keywords and not isinstance(node.args[0], ast.Starred)):
+        return ast.get_source_segment(ref.value, node.args[0])
+    return None
+
+
+def _referer_token(token: str, swaps: dict[str, Ref], plus: bool) -> Optional[str]:
+    """Expression source producing a fresh spelling of a whole Referer token, or None to keep it.
+
+    The token is either the recorded value itself (-> ``str(ref)``) or its percent-encoded
+    spelling (``a%2Bb%3D`` for ``a+b=``): then the encoded source the value was decoded from is
+    used when the Ref is ``unquote(X)``, else ``requests.utils.quote(str(ref), safe='')`` (the
+    generated script always imports ``requests``; ``requests.utils.quote`` is
+    ``urllib.parse.quote``)."""
+    ref = swaps.get(token)
+    if ref is not None:
+        return f"str({ref.value})"
+    if "%" not in token and not (plus and "+" in token):
+        return None
+    decoded = unquote(token.replace("+", " ") if plus else token)
+    ref = swaps.get(decoded)
+    if ref is None or decoded == token:
+        return None
+    source = _unquoted_source(ref)
+    if source is not None:
+        return f"str({source})"
+    return f"requests.utils.quote(str({ref.value}), safe='')"
+
+
+def _referer_with_fresh_values(value: str, refs: dict, secrets: Optional[dict[str, Ref]] = None) -> Ref:
+    """``Referer: .../Search.aspx?key=<recorded key>`` -> the same URL built with the key traced for
+    this step, so the header never carries a stale session value.
+
+    Only whole tokens are replaced: a whole path segment (or the value of a ``;name=value`` path
+    parameter such as ``;jsessionid=``) and a whole query value (or a query item without ``=``),
+    each either verbatim or in its percent-encoded spelling.  ``scheme://host`` and the fragment
+    stay literal, and a value is never replaced inside a longer token.  Only non-literal refs of
+    this step whose recorded value has at least ``_REFERER_MIN_VALUE`` characters are used;
+    anything else stays literal.
+
+    ``secrets`` (recorded value -> Ref of a secret constant) is used, whatever the value's length,
+    for query items whose name looks like a credential (``Login.aspx?pw=abc`` as the previous
+    page), so a password never reaches the script through the Referer."""
+    swaps: dict[str, Ref] = {}
+    for (_loc, _name, raw), ref in refs.items():
+        if ref is None or ref.is_literal or not isinstance(raw, str) or len(raw) < _REFERER_MIN_VALUE:
+            continue
+        swaps.setdefault(raw, ref)
+    secrets = {raw: ref for raw, ref in (secrets or {}).items() if raw and ref is not None and not ref.is_literal}
+    m = _ABS_URL_RE.match(value) if swaps or secrets else None
+    if m is None:
+        return Ref.lit(value)
+    head, path, query, fragment = m.groups()
+    pieces: list[tuple[bool, str]] = [(False, head)]  # (is_expr, text)
+
+    def token(text: str, plus: bool, name: str = "") -> None:
+        expr = _referer_token(text, swaps, plus) if text else None
+        if expr is None and text and secrets and util.looks_like_secret_name(unquote(name.replace("+", " "))):
+            expr = _referer_token(text, secrets, plus)
+        pieces.append((True, expr) if expr is not None else (False, text))
+
+    for i, segment in enumerate(path.split("/")):
+        if i:
+            pieces.append((False, "/"))
+        first, *params = segment.split(";")
+        token(first, False)
+        for param in params:
+            pieces.append((False, ";"))
+            pname, eq, pvalue = param.partition("=")
+            if eq:
+                pieces.append((False, pname + "="))
+                token(pvalue, False)
+            else:
+                token(param, False)
+    if query is not None:
+        pieces.append((False, "?"))
+        for i, item in enumerate(query.split("&")):
+            if i:
+                pieces.append((False, "&"))
+            qname, eq, qvalue = item.partition("=")
+            if eq:
+                pieces.append((False, qname + "="))
+                token(qvalue, True, qname)
+            else:
+                token(item, True)
+    if fragment is not None:
+        pieces.append((False, "#" + fragment))
+    if not any(is_expr for is_expr, _ in pieces):
+        return Ref.lit(value)
+    parts: list[str] = []
+    literal = ""
+    for is_expr, text in pieces:
+        if not is_expr:
+            literal += text
+            continue
+        if literal:
+            parts.append(repr(literal))
+            literal = ""
+        parts.append(text)
+    if literal:
+        parts.append(repr(literal))
+    return Ref.expr(" + ".join(parts))
 
 
 def _response_kind(flow: Flow) -> str:
@@ -224,6 +365,9 @@ class _Builder:
         self.warnings: list[str] = []
         self.constants: list[Constant] = []
         self.const_by_value: dict[str, Constant] = {}
+        #: secret constants by value: a field whose name looks secret never shares a plain constant
+        #: (``txtUserId=tanaka01&txtPassword=tanaka01`` -> a literal user id and a secret password)
+        self.secret_by_value: dict[str, Constant] = {}
         self.const_uses: dict[str, list[str]] = {}
         self.taken: set[str] = set(_CODEGEN_NAMES) | {n.lower() for n in _CODEGEN_NAMES}
         self.func_names: set[str] = set()
@@ -294,26 +438,45 @@ class _Builder:
 
     # ------------------------------------------------------------------ constants
 
+    def _secret_field(self, name: str) -> bool:
+        """Is ``name`` a field whose value must be read from the environment (DESIGN.md §7)?"""
+        return bool(self.opts.redact_secrets and util.looks_like_secret_name(name))
+
     def _constant(self, cand: deps.Candidate, value: str, flow: Flow, step_no: int, force_secret: bool = False) -> Ref:
+        """The shared ``Constant`` for ``value`` (created on first use).
+
+        A secret use (``force_secret`` or a credential-like name, when ``redact_secrets``) only ever
+        reuses a *secret* constant: a password equal to the user id gets its own environment variable
+        instead of turning the user id's constant into one.  A plain use reuses any constant of the
+        value (a form field carrying the Basic password reuses ``AUTH_PASSWORD`` rather than leaking it)."""
         secret = self.opts.redact_secrets and (force_secret or util.looks_like_secret_name(cand.name))
-        const = self.const_by_value.get(value)
+        const = self.secret_by_value.get(value) if secret else self.const_by_value.get(value)
         if const is None:
             base = util.safe_identifier(self._cand_base_name(cand, flow), default="value").upper()
             name = util.unique_name(base, self.taken)
             const = Constant(name=name, value=value, secret=secret, env_var=f"REQREC_{name}" if secret else None)
             self.constants.append(const)
-            self.const_by_value[value] = const
+            self.const_by_value.setdefault(value, const)
+            if secret:
+                self.secret_by_value[value] = const
             self.const_uses[name] = []
             if secret:
                 self.warnings.append(
                     f"step {step_no}: `{cand.name}` looks like a credential; the script reads it from the "
                     f"environment variable {const.env_var} (set it before running)"
                 )
-        elif secret and not const.secret:
-            const.secret = True
-            const.env_var = f"REQREC_{const.name}"
         self.const_uses[const.name].append(f"step {step_no} ({cand.location} `{cand.name}`)")
         return Ref.var(const.name)
+
+    def _secret_ref(self, location: str, name: str, value: str, flow: Flow, step_no: int) -> Optional[Ref]:
+        """Secret constant for a field that is *not* a trace candidate (``password=admin``,
+        ``pin=123``: too short or a plain word) but whose name looks like a credential; None when
+        the value must stay literal (redaction off, ordinary name, empty value)."""
+        if not value or not self._secret_field(name):
+            return None
+        json_path = _dotted_to_path(name) if location == "json" else None
+        cand = deps.Candidate(location, name, value, json_path=json_path)
+        return self._constant(cand, value, flow, step_no, force_secret=True)
 
     # ------------------------------------------------------------------ HTTP authentication (DESIGN.md §13.2)
 
@@ -369,6 +532,8 @@ class _Builder:
             self.const_by_value.setdefault(user, user_const)
         if password:
             self.const_by_value.setdefault(password, pw_const)
+            if pw_const.secret:
+                self.secret_by_value.setdefault(password, pw_const)
         auth.username_const = user_const.name
         auth.password_const = pw_const.name
         if not auth.username and user:
@@ -510,21 +675,33 @@ class _Builder:
         (a short id like ``77``) occur in many places by coincidence."""
         return len(value) < self.opts.min_value_length or _route_like(value)
 
-    def _accept(self, ext: Optional[Extractor], value: str) -> Optional[Extractor]:
-        if ext is not None and ext.pattern and self._structural_only(value):
+    def _accept(self, ext: Optional[Extractor], value: str, cand: Optional[deps.Candidate] = None) -> Optional[Extractor]:
+        if ext is None:
+            return None
+        if ext.pattern and self._structural_only(value):
+            return None
+        if cand is not None and ext.kind in _MARKUP_KINDS and deps.is_structural_path_segment(cand):
+            # a route-like path segment (``Login.aspx``, ``SC0010.aspx``) in markup is a coincidence;
+            # only exact structural matches (JSON leaf, header, <input> / <meta>, cookie) trace it
             return None
         return ext
 
     def _trace(self, value: str, cand: deps.Candidate, flow: Flow, step_no: int) -> Optional[Ref]:
         """Search earlier steps' responses, latest first."""
+        route_segment = deps.is_structural_path_segment(cand)
         for built in reversed(self.built):
             chain = built.unit.response_chain
-            ext = self._accept(deps.locate_value(value, chain[-1]), value)
+            if route_segment:
+                ext = self._accept(deps.locate_value_kinds(value, chain[-1], _ROUTE_SEGMENT_KINDS), value, cand)
+            else:
+                ext = self._accept(deps.locate_value(value, chain[-1]), value, cand)
             note = None
             if ext is None:
                 for k in range(len(chain) - 2, -1, -1):
                     kinds = frozenset({"header", "url"}) if k == len(chain) - 2 else frozenset({"header"})
-                    ext = self._accept(deps.locate_value_kinds(value, chain[k], kinds), value)
+                    if route_segment:
+                        kinds = kinds & _ROUTE_SEGMENT_KINDS
+                    ext = self._accept(deps.locate_value_kinds(value, chain[k], kinds), value, cand)
                     if ext is not None:
                         if ext.kind == "header":
                             note = f"from an intermediate redirect response ({chain[k].id}); check resp.history"
@@ -535,10 +712,14 @@ class _Builder:
             return self._adapt(ext, value)
         return None
 
-    def _resolve(self, cand: deps.Candidate, unit: _Unit, step_no: int, cache: dict[str, Ref]) -> Ref:
+    def _resolve(self, cand: deps.Candidate, unit: _Unit, step_no: int, cache: dict[tuple[str, bool], Ref]) -> Ref:
         value = cand.value
-        if value in cache:
-            return cache[value]
+        secret_name = self._secret_field(cand.name)
+        # keyed by secrecy too: ``txtUserId=tanaka01&txtPassword=tanaka01`` must not hand the user
+        # id's literal to the password
+        cache_key = (value, secret_name)
+        if cache_key in cache:
+            return cache[cache_key]
         flow = unit.first_flow
         ref: Optional[Ref] = None
         ts = util.looks_like_timestamp(value, around=flow.started_at)
@@ -551,14 +732,15 @@ class _Builder:
                 ref = self._cookie_ref(hit[0], hit[1], value)
         if ref is None:
             ref = self._trace(value, cand, flow, step_no)
-        if ref is None and len(self.value_units.get(value, ())) >= 2 and not (cand.location == "path" and _route_like(value)):
+        route_segment = deps.is_structural_path_segment(cand)
+        if ref is None and len(self.value_units.get(value, ())) >= 2 and not route_segment:
             # a repeated literal becomes a shared Constant - except route names in the path
             # (``GET /Default.aspx`` then ``POST /Default.aspx``), which stay part of the URL
             ref = self._constant(cand, value, flow, step_no)
-        if ref is None and value in self.const_by_value:
+        if ref is None and value in self.const_by_value and not route_segment:
             # the same value already has a Constant (e.g. AUTH_USERNAME from the Basic handshake)
             ref = self._constant(cand, value, flow, step_no)
-        if ref is None and self.opts.redact_secrets and util.looks_like_secret_name(cand.name):
+        if ref is None and secret_name:
             ref = self._constant(cand, value, flow, step_no, force_secret=True)
         if ref is None:
             if deps.is_dynamic_looking(value):
@@ -568,7 +750,7 @@ class _Builder:
                     f"response; replaying the recorded literal may fail"
                 )
             ref = Ref.lit(value)
-        cache[value] = ref
+        cache[cache_key] = ref
         return ref
 
     # ------------------------------------------------------------------ step construction
@@ -593,7 +775,7 @@ class _Builder:
 
         refs: dict[tuple[str, str, str], Ref] = {}
         cand_by_key: dict[tuple[str, str, str], deps.Candidate] = {}
-        cache: dict[str, Ref] = {}
+        cache: dict[tuple[str, bool], Ref] = {}
         for cand in cands:
             key = (cand.location, cand.name, cand.value)
             cand_by_key.setdefault(key, cand)
@@ -602,13 +784,25 @@ class _Builder:
             refs[key] = self._resolve(cand, unit, step_no, cache)
 
         counters: dict[tuple[str, str], int] = {}
+        secret_refs: dict[tuple[str, str, str], Optional[Ref]] = {}
+
+        def secret_ref(location: str, name: str, value: str) -> Optional[Ref]:
+            # a credential that is not a trace candidate (``password=admin``, ``pin=123``) is still
+            # read from the environment - never written into the script
+            key = (location, name, value)
+            if key not in secret_refs:
+                secret_refs[key] = self._secret_ref(location, name, value, flow, step_no)
+            return secret_refs[key]
 
         def ref_for(location: str, name: str, value: str) -> Ref:
             occ = counters.get((location, name), 0)
             counters[(location, name)] = occ + 1
             if loop is not None and loop_key == (location, name, occ):
                 return Ref.var(loop.var)
-            return refs.get((location, name, value), Ref.lit(value))
+            ref = refs.get((location, name, value))
+            if ref is None:
+                ref = secret_ref(location, name, value) or Ref.lit(value)
+            return ref
 
         # URL pieces (path segments may be dynamic)
         parts = urlsplit(req.url)
@@ -695,6 +889,15 @@ class _Builder:
                     if resolved is not None:
                         ref = _with_prefix(cand.prefix, resolved)
                     break
+            if ref.is_literal and lname not in ("referer", "cookie") and value.strip():
+                # ``X-Api-Key: abc`` / ``Authorization: Bearer xyz`` too short to be a candidate
+                prefix, token = deps.split_auth_header(value) if lname == "authorization" else ("", value.strip())
+                hidden = secret_ref("header", lname, token)
+                if hidden is not None:
+                    ref = _with_prefix(prefix, hidden)
+            if lname == "referer" and ref.is_literal:
+                secrets = {c.value: Ref.var(c.name) for c in self.secret_by_value.values()}
+                ref = _referer_with_fresh_values(value, refs, secrets)
             headers.append((name, ref))
 
         status = resp.status if resp else 200
@@ -734,7 +937,12 @@ class _Builder:
         if conv is None:
             return doc
         ref = ref_for("json", deps.json_dotted(path), conv[0])
-        return doc if ref.is_literal else ref
+        if ref.is_literal:
+            return doc
+        if conv[1] and ref.kind == "var" and any(c.name == ref.value for c in self.constants):
+            # a constant (an environment variable for a secret) is a str: keep the number a number
+            return Ref.expr(f"{'int' if isinstance(doc, int) else 'float'}({ref.value})")
+        return ref
 
     # ------------------------------------------------------------------ driver
 
@@ -785,6 +993,8 @@ class _Builder:
         # which values are sent by more than one step (-> Constant when not traced)
         for idx, unit in enumerate(units):
             for cand in deps.find_candidates(unit.first_flow, opts):
+                if deps.is_structural_path_segment(cand):
+                    continue  # route names in the path never become constants (and do not make others one)
                 self.value_units.setdefault(cand.value, set()).add(idx)
             for cand in deps.header_candidates(unit.first_flow, skip_session_auth=False):
                 if cand.prefix.strip().lower() in SESSION_AUTH_SCHEMES:

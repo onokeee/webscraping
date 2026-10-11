@@ -389,13 +389,53 @@ def is_numeric_path_id(cand: Candidate) -> bool:
     return cand.location == "path" and cand.value.isdigit()
 
 
+#: Extensions of server-side pages: a segment such as ``SC0010.aspx`` / ``KJ010Search.aspx`` is a
+#: screen id, i.e. a page name, even though it contains digits.
+_PAGE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*\.(?:aspx|asp|ashx|asmx|axd|svc|html?|php|jsp|jspx|do|action|cgi|pl)$", re.I)
+#: A word or a letters-only (file) name (``orders``, ``export-csv``, ``Login.aspx``, ``jquery.min.js``).
+_LETTERS_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z_.~-]*$")
+_NAME_DOTS_RE = re.compile(r"[.~]+")
+_DIGIT_RUN_RE = re.compile(r"\d+")
+_NON_LETTERS_RE = re.compile(r"[^A-Za-z]+")
+
+
+def is_route_like(value: str) -> bool:
+    """A route / page name rather than a per-session value: a word (``dashboard``,
+    ``ProductionResultCSV``), a letters-only file name (``Default.aspx``) or a screen-id page
+    (``SC0010.aspx``, ``KJ010Search.aspx``, ``Menu01.aspx``) - unless the name (or the stem before
+    the extension) looks random (``xBBHOHpXYZgFKyNZpuWy``, ``xBBHOH-pXYZgFKyNZpuWy.aspx``).
+
+    Such values occur in many places of the previous page (``action="Login.aspx"``, link texts,
+    menu markup) by coincidence, so plan.py only traces them through exact structural matches
+    (JSON leaf, header, cookie, ``<input>`` / ``<meta>``), never through markup or a pattern."""
+    if not isinstance(value, str) or not value:
+        return False
+    if _LETTERS_NAME_RE.match(value):
+        return not (looks_random_letters(value) or any(looks_random_letters(p) for p in _NAME_DOTS_RE.split(value) if p))
+    if _PAGE_NAME_RE.match(value):
+        return not _looks_random_stem(value.rsplit(".", 1)[0])
+    return False
+
+
+def is_structural_path_segment(cand: Candidate) -> bool:
+    """A route-like path segment (``Login.aspx``, ``orders``, ``SC0010.aspx``; see ``is_route_like``).
+
+    It stays a trace candidate - an all-uppercase key such as ``/s/QZVBNMWRTYPXSDFKHJ/items`` can
+    be a JSON leaf of an earlier response - but plan.py never traces it through markup
+    (``html_attr`` / ``html_text`` / ``regex`` / ``url``): tracing ``Login.aspx`` to
+    ``action="Login.aspx"`` would only make the script depend on that markup for a constant."""
+    return cand.location == "path" and is_route_like(cand.value)
+
+
 def find_candidates(flow: Flow, opts: PlanOptions) -> list[Candidate]:
     """All request values worth tracing to earlier responses (see DESIGN.md §5).
 
     Digits-only path segments are kept even when shorter than ``opts.min_value_length``: an id in
     the URL path almost always comes from an earlier JSON / HTML response (``org.id`` -> ``/orgs/77``).
     plan.py accepts only exact structural matches (JSON leaf, attribute, header ...) for such short
-    values, never a regex, so a two-digit number cannot be traced by coincidence."""
+    values, never a regex, so a two-digit number cannot be traced by coincidence.  Route-like path
+    segments (``is_structural_path_segment``) are candidates as well; plan.py restricts the
+    locators it accepts for them."""
     return [
         c for c in request_params(flow) + header_candidates(flow)
         if is_candidate_value(c.value, opts) or is_numeric_path_id(c)
@@ -443,10 +483,98 @@ def is_dynamic_looking(value: str) -> bool:
     return _is_dynamic_text(value)
 
 
+#: Upper- / lowercase runs of a letters-only identifier part.
+_CASE_RUN_RE = re.compile(r"[A-Z]+|[a-z]+")
+#: Two-letter words (a capital + one lowercase letter) common in identifiers: English (``ById``,
+#: ``DownloadAsPDF``), Japanese-system abbreviations (``TokuisakiCd``, ``ShohinNm``, ``UpdDt``,
+#: ``DelFg``) and date / time parts (``txtFromYy``, ``ddlFromMm``, ``StartHh``).
+#: A capital followed by one lowercase *vowel* is accepted too (romaji syllables: ``SeisanSu``).
+_TWO_LETTER_WORDS = frozenset({
+    "by", "id", "as", "is", "of", "to", "on", "in", "at", "up", "no", "or", "an", "if", "do", "go", "ok", "my",
+    "me", "we", "be", "ex", "cd", "nm", "dt", "kb", "ym", "pc", "db", "ui", "io", "js", "ip", "op", "qr",
+    "yy", "mm", "dd", "hh", "ss", "ms", "tm", "ts", "fg", "wk", "st",
+})
+_SEPARATOR_RE = re.compile(r"[-_]+")
+_EXTENSION_RE = re.compile(r"^([^.]+)\.[A-Za-z0-9]{1,5}$")
+
+
+def _case_irregularities(part: str) -> int:
+    """How many places of a letters-only ``part`` do not fit the structure of an identifier.
+
+    The part is read as ``lower* (UPPER+ lower*)*``: an uppercase run followed by lowercase letters
+    is an acronym (of any length, or none) plus a capitalised word that starts with the run's last
+    capital (``XMLHttp`` = ``XML`` + ``Http``); a trailing uppercase run is an acronym (``CSV``).
+    Irregular are a lone capital between words (``...kAValue``), a single capital closing the part
+    after a word (``...ColumnX``) and a two-letter word that is neither a known one nor a capital +
+    vowel (``Fk``, ``Zg``).  Random mixed-case letters have such places almost everywhere; names
+    such as ``getElementById``, ``txtTokuisakiCD`` or ``getXMLHttpRequest`` have none."""
+    runs = _CASE_RUN_RE.findall(part)
+    count = 0
+    i = 1 if runs and runs[0].islower() else 0
+    while i < len(runs):
+        upper = runs[i]
+        lower = runs[i + 1] if i + 1 < len(runs) else ""
+        if lower:
+            if len(upper) == 2:
+                count += 1
+            if len(lower) == 1 and lower not in "aeiou" and (upper[-1] + lower).lower() not in _TWO_LETTER_WORDS:
+                count += 1
+        elif len(upper) == 1 and i > 0:
+            count += 1
+        i += 2
+    return count
+
+
+def _strip_extension(value: str) -> str:
+    """``xBBHOHpXYZgFKyNZpuWy.pdf`` -> ``xBBHOHpXYZgFKyNZpuWy`` (one short extension at most)."""
+    m = _EXTENSION_RE.match(value)
+    return m.group(1) if m else value
+
+
+def looks_random_letters(value: str) -> bool:
+    """A long letters-only value with irregular mixed case (``xBBHOHpXYZgFKyNZpuWy``) is a random
+    token, not a word: sites generate such keys (a URL key, a nonce) and about one in ten random
+    20-character alphanumeric tokens happens to contain no digit at all.
+
+    ``-`` / ``_`` separate parts that are judged one by one (base64url without digits:
+    ``xBBHOH-pXYZgFKyNZpuWy``) and a file name is judged by its stem (``xBBHOHpXYZgFKyNZpuWy.pdf``).
+    Identifiers with acronyms anywhere (``txtTokuisakiCD``, ``CustomerIDList``, ``DownloadAsPDF``,
+    ``getXMLHttpRequest``) are words.  Measured on random mixed-case letter strings: about 96 % of
+    16-24 characters (also with ``-`` / ``_``) and about 89 % of 12-15 characters are recognised as
+    tokens (tests/test_review3_analysis.py)."""
+    if not isinstance(value, str) or not value.isascii():
+        return False
+    stem = _strip_extension(value)
+    if len(stem) < 12:
+        return False
+    parts = [p for p in _SEPARATOR_RE.split(stem) if p]
+    if not parts or not all(p.isalpha() for p in parts):
+        return False
+    letters = "".join(parts)
+    if letters.islower() or letters.isupper():
+        return False
+    return any(_case_irregularities(p) for p in parts)
+
+
+def _looks_random_stem(stem: str) -> bool:
+    """The stem of a page name (before ``.aspx`` ...) is random: random letters, or digits in more
+    than two runs or next to random-case letters (``a8F3kQ9zP2``).  Screen ids such as ``SC0010``,
+    ``KJ010Search`` or ``Menu01`` are not random."""
+    if looks_random_letters(stem):
+        return True
+    if not any(ch.isdigit() for ch in stem):
+        return False
+    if len(_DIGIT_RUN_RE.findall(stem)) > 2:
+        return True
+    return len(stem) >= 12 and any(_case_irregularities(p) for p in _NON_LETTERS_RE.split(stem) if p)
+
+
 def _is_dynamic_text(value: str) -> bool:
     if len(value) < 12 or any(ch.isspace() for ch in value):
         return False
     if _UUID_RE.match(value) or _JWT_RE.match(value):
+        return True
+    if looks_random_letters(value):
         return True
     if _URL_RE.match(value) or _PATH_RE.match(value) or _DATE_RE.match(value) or _MIME_RE.match(value) \
             or _VERSION_RE.match(value) or _EMAIL_RE.match(value) or _DOMAIN_RE.match(value):
@@ -980,7 +1108,8 @@ __all__ = [
     "Candidate", "MultipartField", "parse_multipart", "json_leaves", "json_dotted", "parse_json_text",
     "split_form_segments", "form_pairs_bytes", "form_body_is_utf8", "parse_form_bytes", "request_form_charset",
     "classify_body", "request_params", "split_auth_header", "is_session_auth_header", "header_candidates",
-    "is_candidate_value", "is_numeric_path_id", "find_candidates",
+    "is_candidate_value", "is_numeric_path_id", "is_route_like", "is_structural_path_segment", "find_candidates",
+    "looks_random_letters",
     "is_dynamic_looking", "build_pattern", "locate_value", "locate_value_kinds", "find_cookie",
     "locate_in_cookies", "clear_cache",
 ]

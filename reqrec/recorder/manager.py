@@ -196,6 +196,48 @@ class RecorderManager:
                 self._threads.append(t)
             return self.status()
 
+    def wait_until_listening(
+        self,
+        timeout: float = 20.0,
+        connect: Optional[Callable[..., Any]] = None,
+        interval: float = 0.2,
+    ) -> bool:
+        """Block until the proxy accepts TCP connections on ``listen_host:port``.
+
+        mitmdump needs a second or two to import before it binds; a client that is pointed at the
+        proxy earlier (the in-app recording browser, DESIGN.md §13.12) gets 「ページを表示できません」.
+        Returns ``False`` when the child exits first or ``timeout`` passes.  Does not hold the lock
+        while waiting.  ``connect`` is injectable (default :func:`socket.create_connection`).
+        """
+        import socket
+
+        dial = connect or socket.create_connection
+        with self._lock:
+            port = self.port
+            host = self.listen_host or "127.0.0.1"
+            out = self.out
+        if not port:
+            return False
+        if host in ("0.0.0.0", "::", "", "*"):
+            host = "127.0.0.1"
+        deadline = time.time() + max(0.0, float(timeout))
+        while True:
+            if not self.running or self.out != out:
+                return False
+            try:
+                conn = dial((host, int(port)), timeout=0.5)
+            except OSError:
+                conn = None
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(interval)
+
     @staticmethod
     def _drain(stream: Any, buf: deque) -> None:
         try:
@@ -264,6 +306,22 @@ class RecorderManager:
         except (ProcessLookupError, OSError):
             pass
         return proc.wait()
+
+    def forget(self) -> bool:
+        """Drop the output file of a **stopped** session so :meth:`status` no longer reports it.
+
+        Used when the recording was thrown away ([やめる] in the GUI, which deletes the file) or never
+        really started (the recording browser could not be opened): afterwards ``out`` is ``None``, so
+        the GUI does not claim 「記録は保存されました」 and :meth:`load_recording` refuses.  The exit
+        code and the output tails stay for diagnostics.  Returns ``False`` (and changes nothing)
+        while the child is still running.
+        """
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return False
+            self.out = None
+            self._last_count = 0
+            return True
 
     def close(self) -> None:
         """``stop()`` that never raises (for ``atexit`` / app shutdown)."""

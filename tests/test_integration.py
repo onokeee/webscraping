@@ -399,15 +399,16 @@ def test_chrome_script_fails_loudly_with_wrong_password(chrome):
     assert [(c.method, c.path) for c in site.adapter.calls] == [("GET", "/login"), ("POST", "/login")]
 
 
-def test_chrome_script_without_env_var_sends_empty_password(chrome, monkeypatch):
-    """Redacted secret + no environment variable -> an empty password goes out and the login is refused."""
+def test_chrome_script_without_env_var_stops_before_sending(chrome, monkeypatch):
+    """Redacted secret + no environment variable -> the script stops at once, naming the variable;
+    an empty password is never sent."""
     _recording, _plan, source = chrome
     monkeypatch.delenv("REQREC_PASSWORD", raising=False)
     site = ShopSite()
-    with pytest.raises(requests.HTTPError) as info:
+    with pytest.raises(SystemExit) as info:
         run_generated(source, site.adapter, env={})
-    assert info.value.response.status_code == 403
-    assert site.adapter.calls[1].form["password"] == ""
+    assert "REQREC_PASSWORD" in str(info.value.code) and "設定されていません" in str(info.value.code)
+    assert site.adapter.calls == []
 
 
 def test_cli_inspect_reports_the_traced_values(capsys):
@@ -1018,7 +1019,7 @@ def test_override_exclude_include_and_final_at_plan_level(chrome):
     assert any("f0002" in w and "除外" in w for w in dropped_final.warnings)
 
 
-def test_override_final_step_changes_only_the_printed_result(chrome):
+def test_override_final_step_changes_only_the_printed_result(chrome, tmp_path, monkeypatch):
     recording, _plan, _source = chrome
     plan = build_plan(recording, PlanOptions(final_flow_id="f0009"))
     source = generate(plan, GenOptions())
@@ -1029,9 +1030,12 @@ def test_override_final_step_changes_only_the_printed_result(chrome):
     assert source.index("resp, out = step_02_post_login(") < source.index("final_resp = resp") < source.index("resp, out = step_03_get_v1_me(")
     assert "soup = _soup(final_resp)" in source
     site = ShopSite()
-    out = run_generated(source, site.adapter, env={"REQREC_PASSWORD": ShopSite.PASSWORD})
+    monkeypatch.chdir(tmp_path)
+    out = run_generated(source, site.adapter, env={"REQREC_PASSWORD": ShopSite.PASSWORD, "REQREC_OUTPUT_DIR": str(tmp_path / "out")})
     _assert_chrome_replay(site, out.replace("ダッシュボード", "id,name new-foo new-bar"))  # all 8 calls still happen
-    assert out.strip() == "ダッシュボード"  # ... but the dashboard title is what gets printed
+    assert out.strip().splitlines()[-1] == "ダッシュボード"  # ... but the dashboard title is what gets printed
+    # the CSV export in the middle (Content-Disposition: attachment) is still kept as a file
+    assert "export.csv に保存しました" in out and (tmp_path / "out" / "export.csv").is_file()
 
 
 def test_override_exclude_step_via_cli_replays_without_the_export(tmp_path, capsys):

@@ -486,3 +486,75 @@ class TestFormBytes:
 ])
 def test_dynamic_looking_judges_percent_encoded_values_on_their_decoded_text(value, expected):
     assert deps.is_dynamic_looking(value) is expected
+
+
+# --------------------------------------------------------------------------- review 3: words vs random letters, route-like segments
+
+IDENTIFIER_WORDS = [
+    # acronym runs anywhere (start, middle, end) - names of ASP.NET controls, MVC actions, DOM APIs
+    "txtTokuisakiCD", "ddlSeisanKBN", "hdnSearchKEY", "btnExportCSV", "CustomerIDList", "ProductionResultCSV",
+    "OrderDateDESC", "DownloadAsPDF", "getXMLHttpRequest", "XMLHttpRequest", "HTMLDocument", "getElementById",
+    "getElementsByTagName", "encodeURIComponent", "toLocaleDateString", "XMLHTTPRequest",
+    # Japanese-system abbreviations (two-letter words) and separators
+    "txtTokuisakiCd", "hdnShohinCdList", "TokuisakiNmKana", "txtJyuchuNoFrom", "SeisanSuKei",
+    "Customer_ID_List", "export-production-CSV", "ProductionResultCSV.aspx", "getXMLHttpRequest.js",
+]
+
+
+@pytest.mark.parametrize("value", IDENTIFIER_WORDS)
+def test_identifiers_with_acronyms_are_words(value):
+    assert deps.looks_random_letters(value) is False
+    assert deps.is_dynamic_looking(value) is False
+
+
+@pytest.mark.parametrize("value", [
+    "xBBHOHpXYZgFKyNZpuWy",       # the factory site's letters-only URL key
+    "EThwGCKtUHzbgRcwocKJ",
+    "xBBHOH-pXYZgFKyNZpuWy",      # base64url without digits: '-' / '_' separate judged parts
+    "pXYZgFKy_NZpuWyxBBHOH",
+    "xBBHOHpXYZgFKyNZpuWy.pdf",   # a random file name: judged by its stem
+])
+def test_random_letter_tokens_are_tokens(value):
+    assert deps.looks_random_letters(value) is True
+    assert deps.is_dynamic_looking(value) is True
+    assert deps.is_route_like(value) is False
+
+
+@pytest.mark.parametrize("value", ["QZVBNMWRTYPXSDFKHJ", "qzvbnmwrtypxsdfkhj", "short", "getX", "aBcD"])
+def test_single_case_or_short_letters_are_not_judged_random(value):
+    assert deps.looks_random_letters(value) is False
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("Login.aspx", True), ("News.aspx", True), ("orders", True), ("export-csv", True), ("ProductionResultCSV", True),
+    ("QZVBNMWRTYPXSDFKHJ", True),                       # all uppercase: a word for the regex, traced only exactly
+    ("SC0010.aspx", True), ("KJ010Search.aspx", True), ("Menu01.aspx", True), ("WebForm1.aspx", True),
+    ("KJ010SearchResult.aspx", True), ("SC0010Detail.ASPX", True), ("list.do", True), ("report2.php", True),
+    ("xBBHOHpXYZgFKyNZpuWy", False), ("xBBHOHpXYZgFKyNZpuWy.aspx", False), ("xBBHOH-pXYZgFKyNZpuWy", False),
+    ("a8F3kQ9zP2.aspx", False), ("aB3dEfGhIjKlMn.aspx", False), ("77", False), ("abc123def456", False),
+    ("logo01.png", False), ("", False), ("jquery.min.js", True), ("xBBHOHpXYZgFKyNZpuWy.min.js", False),
+])
+def test_is_route_like(value, expected):
+    assert deps.is_route_like(value) is expected
+
+
+def test_route_like_path_segments_stay_candidates_but_are_flagged():
+    """Regression: letters-only path segments used to be dropped, losing exact JSON / header traces."""
+    f = req_flow("GET", "https://s/s/QZVBNMWRTYPXSDFKHJ/SC0010.aspx?key=xBBHOHpXYZgFKyNZpuWy")
+    cands = {(c.location, c.name): c for c in deps.find_candidates(f, PlanOptions())}
+    assert cands[("path", "1")].value == "QZVBNMWRTYPXSDFKHJ" and cands[("path", "2")].value == "SC0010.aspx"
+    assert deps.is_structural_path_segment(cands[("path", "1")])
+    assert deps.is_structural_path_segment(cands[("path", "2")])
+    assert not deps.is_structural_path_segment(cands[("query", "key")])  # only path segments
+    assert not deps.is_structural_path_segment(deps.Candidate("path", "0", "xBBHOHpXYZgFKyNZpuWy"))
+    assert ("path", "0") not in cands  # "s": too short to be a candidate at all
+
+
+def test_selectors_use_ids_with_acronyms():
+    """``_attr_ok`` rejects dynamic-looking ids; ``lblTokuisakiCD`` must not count as one."""
+    f = resp_flow(b'<html><body><span id="lblTokuisakiCD">TK-2026-0042</span><span>TK-2026-0042x</span>'
+                  b'<a id="lnkExportCSV" href="/Export.aspx?t=EXPtok98765">x</a></body></html>')
+    ext = check(deps.locate_value("TK-2026-0042", f), f, "TK-2026-0042")
+    assert (ext.kind, ext.selector) == ("html_text", "#lblTokuisakiCD")
+    ext = check(deps.locate_value("EXPtok98765", f), f, "EXPtok98765")
+    assert (ext.kind, ext.selector, ext.attr) == ("html_attr", "#lnkExportCSV", "href")

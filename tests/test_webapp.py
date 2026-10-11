@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -62,6 +63,8 @@ STUB_SOURCE = textwrap.dedent(
 
     signal.signal(signal.SIGINT, _bye)
     signal.signal(signal.SIGTERM, _bye)
+    if hasattr(signal, "SIGBREAK"):  # Windows: RecorderManager.stop() sends CTRL_BREAK_EVENT
+        signal.signal(signal.SIGBREAK, _bye)
     from reqrec.model import Flow, Recording, RecordedRequest, RecordedResponse
 
     rec = Recording(meta={"source": "mitmproxy", "started_at": "stub"})
@@ -856,6 +859,23 @@ class TestRecorderManager:
             m.start(str(tmp_path / "r.json"))
         assert m.running is False
 
+    def test_forget_drops_the_output_of_a_stopped_session_only(self, tmp_path, stub_script):
+        m = RecorderManager(command_builder=_stub_builder(stub_script, n=2))
+        out = tmp_path / "r.json"
+        m.start(str(out))
+        try:
+            assert m.forget() is False and m.out == str(out)  # never while running
+            assert _wait_until(lambda: m.flow_count() == 2, 15)
+        finally:
+            m.stop()
+        assert m.forget() is True
+        st = m.status()
+        assert st["out"] is None and st["out_name"] is None and st["flows"] == 0 and st["running"] is False
+        assert st["exit_code"] == 0 and "stub" in st["stdout_tail"]  # diagnostics stay
+        with pytest.raises(RecorderError):
+            m.load_recording()
+        assert out.is_file()  # forget() never deletes anything itself
+
     def test_child_dying_is_reported(self, tmp_path):
         m = RecorderManager(command_builder=lambda out, **kw: [sys.executable, "-c", "import sys; sys.stderr.write('Address already in use\\n'); sys.exit(3)"])
         m.start(str(tmp_path / "r.json"))
@@ -980,6 +1000,17 @@ class TestRecordEndpoints:
         r = client.post("/api/record/stop", json={}, headers=H)
         assert r.status_code == 409
 
+    def test_discard_with_the_real_recorder_forgets_the_file(self, client, H, stubbed, workdir):
+        r = client.post("/api/record/start", json={"port": 18080}, headers=H)
+        assert r.status_code == 200
+        out = workdir / "recordings" / r.get_json()["out"]
+        assert _wait_until(lambda: out.is_file(), 15)
+        r = client.post("/api/record/stop", json={"discard": True}, headers=H)
+        assert r.status_code == 200 and r.get_json()["removed"] is True and not out.exists()
+        st = client.get("/api/record/status").get_json()
+        assert st["out"] is None and st["running"] is False  # the panel shows 「停止中」, not 「記録は保存されました」
+        assert client.post("/api/record/stop", json={}, headers=H).status_code == 409
+
     def test_start_validation(self, client, H, stubbed):
         assert client.post("/api/record/start", json={"port": "abc"}, headers=H).status_code == 400
         assert client.post("/api/record/start", json={"port": 0}, headers=H).status_code == 400
@@ -994,7 +1025,7 @@ class TestRecordEndpoints:
         client.post("/api/record/start", json={"port": 18080}, headers=H)
         assert _wait_until(lambda: "wrote 0 flows" in client.get("/api/record/status").get_json()["stdout_tail"], 15)
         r = client.post("/api/record/stop", json={}, headers=H)
-        assert r.status_code == 400 and "フロー" in r.get_json()["error"]
+        assert r.status_code == 400 and "何も記録されませんでした" in r.get_json()["error"] and r.get_json()["empty"] is True
         assert client.get("/api/state").get_json()["recording"]["loaded"] is False
 
     def test_stop_when_no_file_written_is_400(self, client, H):
@@ -1002,7 +1033,9 @@ class TestRecordEndpoints:
         state.recorder.command_builder = lambda out, **kw: [sys.executable, "-c", "import time\ntime.sleep(30)"]
         client.post("/api/record/start", json={"port": 18080}, headers=H)
         r = client.post("/api/record/stop", json={}, headers=H)
-        assert r.status_code == 400 and "作成されませんでした" in r.get_json()["error"]
+        # no file at all = nothing was recorded (the addon writes after the first response only)
+        assert r.status_code == 400 and "何も記録されませんでした" in r.get_json()["error"] and r.get_json()["empty"] is True
+        assert client.get("/api/state").get_json()["recording"]["loaded"] is False
 
     def test_missing_mitmproxy_is_reported(self, client, H, monkeypatch):
         monkeypatch.setattr(routes_mod, "mitmproxy_available", lambda: False)
@@ -1043,7 +1076,7 @@ class TestRunGui:
 
     def test_bind_error_from_app_run_returns_1(self, monkeypatch, tmp_path, capsys):
         def fake_run(self, **kw):
-            raise OSError(98, "Address already in use")
+            raise OSError(errno.EADDRINUSE, "Address already in use")  # 98 on Linux, 10048 on Windows
 
         monkeypatch.setattr(flask.Flask, "run", fake_run)
         rc = run_gui(host="127.0.0.1", port=_free_port(), workdir=str(tmp_path / "w"), open_browser=False)

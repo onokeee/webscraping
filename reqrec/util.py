@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import keyword
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -95,7 +96,7 @@ def _normalise_charset(cs: str) -> str:
     aliases = {"shift-jis": "cp932", "shift_jis": "cp932", "sjis": "cp932", "x-sjis": "cp932", "windows-31j": "cp932", "ms932": "cp932"}
     cs = aliases.get(cs, cs)
     try:
-        b"".decode(cs)
+        "".encode(cs)  # an unknown name raises LookupError (decoding b"" skips the codec lookup)
     except (LookupError, TypeError):
         return "utf-8"
     return cs
@@ -236,3 +237,105 @@ def looks_like_secret_name(name: str) -> bool:
 
 def truncate(s: str, n: int = 80) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# --------------------------------------------------------------------------- downloads (GUI display)
+#
+# These mirror the helpers the generated scripts carry (``codegen._DOWNLOAD_HELPERS_SRC``) so the GUI
+# shows the same decision and the same file name the script will use (DESIGN.md §13.13).
+
+_DISPOSITION_EXT_RE = re.compile(r"filename\*\s*=\s*([^';]*)'[^']*'([^;]+)", re.I)
+_DISPOSITION_RE = re.compile(r'filename\s*=\s*(?:"([^"]*)"|([^;]+))', re.I)
+_PCT_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+_RESERVED_FILE_NAME_RE = re.compile(r"(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3])", re.I)
+MAX_FILE_NAME = 150
+
+
+def is_attachment_disposition(content_disposition: Optional[str]) -> bool:
+    """Is a response with this ``Content-Disposition`` a file download?
+
+    True when the value (stripped, lower-cased) starts with ``attachment``, or contains
+    ``filename`` and does not start with ``inline``.  ``inline; filename=f.txt`` (Spring's
+    reflected-file-download protection on every JSON response) is *not* a download.  The generated
+    scripts' ``_is_attachment`` applies the same rule."""
+    disposition = (content_disposition or "").strip().lower()
+    if disposition.startswith("attachment"):
+        return True
+    return "filename" in disposition and not disposition.startswith("inline")
+
+
+def _decode_encoded_words(text: str) -> str:
+    """RFC 2047 encoded words (``=?UTF-8?B?...?=``, ``=?Shift_JIS?Q?...?=``) -> text; unchanged when
+    there are none or they cannot be decoded."""
+    from email.header import decode_header
+
+    try:
+        parts = decode_header(text)
+    except Exception:
+        return text
+    out: list[str] = []
+    for part, charset in parts:
+        if isinstance(part, str):
+            out.append(part)
+        elif charset:
+            try:
+                out.append(part.decode(_normalise_charset(charset), "replace"))
+            except LookupError:  # pragma: no cover - _normalise_charset only returns known codecs
+                out.append(part.decode("utf-8", "replace"))
+        else:
+            out.append(part.decode("raw-unicode-escape", "replace"))
+    return "".join(out)
+
+
+def safe_file_name(name: Optional[str]) -> str:
+    """A file name usable on Windows: no folder part, no forbidden characters, reserved device names
+    (``CON``, ``NUL``, ``COM1`` ... with any extension) prefixed with ``_``, at most
+    :data:`MAX_FILE_NAME` characters (the extension is kept).  ``''`` when nothing is left."""
+    name = (name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
+    if not name:
+        return ""
+    if _RESERVED_FILE_NAME_RE.fullmatch(name.split(".", 1)[0].rstrip(" ")):
+        name = "_" + name
+    if len(name) > MAX_FILE_NAME:
+        stem, ext = os.path.splitext(name)
+        if len(ext) > 16:  # not a real extension
+            stem, ext = name, ""
+        name = stem[: MAX_FILE_NAME - len(ext)].rstrip(" .") + ext
+    return name
+
+
+def download_filename(content_disposition: Optional[str]) -> Optional[str]:
+    """File name from a ``Content-Disposition`` header, decoded the way the generated scripts do
+    (RFC 6266 ``filename*=``, RFC 2047 ``=?UTF-8?B?...?=``, IE-style percent-encoded UTF-8, raw
+    UTF-8 / Shift_JIS bytes read as Latin-1) and made safe with :func:`safe_file_name`; ``None``
+    when the header names no file.  It only decodes the name: whether the response is a download
+    at all is :func:`is_attachment_disposition`.  Used to show 「保存されるファイル」 in the GUI."""
+    from urllib.parse import unquote
+
+    value = content_disposition or ""
+    m = _DISPOSITION_EXT_RE.search(value)
+    name: Optional[str] = None
+    if m:
+        try:
+            name = unquote(m.group(2).strip().strip('"'), encoding=m.group(1).strip() or "utf-8", errors="replace")
+        except LookupError:
+            name = unquote(m.group(2).strip().strip('"'), encoding="utf-8", errors="replace")
+    else:
+        m = _DISPOSITION_RE.search(value)
+        if m:
+            raw = (m.group(1) if m.group(1) is not None else m.group(2)).strip()
+            decoded = _decode_encoded_words(raw) if "=?" in raw else raw
+            if decoded != raw:
+                name = decoded
+            elif _PCT_RE.search(raw):
+                name = unquote(raw, encoding="utf-8", errors="replace")
+            else:
+                name = raw
+                for codec in ("utf-8", "cp932"):
+                    try:
+                        name = raw.encode("latin-1").decode(codec)
+                        break
+                    except (UnicodeEncodeError, UnicodeDecodeError):
+                        continue
+    return safe_file_name(name) or None

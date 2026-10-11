@@ -617,12 +617,80 @@ class TestOptions:
 
     def test_print_final_binary_saves_file(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("REQREC_OUTPUT_DIR", raising=False)  # this test checks the cwd default
         plan = Plan(steps=[step(1, "GET", "/x", response_kind="binary")])
         src = compiles(generate(plan))
         adapter = MockAdapter([Rule(H + "/x", body=b"\x00\x01\x02", content_type="application/octet-stream")])
         out = run_generated(src, adapter)
         assert (tmp_path / "output.bin").read_bytes() == b"\x00\x01\x02"
         assert "output.bin" in out and "3 バイト" in out
+
+    XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    @pytest.mark.parametrize("disposition,expected", [
+        # RFC 6266 / 5987
+        ("attachment; filename*=UTF-8''%E7%94%9F%E7%94%A3%E5%AE%9F%E7%B8%BE.xlsx", "生産実績.xlsx"),
+        ("attachment; filename=\"fallback.xlsx\"; filename*=UTF-8''%E5%AE%9F%E7%B8%BE.xlsx", "実績.xlsx"),
+        # IE-style percent-encoded UTF-8 in plain filename=
+        ("attachment; filename=%E7%94%9F%E7%94%A3.xlsx", "生産.xlsx"),
+        # raw Shift_JIS bytes (legacy IIS) – http.client hands them over as Latin-1
+        ("attachment; filename=\"" + "生産実績.xlsx".encode("cp932").decode("latin-1") + "\"", "生産実績.xlsx"),
+        # raw UTF-8 bytes
+        ("attachment; filename=" + "日報.xlsx".encode("utf-8").decode("latin-1"), "日報.xlsx"),
+        # path tricks are neutralised
+        ("attachment; filename=\"..\\\\..\\\\evil.xlsx\"", "evil.xlsx"),
+        ("attachment; filename=\"a:b?.xlsx\"", "a_b_.xlsx"),
+        # no name at all -> output + extension from the MIME type
+        ("attachment", "output.xlsx"),
+    ])
+    def test_final_download_uses_server_file_name(self, tmp_path, monkeypatch, disposition, expected):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("REQREC_OUTPUT_DIR", raising=False)  # this test checks the cwd default
+        plan = Plan(steps=[step(1, "POST", "/Search.aspx", "step_01_search", response_kind="binary")])
+        src = compiles(generate(plan))
+        adapter = MockAdapter([Rule(H + "/Search.aspx", body=b"PK\x03\x04xlsx", content_type=self.XLSX,
+                                    headers={"Content-Disposition": disposition})])
+        out = run_generated(src, adapter)
+        assert (tmp_path / expected).read_bytes() == b"PK\x03\x04xlsx"
+        assert expected in out and "に保存しました" in out
+        assert not (tmp_path / "output.bin").exists() or expected == "output.bin"
+
+    def test_final_download_name_from_url_and_output_dir(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("REQREC_OUTPUT_DIR", raising=False)  # this test checks the cwd default
+        outdir = tmp_path / "outputs"
+        plan = Plan(steps=[step(1, "GET", "/files/report.xlsx", "step_01_report", response_kind="binary")])
+        src = compiles(generate(plan))
+        adapter = MockAdapter([Rule(H + "/files/report.xlsx", body=b"PK", content_type=self.XLSX)])
+        run_generated(src, adapter, env={"REQREC_OUTPUT_DIR": str(outdir)})
+        assert (outdir / "report.xlsx").read_bytes() == b"PK"
+
+    def test_text_attachment_is_saved_and_previewed(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("REQREC_OUTPUT_DIR", raising=False)  # this test checks the cwd default
+        csv = "品番,数量\nA-1001,12\n".encode("cp932")
+        plan = Plan(steps=[step(1, "POST", "/Export.aspx", "step_01_export", response_kind="text")])
+        src = compiles(generate(plan))
+        adapter = MockAdapter([Rule(H + "/Export.aspx", body=csv, content_type="text/csv; charset=Shift_JIS",
+                                    headers={"Content-Disposition": "attachment; filename=export.csv"})])
+        out = run_generated(src, adapter)
+        assert (tmp_path / "export.csv").read_bytes() == csv
+        assert "export.csv に保存しました" in out and "A-1001,12" in out
+
+    def test_text_without_attachment_is_only_printed(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("REQREC_OUTPUT_DIR", raising=False)  # this test checks the cwd default
+        plan = Plan(steps=[step(1, "GET", "/x.txt", "step_01_x", response_kind="text")])
+        src = compiles(generate(plan))
+        adapter = MockAdapter([Rule(H + "/x.txt", body="hello", content_type="text/plain")])
+        assert run_generated(src, adapter) == "hello\n"
+        assert list(tmp_path.iterdir()) == []
+
+    def test_download_helpers_without_comments(self):
+        src = generate(Plan(steps=[step(1, "GET", "/x", response_kind="binary")]), GenOptions(comments=False))
+        check_format(src)
+        assert comment_tokens(src) == []
+        assert "def _save_download(resp):" in src
 
     def test_json_final_falls_back_to_text(self):
         plan = Plan(steps=[step(1, "GET", "/x", response_kind="json")])

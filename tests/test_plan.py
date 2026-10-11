@@ -570,3 +570,238 @@ def test_reserved_parameter_names_are_qualified_with_the_route():
 def test_plan_without_auth_has_no_auth_fields():
     plan = login_site().plan()
     assert plan.auth is None and plan.final_step_index is None and "auth" not in plan.meta
+
+
+# --------------------------------------------------------------------------- review 3: route-like path segments
+
+def test_all_uppercase_path_key_is_traced_to_an_exact_json_leaf():
+    """Regression: letters-only path segments were removed from the candidates, so a base32 session
+    key in the path (traceable to a JSON leaf) stayed a stale literal."""
+    s = Site()
+    s.add("GET", "/api/session", resp_headers=JSON, resp_body=b'{"session": {"key": "QZVBNMWRTYPXSDFKHJ"}}')
+    s.add("GET", "/s/QZVBNMWRTYPXSDFKHJ/items", resp_headers=JSON, resp_body=b"[]")
+    plan = s.plan()
+    (ext,) = plan.steps[0].extractors
+    assert (ext.kind, ext.path) == ("json", ["session", "key"])
+    assert plan.steps[1].url == [Ref.lit("https://site.example/s/"), Ref.var(ext.var), Ref.lit("/items")]
+
+
+def test_route_like_path_segment_keeps_exact_header_and_input_traces_but_never_markup():
+    s = Site()
+    s.add("GET", "/start", resp_headers=HTML + [("X-Next-Page", "SC0020.aspx")],
+          resp_body=b'<html><a id="nx" href="SC0020.aspx">next</a><span id="pg">SC0030.aspx</span>'
+                    b'<form action="KJ010Search.aspx"><input type="hidden" name="hdnNext" value="Menu01.aspx"></form></html>')
+    s.add("GET", "/SC0020.aspx")        # equal to a response header -> traced (exact)
+    s.add("GET", "/start", resp_headers=HTML + [("X-Next-Page", "SC0020.aspx")],
+          resp_body=b'<html><form><input type="hidden" name="hdnNext" value="Menu01.aspx"></form></html>')
+    s.add("GET", "/Menu01.aspx")        # equal to an <input> value -> traced (exact)
+    s.add("GET", "/start", resp_body=b'<html><span id="pg">SC0030.aspx</span><form action="KJ010Search.aspx"></form></html>')
+    s.add("GET", "/SC0030.aspx")        # only element text -> literal
+    s.add("GET", "/start", resp_body=b'<html><span id="pg">SC0030.aspx</span><form action="KJ010Search.aspx"></form></html>')
+    s.add("POST", "/KJ010Search.aspx", [FORM], body=b"q=hello_world")  # only a form action -> literal
+    plan = s.plan(PlanOptions(detect_loops=False))
+    steps = {st.index: st for st in plan.steps}
+    assert [(e.kind, e.name) for st in plan.steps for e in st.extractors] == [("header", "X-Next-Page"), ("html_input", "hdnNext")]
+    header_ext, input_ext = plan.steps[0].extractors[0], plan.steps[2].extractors[0]
+    assert steps[2].url == [Ref.lit("https://site.example/"), Ref.var(header_ext.var)]
+    assert steps[4].url == [Ref.lit("https://site.example/"), Ref.var(input_ext.var)]
+    assert steps[6].literal_url() == "https://site.example/SC0030.aspx"
+    assert steps[8].literal_url() == "https://site.example/KJ010Search.aspx"
+    assert plan.constants == [] and not any("looks dynamic" in w for w in plan.warnings)
+
+
+def test_screen_id_pages_are_literal_in_urls_and_referers():
+    """``SC0010.aspx`` / ``KJ010Search.aspx`` / ``Menu01.aspx`` used to be traced to markup (the digits
+    made them non-structural) and the Referer rewrite spread that dependency."""
+    s = Site("http://intra.example")
+    page = (b'<html><a id="m" href="Menu01.aspx">menu</a><form id="f" action="KJ010Search.aspx">'
+            b'<input type="hidden" name="__VIEWSTATE" value="VS0123456789abc"></form></html>')
+    s.add("GET", "/SC0010.aspx", resp_body=page)
+    s.add("POST", "/KJ010Search.aspx", [FORM, ("Referer", "http://intra.example/SC0010.aspx")],
+          body=b"__VIEWSTATE=VS0123456789abc&q=x", resp_body=page)
+    s.add("GET", "/Menu01.aspx", [("Referer", "http://intra.example/KJ010Search.aspx")], resp_body=page)
+    s.add("GET", "/SC0010.aspx", [("Referer", "http://intra.example/Menu01.aspx")], resp_body=page)
+    plan = s.plan(PlanOptions(detect_loops=False))
+    assert [st.literal_url() for st in plan.steps] == [
+        "http://intra.example/SC0010.aspx", "http://intra.example/KJ010Search.aspx",
+        "http://intra.example/Menu01.aspx", "http://intra.example/SC0010.aspx"]
+    assert [(e.kind, e.name) for st in plan.steps for e in st.extractors] == [("html_input", "__VIEWSTATE")]
+    assert all(r.is_literal for st in plan.steps for n, r in st.headers if n.lower() == "referer")
+    assert plan.constants == []
+
+
+def test_mvc_route_words_with_acronyms_are_not_traced_through_markup():
+    s = Site()
+    s.add("GET", "/Production/Index", resp_body=b'<html><a id="x" href="/Production/ProductionResultCSV">csv</a>'
+                                                 b'<script>var a = "/Production/OrderDateDESC";</script></html>')
+    s.add("GET", "/Production/ProductionResultCSV", resp_headers=[("Content-Type", "text/csv")], resp_body=b"a,b\n")
+    s.add("GET", "/Production/OrderDateDESC", resp_body=b"<html></html>")
+    plan = s.plan(PlanOptions(detect_loops=False))
+    assert plan.steps[0].extractors == []
+    assert [st.literal_url() for st in plan.steps[1:]] == [
+        "https://site.example/Production/ProductionResultCSV", "https://site.example/Production/OrderDateDESC"]
+    assert not any("looks dynamic" in w for w in plan.warnings)
+
+
+def test_digit_free_base64url_key_is_a_token():
+    """``xBBHOH-pXYZgFKyNZpuWy`` is not a route word: traced by pattern, and warned about otherwise."""
+    s = Site()
+    s.add("GET", "/menu", resp_body=b"<html><a id=\"s\" onclick=\"window.open('Search.aspx?key=xBBHOH-pXYZgFKyNZpuWy','s')\">s</a></html>")
+    s.add("GET", "/Search.aspx?key=xBBHOH-pXYZgFKyNZpuWy")
+    s.add("GET", "/r/pXYZgFKy_NZpuWyxBBHOH/view")
+    plan = s.plan(PlanOptions(detect_loops=False))
+    (ext,) = plan.steps[0].extractors
+    assert ext.pattern and params(plan.steps[1])["key"] == Ref.var(ext.var)
+    assert plan.constants == []
+    # an untraced random path key is not a route name: the stale literal is warned about
+    assert any("path segment 1" in w and "looks dynamic" in w for w in plan.warnings)
+    # repeated and untraced: a shared constant (not kept in the URL like a route name), still warned about
+    s.add("GET", "/r/pXYZgFKy_NZpuWyxBBHOH/view?x=1")
+    plan = s.plan(PlanOptions(detect_loops=False))
+    assert [c.value for c in plan.constants] == ["pXYZgFKy_NZpuWyxBBHOH"]
+
+
+# --------------------------------------------------------------------------- review 3: Referer substitution
+
+from reqrec.plan import _referer_with_fresh_values  # noqa: E402
+
+
+def _eval_ref(ref, **names):
+    import requests
+
+    return eval(ref.value, {"requests": requests, "unquote": unquote, "str": str}, names)  # noqa: S307
+
+
+def test_referer_replaces_whole_tokens_only():
+    refs = {("query", "key", "ABCDEFGH1234"): Ref.var("key")}
+    referer = ("http://ABCDEFGH1234.example/x/ABCDEFGH1234/y?key=ABCDEFGH1234&long=ABCDEFGH12345"
+               "&pre=xABCDEFGH1234&ABCDEFGH1234#ABCDEFGH1234")
+    ref = _referer_with_fresh_values(referer, refs)
+    assert ref.kind == "expr"
+    assert _eval_ref(ref, key="NEW") == ("http://ABCDEFGH1234.example/x/NEW/y?key=NEW&long=ABCDEFGH12345"
+                                          "&pre=xABCDEFGH1234&NEW#ABCDEFGH1234")
+    # in the host, or inside longer tokens only -> nothing to replace
+    assert _referer_with_fresh_values("http://ABCDEFGH1234.example/a?k=ABCDEFGH12345", refs) == \
+        Ref.lit("http://ABCDEFGH1234.example/a?k=ABCDEFGH12345")
+    # path parameters (``;jsessionid=``) are whole tokens too
+    ref = _referer_with_fresh_values("http://h/app/list.do;jsessionid=ABCDEFGH1234?p=1", refs)
+    assert _eval_ref(ref, key="NEW") == "http://h/app/list.do;jsessionid=NEW?p=1"
+    # short values, literal refs and non-URL headers stay literal
+    assert _referer_with_fresh_values("http://h/a?k=1234567", {("query", "k", "1234567"): Ref.var("k")}).is_literal
+    assert _referer_with_fresh_values("http://h/a?k=ABCDEFGH1234", {("query", "k", "ABCDEFGH1234"): Ref.lit("x")}).is_literal
+    assert _referer_with_fresh_values("about:blank ABCDEFGH1234", refs).is_literal
+
+
+def test_referer_handles_the_percent_encoded_spelling():
+    """A key with ``+ / =`` appears percent-encoded in the Referer and used to stay stale."""
+    raw = "Qk+9/zR8vT=="
+    referer = "http://h/Search.aspx?key=Qk%2B9%2FzR8vT%3D%3D&x=1"
+    # value decoded from an encoded source (``unquote(X)``): X is the fresh encoded spelling
+    ref = _referer_with_fresh_values(referer, {("query", "key", raw): Ref.expr("unquote(key)")})
+    assert ref.value == "'http://h/Search.aspx?key=' + str(key) + '&x=1'"
+    assert _eval_ref(ref, key="Zz%2B1%2FyY2xX%3D%3D") == "http://h/Search.aspx?key=Zz%2B1%2FyY2xX%3D%3D&x=1"
+    # any other ref: quoted with requests.utils.quote (the generated script always imports requests)
+    ref = _referer_with_fresh_values(referer, {("query", "key", raw): Ref.var("key")})
+    assert "requests.utils.quote(str(key), safe='')" in ref.value
+    assert _eval_ref(ref, key="Zz+1/yY2xX==") == "http://h/Search.aspx?key=Zz%2B1%2FyY2xX%3D%3D&x=1"
+    # the verbatim spelling still wins, also for an unquote(X) ref
+    ref = _referer_with_fresh_values("http://h/S.aspx?key=" + raw, {("query", "key", raw): Ref.expr("unquote(key)")})
+    assert _eval_ref(ref, key="Zz%2B1") == "http://h/S.aspx?key=Zz+1"
+    # '+' for a space in a query value
+    ref = _referer_with_fresh_values("http://h/s?q=hello+big+world", {("query", "q", "hello big world"): Ref.var("q")})
+    assert _eval_ref(ref, q="a b") == "http://h/s?q=a%20b"
+
+
+def test_referer_rewrite_in_a_plan_keeps_host_and_unrelated_tokens():
+    s = Site("http://kanri01")
+    s.add("GET", "/Menu.aspx", resp_body=b"<html><a id=\"s\" onclick=\"window.open('Search.aspx?key=kanri01KEYxyz9','s')\">s</a></html>")
+    s.add("GET", "/Search.aspx?key=kanri01KEYxyz9", [("Referer", "http://kanri01/Menu.aspx?from=kanri01KEYxyz9X")],
+          resp_body=b'<html><form id="form1" action="Search.aspx?key=kanri01KEYxyz9"></form></html>')
+    s.add("POST", "/Search.aspx?key=kanri01KEYxyz9", [FORM, ("Referer", "http://kanri01/Search.aspx?key=kanri01KEYxyz9")],
+          body=b"q=1", resp_body=b"<html></html>")
+    plan = s.plan()
+    get_search, post_search = plan.steps[1], plan.steps[2]
+    assert hdr(get_search, "Referer") == Ref.lit("http://kanri01/Menu.aspx?from=kanri01KEYxyz9X")
+    key_var = params(post_search)["key"].value
+    assert hdr(post_search, "Referer") == Ref.expr(f"'http://kanri01/Search.aspx?key=' + str({key_var})")
+
+
+# --------------------------------------------------------------------------- review 3: secrets that are not trace candidates
+
+@pytest.mark.parametrize("password", ["admin", "guest", "abc", "123", "x"])
+def test_short_or_plain_word_passwords_are_still_secret(password):
+    s = Site()
+    s.add("GET", "/login", resp_body=b"<html></html>")
+    s.add("POST", "/login", [FORM], body=f"user=taro&password={password}".encode(), resp_body=b"<html></html>")
+    plan = s.plan()
+    (const,) = plan.constants
+    assert (const.name, const.value, const.secret, const.env_var) == ("PASSWORD", password, True, "REQREC_PASSWORD")
+    assert form(plan.steps[1], "password") == Ref.var("PASSWORD") and form(plan.steps[1], "user") == Ref.lit("taro")
+    assert any("REQREC_PASSWORD" in w for w in plan.warnings)
+    no_redact = s.plan(PlanOptions(redact_secrets=False))
+    assert form(no_redact.steps[1], "password") == Ref.lit(password) and no_redact.constants == []
+
+
+def test_password_equal_to_the_user_id_is_still_secret():
+    """Regression: the per-step value cache handed the user id's literal Ref to the password."""
+    s = Site()
+    s.add("POST", "/Login.aspx", [FORM], body=b"txtUserId=tanaka01&txtPassword=tanaka01&btnLogin=Login", resp_body=b"<html></html>")
+    plan = s.plan()
+    assert form(plan.steps[0], "txtUserId") == Ref.lit("tanaka01")
+    assert form(plan.steps[0], "txtPassword") == Ref.var("TXT_PASSWORD")
+    (const,) = plan.constants
+    assert (const.value, const.secret, const.env_var) == ("tanaka01", True, "REQREC_TXT_PASSWORD")
+
+
+def test_repeated_user_id_constant_is_not_turned_into_the_password():
+    """The user id's shared constant stays plain; the password gets its own environment variable."""
+    s = Site()
+    for _ in range(2):
+        s.add("POST", "/Login.aspx", [FORM], body=b"txtUserId=tanaka01&txtPassword=tanaka01", resp_body=b"<html></html>")
+        s.add("GET", "/Logout.aspx", resp_body=b"<html></html>")
+    plan = s.plan(PlanOptions(detect_loops=False))
+    consts = {c.name: c for c in plan.constants}
+    assert (consts["TXT_USER_ID"].secret, consts["TXT_USER_ID"].env_var) == (False, None)
+    assert (consts["TXT_PASSWORD"].secret, consts["TXT_PASSWORD"].env_var) == (True, "REQREC_TXT_PASSWORD")
+    for st in (plan.steps[0], plan.steps[2]):
+        assert form(st, "txtUserId") == Ref.var("TXT_USER_ID") and form(st, "txtPassword") == Ref.var("TXT_PASSWORD")
+
+
+def test_secret_fields_outside_forms_are_redacted_too():
+    s = Site()
+    s.add("POST", "/api/login?pwd=987", [("Content-Type", "application/json"), ("Authorization", "Bearer abc"), ("X-Api-Key", "k1")],
+          body=json.dumps({"user": "taro", "pin": 123, "auth": {"password": "admin"}}).encode(), resp_headers=JSON, resp_body=b"{}")
+    s.add("POST", "/upload", [("Content-Type", "multipart/form-data; boundary=XyZ")],
+          body=b'--XyZ\r\nContent-Disposition: form-data; name="passwd"\r\n\r\nxyz\r\n--XyZ--\r\n', resp_body=b"<html></html>")
+    plan = s.plan()
+    api, upload = plan.steps
+    consts = {c.name: c for c in plan.constants}
+    assert all(c.secret and c.env_var == f"REQREC_{c.name}" for c in consts.values())
+    assert params(api)["pwd"] == Ref.var("PWD") and consts["PWD"].value == "987"
+    # a numeric leaf stays a number: int() of the environment variable
+    assert api.json_body == {"user": "taro", "pin": Ref.expr("int(PIN)"), "auth": {"password": Ref.var("PASSWORD")}}
+    assert (consts["PIN"].value, consts["PASSWORD"].value) == ("123", "admin")
+    assert hdr(api, "Authorization") == Ref.expr('"Bearer " + AUTHORIZATION') and consts["AUTHORIZATION"].value == "abc"
+    assert hdr(api, "X-Api-Key") == Ref.var("X_API_KEY") and consts["X_API_KEY"].value == "k1"
+    (part,) = upload.multipart
+    assert part.value == Ref.var("PASSWD") and consts["PASSWD"].value == "xyz"
+    assert not any(f"'{v}'" in repr(plan.steps) for v in ("admin", "abc", "xyz", "k1", "987"))
+
+
+def test_referer_never_carries_a_short_password():
+    """``Login.aspx?pwd=abc`` as the previous page: the Referer of the next request reuses the secret."""
+    s = Site("http://kanri01")
+    s.add("GET", "/Login.aspx?user=taro&pwd=abc", resp_body=b"<html></html>")
+    s.add("GET", "/Menu.aspx", [("Referer", "http://kanri01/Login.aspx?user=taro&pwd=abc&x=abc")], resp_body=b"<html></html>")
+    plan = s.plan()
+    assert params(plan.steps[0])["pwd"] == Ref.var("PWD")
+    referer = hdr(plan.steps[1], "Referer")
+    assert referer == Ref.expr("'http://kanri01/Login.aspx?user=taro&pwd=' + str(PWD) + '&x=abc'")
+
+
+def test_route_like_path_segments_do_not_turn_other_values_into_constants():
+    s = Site()
+    s.add("GET", "/Menu.aspx", resp_body=b"<html></html>")
+    s.add("POST", "/Logout.aspx", [FORM], body=b"ReturnUrl=Menu.aspx", resp_body=b"<html></html>")
+    plan = s.plan(PlanOptions(detect_loops=False))
+    assert plan.constants == [] and form(plan.steps[1], "ReturnUrl") == Ref.lit("Menu.aspx")

@@ -12,6 +12,8 @@
       data-is-windows="{{ 'true' if is_windows else 'false' }}"
       data-gui-address="{{ gui_address }}"
       data-mitm-available="{{ 'true' if mitmproxy_available else 'false' }}"
+      data-iehost-available="{{ 'true' if iehost and iehost.available else 'false' }}"
+      data-iehost-reason="{{ (iehost.reason if iehost and iehost.reason else '') }}"
       data-workdir="{{ workdir }}">
 
 <header class="topbar">
@@ -22,8 +24,9 @@
     </div>
     <div class="status-bar" id="status-bar" role="status" aria-live="polite">
       <span class="status-dot" id="status-dot"></span>
-      <span id="status-text">準備完了。まず「1 記録」か「2 読み込み」から始めてください。</span>
+      <span id="status-text">準備完了。</span>
     </div>
+    <button type="button" id="mode-toggle" class="btn tiny ghost mode-toggle" title="フィルタ設定や通信の一覧など、細かい設定を表示します">詳細設定を表示</button>
   </div>
   <nav class="steps-nav" id="nav" aria-label="作業の流れ">
     <button type="button" class="nav-step active" data-panel="record"><span class="nav-num">1</span><span class="nav-label">記録</span><span class="nav-badge" id="badge-record" hidden></span></button>
@@ -39,6 +42,121 @@
 </header>
 
 <main class="content">
+
+<!-- ===================================================== かんたん画面 (既定) -->
+<section id="panel-easy" class="easy" aria-labelledby="h-easy">
+
+  {% if not mitmproxy_available %}
+  <div class="notice warn">
+    <strong>記録機能の準備ができていません。</strong> 管理者（または IT 担当）に「mitmproxy が入っていない」と伝えてください。
+    コマンドプロンプトで <code>pip install "reqrec[record]"</code> を実行してから、この画面を開き直すと使えるようになります。
+  </div>
+  {% endif %}
+
+  <!-- 待機中 -->
+  <div class="easy-stage" id="easy-idle">
+    <div class="easy-hero">
+      <h1 id="h-easy">サイトの操作を記録して、自動取得スクリプトを作ります</h1>
+      <p class="lead" id="easy-lead">やることは 3 つだけです。ポートやプロキシなどの設定はすべて自動で行います。Windows の設定や証明書は変更しません。</p>
+      <ol class="easy-flow">
+        <li><span class="easy-flow-num">1</span><div><strong>記録をはじめる</strong> を押す<br><span class="hint" id="easy-hint-1">記録用のブラウザが開きます (Edge の IE モードと同じエンジン)</span></div></li>
+        <li><span class="easy-flow-num">2</span><div><strong>いつもどおりサイトを操作する</strong><br><span class="hint">ログイン → 一覧を開く → 欲しいデータの画面まで</span></div></li>
+        <li><span class="easy-flow-num">3</span><div><strong>記録をおわる</strong> を押す<br><span class="hint" id="easy-hint-3">ブラウザを閉じるだけでスクリプトが自動でできあがります</span></div></li>
+      </ol>
+    </div>
+    <div class="card easy-card">
+      <div class="form-grid compact">
+        <label for="easy-url">開くサイトのアドレス <span class="hint">(任意)</span></label>
+        <div><input id="easy-url" type="text" class="w-full" placeholder="例: http://kanri/  または  http://192.168.1.10/seisan/" autocomplete="url">
+          <div class="hint" id="easy-url-hint">空欄のままでも構いません。開いたブラウザのアドレス欄にサイトのアドレスを入れて開けます。</div></div>
+      </div>
+      <div class="easy-actions">
+        <button type="button" id="easy-start" class="btn primary xl" {% if not mitmproxy_available %}disabled{% endif %}>● 記録をはじめる</button>
+      </div>
+      <ul class="easy-ready" id="easy-ready" aria-live="polite"></ul>
+      <div class="easy-loaded" id="easy-loaded" hidden>
+        <span class="hint">すでに読み込まれている記録があります:</span>
+        <button type="button" id="easy-build-loaded" class="btn">読み込み済みの記録 (<span id="easy-loaded-count">0</span> 件) からスクリプトを作る</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 記録中 -->
+  <div class="easy-stage" id="easy-recording" hidden>
+    <div class="card easy-card easy-live-card">
+      <div class="easy-live"><span class="rec-light"></span><span>記録中</span></div>
+      <div class="easy-count"><span class="easy-count-num" id="easy-count">0</span><span class="easy-count-label">件の通信を記録しました</span></div>
+      <p class="easy-guide" id="easy-guide">開いたブラウザで、<strong>いつもどおりサイトを操作</strong>してください。<br>欲しいデータが画面に表示されたら <strong>[記録をおわる]</strong> を押します。</p>
+      <div class="notice warn" id="easy-cert-note" hidden></div>
+      <div class="notice info" id="easy-manual-proxy" hidden></div>
+      <div class="notice error" id="easy-rec-error" hidden></div>
+      <div class="easy-actions">
+        <button type="button" id="easy-stop" class="btn danger xl">■ 記録をおわる</button>
+        <button type="button" id="easy-open-browser" class="btn">ブラウザをもう一度開く</button>
+        <button type="button" id="easy-cancel" class="btn ghost">やめる (記録を破棄)</button>
+      </div>
+      <p class="hint" id="easy-count-hint">件数が増えないときは、ブラウザが開き直されていないか、別のブラウザを使っていないか確認してください。</p>
+    </div>
+  </div>
+
+  <!-- 処理中 -->
+  <div class="easy-stage" id="easy-processing" hidden>
+    <div class="card easy-card easy-center">
+      <div class="spinner" aria-hidden="true"></div>
+      <p class="easy-processing-text" id="easy-processing-text">処理しています…</p>
+    </div>
+  </div>
+
+  <!-- 完了 -->
+  <div class="easy-stage" id="easy-done" hidden>
+    <div class="card easy-card">
+      <h1 class="easy-done-title">✔ スクリプトができました</h1>
+      <dl class="kv easy-kv">
+        <dt>ファイル名</dt><dd><code id="easy-done-name"></code></dd>
+        <dt>保存先</dt><dd><code id="easy-done-path"></code></dd>
+        <dt>手順の数</dt><dd id="easy-done-steps"></dd>
+        <dt id="easy-done-files-label" hidden>保存されるファイル</dt><dd id="easy-done-files" hidden></dd>
+        <dt>最後に取得する画面</dt><dd id="easy-done-final" class="url-cell"></dd>
+      </dl>
+      <details class="easy-details">
+        <summary>スクリプトがする手順を見る</summary>
+        <ol class="easy-steplist" id="easy-steplist"></ol>
+      </details>
+      <div class="notice warn" id="easy-done-warnings" hidden>
+        <strong>確認してください</strong>
+        <ul class="warnings" id="easy-done-warning-list"></ul>
+      </div>
+      <div class="notice info" id="easy-done-secrets" hidden></div>
+      <div class="easy-actions">
+        <a id="easy-download" class="btn primary" href="#" download>⬇ スクリプトをダウンロード</a>
+        <button type="button" id="easy-open-folder" class="btn">保存先フォルダを開く</button>
+        <button type="button" id="easy-test-run" class="btn">▶ 試しに実行する</button>
+        <button type="button" id="easy-again" class="btn ghost">もう一度記録する</button>
+      </div>
+    </div>
+
+    <div class="card easy-card" id="easy-run" hidden>
+      <h2>試しに実行する</h2>
+      <div id="easy-env" class="form-grid compact"></div>
+      <div class="easy-actions">
+        <button type="button" id="easy-run-btn" class="btn primary">▶ 実行</button>
+        <button type="button" id="easy-run-stop" class="btn danger" disabled>■ 停止</button>
+        <span id="easy-run-state" class="run-state">待機中</span>
+        <button type="button" id="easy-save-output" class="btn" disabled>結果をファイルに保存</button>
+      </div>
+      <p class="hint" id="easy-save-output-result"></p>
+      <div class="notice error" id="easy-run-hint" hidden></div>
+      <h3>結果 (スクリプトの出力)</h3>
+      <pre class="console" id="easy-run-out"></pre>
+      <details id="easy-run-err-wrap" hidden>
+        <summary>エラーメッセージを表示</summary>
+        <pre class="console stderr" id="easy-run-err"></pre>
+      </details>
+    </div>
+  </div>
+
+  <div class="notice error" id="easy-error" hidden></div>
+</section>
 
 <!-- ===================================================== 1 記録 -->
 <section id="panel-record" class="panel active" aria-labelledby="h-record">
@@ -72,9 +190,38 @@
         <label>追加モード</label>
         <div><label class="check"><input id="rec-append" type="checkbox"><span>停止したとき、すでに読み込んである記録に<strong>追加して結合</strong>する</span></label></div>
 
+        <label class="win-only" for="rec-browser" hidden>記録方式</label>
+        <div class="win-only" hidden>
+          <select id="rec-browser" class="w-full">
+            <option value="iehost">アプリ内の記録用ブラウザで開く (IE エンジン、設定変更なし、http のみ)</option>
+            <option value="none">自分でブラウザを設定する (システムプロキシ / Edge)</option>
+          </select>
+          <div class="hint" id="rec-browser-hint">記録用のブラウザだけがこのツールのプロキシを通ります。Windows のプロキシ設定や証明書は変更しません。</div>
+        </div>
+
+        <label class="win-only rec-iehost-only" for="rec-start-url" hidden>最初に開くアドレス</label>
+        <div class="win-only rec-iehost-only" hidden><input id="rec-start-url" type="text" class="w-full" placeholder="例: http://kanri/  (空欄なら空のページで開きます)" autocomplete="url"></div>
+
+        <label class="win-only rec-iehost-only" for="rec-emulation" hidden>表示モード (記録用ブラウザ)</label>
+        <div class="win-only rec-iehost-only" hidden>
+          <select id="rec-emulation" class="w-full">
+            <option value="keep">変更しない (今の設定のまま)</option>
+            <option value="default">既定 (IE7 互換表示、レジストリに書き込まない)</option>
+            <option value="ie8">IE8 相当</option>
+            <option value="ie11">IE11 相当 (ページの指定に従う)</option>
+            <option value="ie11_force">IE11 強制</option>
+          </select>
+          <div class="hint">Edge の IE モードで表示が崩れないサイトは「既定」のままで構いません。既定以外は、この記録用ブラウザだけに効く設定をユーザーのレジストリ (HKCU) に書き込みます。選んだ表示モードは次回以降も (かんたん画面でも) そのまま使われます。</div>
+        </div>
+
+        <label class="win-only" hidden>https://</label>
+        <div class="win-only" hidden>
+          <label class="check"><input id="rec-https-passthrough" type="checkbox" checked><span>https:// の通信は記録せず素通しする (どのポート番号でも。証明書不要)</span></label>
+        </div>
+
         <label class="win-only" hidden>Windows</label>
         <div class="win-only" hidden>
-          <label class="check"><input id="rec-sysproxy" type="checkbox"><span><strong>システムプロキシを自動で設定する</strong>（Edge の IE モード / Windows 全体に適用。停止時に元の設定へ戻します）</span></label>
+          <label class="check"><input id="rec-sysproxy" type="checkbox"><span><strong>システムプロキシを自動で設定する</strong>（Edge の IE モード / Windows 全体に適用。停止時に元の設定へ戻します。記録方式が「自分でブラウザを設定する」のときだけ使えます）</span></label>
         </div>
       </div>
       <div class="actions">
@@ -93,6 +240,7 @@
       <dl class="kv">
         <dt>プロキシのアドレス</dt><dd id="rec-proxy-address">—</dd>
         <dt>出力ファイル</dt><dd id="rec-out">—</dd>
+        <dt class="win-only" hidden>記録用ブラウザ</dt><dd class="win-only" id="rec-browser-state" hidden>—</dd>
       </dl>
       <div id="rec-error" class="notice error" hidden></div>
       <details id="rec-log-details">
@@ -104,6 +252,7 @@
 
   <div class="card">
     <h2>ブラウザ側の手順</h2>
+    <p class="hint win-only" hidden>記録方式が「アプリ内の記録用ブラウザで開く」のときは、下の手順は不要です。[記録開始] で開く記録用ブラウザ (タイトルに「記録中」と付いた窓) でサイトを操作してください。以下は「自分でブラウザを設定する」を選んだときの手順です。</p>
     <ol class="howto">
       <li><strong>プロキシを設定する</strong> — ブラウザ (または Windows) の HTTP / HTTPS プロキシを <code id="howto-proxy">127.0.0.1:8080</code> にします。
         <ul>

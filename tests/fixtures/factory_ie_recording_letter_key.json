@@ -1,0 +1,1169 @@
+{
+ "version": 1,
+ "meta": {
+  "source": "mitmproxy",
+  "started_at": "2026-10-11T05:10:51+00:00",
+  "updated_at": "2026-10-11T05:10:59+00:00",
+  "hosts": [],
+  "flows_total": 12,
+  "errors": 0
+ },
+ "flows": [
+  {
+   "id": "f0001",
+   "started_at": 1791695452.20728,
+   "page_ref": null,
+   "resource_type": null,
+   "request": {
+    "method": "GET",
+    "url": "http://127.0.0.1.nip.io:60914/Login.aspx",
+    "headers": [
+     [
+      "Accept",
+      "*/*"
+     ],
+     [
+      "Accept-Language",
+      "ja"
+     ],
+     [
+      "UA-CPU",
+      "AMD64"
+     ],
+     [
+      "Accept-Encoding",
+      "gzip, deflate"
+     ],
+     [
+      "User-Agent",
+      "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729)"
+     ],
+     [
+      "Host",
+      "127.0.0.1.nip.io:60914"
+     ],
+     [
+      "Proxy-Connection",
+      "Keep-Alive"
+     ]
+    ],
+    "body_b64": null
+   },
+   "response": {
+    "status": 200,
+    "headers": [
+     [
+      "Server",
+      "Microsoft-IIS/8.5"
+     ],
+     [
+      "Date",
+      "Sun, 11 Oct 2026 05:10:52 GMT"
+     ],
+     [
+      "Content-Type",
+      "text/html; charset=Shift_JIS"
+     ],
+     [
+      "Content-Length",
+      "1652"
+     ],
+     [
+      "Cache-Control",
+      "no-cache"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Expires",
+      "-1"
+     ],
+     [
+      "Set-Cookie",
+      "ASP.NET_SessionId=10bpzigjmgvvihumibmcv8i8; path=/; HttpOnly"
+     ],
+     [
+      "X-AspNet-Version",
+      "4.0.30319"
+     ],
+     [
+      "X-Powered-By",
+      "ASP.NET"
+     ]
+    ],
+    "body_b64": "PCFET0NUWVBFIGh0bWwgUFVCTElDICItLy9XM0MvL0RURCBYSFRNTCAxLjAgVHJhbnNpdGlvbmFsLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL1RSL3hodG1sMS9EVEQveGh0bWwxLXRyYW5zaXRpb25hbC5kdGQiPg0KPGh0bWwgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGh0bWwiPg0KPGhlYWQ+PG1ldGEgaHR0cC1lcXVpdj0iQ29udGVudC1UeXBlIiBjb250ZW50PSJ0ZXh0L2h0bWw7IGNoYXJzZXQ9U2hpZnRfSklTIiAvPjx0aXRsZT6Qto5ZiseXnYNWg1iDZYOAIC0gg42DT4NDg5M8L3RpdGxlPjxsaW5rIGhyZWY9Ii9jc3Mvc2l0ZS5jc3MiIHJlbD0ic3R5bGVzaGVldCIgdHlwZT0idGV4dC9jc3MiIC8+PGxpbmsgcmVsPSJzaG9ydGN1dCBpY29uIiBocmVmPSIvZmF2aWNvbi5pY28iIC8+PC9oZWFkPg0KPGJvZHk+DQo8ZGl2IGlkPSJoZWFkZXIiPjxpbWcgc3JjPSIvaW1nL2xvZ28uZ2lmIiB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIGFsdD0iIiAvPjxzcGFuIGNsYXNzPSJzeXMiPpC2jlmKx5edg1aDWINlg4A8L3NwYW4+PC9kaXY+DQo8ZGl2IGlkPSJjb250ZW50Ij4NCjxmb3JtIG5hbWU9ImZvcm0xIiBtZXRob2Q9InBvc3QiIGFjdGlvbj0iTG9naW4uYXNweCIgaWQ9ImZvcm0xIj4NCjxkaXY+DQo8aW5wdXQgdHlwZT0iaGlkZGVuIiBuYW1lPSJfX1ZJRVdTVEFURSIgaWQ9Il9fVklFV1NUQVRFIiB2YWx1ZT0iL3dFUER3VUt3TjhQMGNtbllUekZDenhFYVZ5c2plSzFUdzhNL29ENWEvblo3cTBxMHJNZWlTeUt0ZVZwbk9hNkpibFJ0RXpOT09uOHBVc205SEFDV014ZlB0eEtENStyOElQMG05am53c2prcWMzSTI4Ym9GZnZSIiAvPg0KPC9kaXY+DQo8ZGl2Pg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19WSUVXU1RBVEVHRU5FUkFUT1IiIGlkPSJfX1ZJRVdTVEFURUdFTkVSQVRPUiIgdmFsdWU9IkMyRUU5QUJCIiAvPg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19FVkVOVFZBTElEQVRJT04iIGlkPSJfX0VWRU5UVkFMSURBVElPTiIgdmFsdWU9Ii93RVcxcW5XeFg3YTdwZmF2WjFCVHR2dmw2V2g0T3Y1Zm80UWYxT1MzMml0bGpHT2pSOXdlNWtJS3poOSIgLz4NCjwvZGl2Pg0KPGgyPoONg0+DQ4OTPC9oMj4NCjx0YWJsZSBjbGFzcz0iZm9ybSI+DQo8dHI+PHRoPoOGgVuDVYFbIElEPC90aD48dGQ+PGlucHV0IG5hbWU9InR4dFVzZXJJZCIgdHlwZT0idGV4dCIgdmFsdWU9IiIgbWF4bGVuZ3RoPSIyMCIgaWQ9InR4dFVzZXJJZCIgc3R5bGU9IndpZHRoOjE2MHB4OyIgLz48L3RkPjwvdHI+DQo8dHI+PHRoPoNwg1iDj4Fbg2g8L3RoPjx0ZD48aW5wdXQgbmFtZT0idHh0UGFzc3dvcmQiIHR5cGU9InBhc3N3b3JkIiBtYXhsZW5ndGg9IjMyIiBpZD0idHh0UGFzc3dvcmQiIHN0eWxlPSJ3aWR0aDoxNjBweDsiIC8+PC90ZD48L3RyPg0KPC90YWJsZT4NCjxwPjxzcGFuIGlkPSJsYmxNZXNzYWdlIiBjbGFzcz0ibXNnIj48L3NwYW4+PC9wPg0KPGlucHV0IHR5cGU9InN1Ym1pdCIgbmFtZT0iYnRuTG9naW4iIHZhbHVlPSKDjYNPg0ODkyIgaWQ9ImJ0bkxvZ2luIiAvPg0KPC9mb3JtPg0KPC9kaXY+DQo8c2NyaXB0IHR5cGU9InRleHQvamF2YXNjcmlwdCI+ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3R4dFVzZXJJZCcpLmZvY3VzKCk7PC9zY3JpcHQ+DQo8L2JvZHk+DQo8L2h0bWw+DQo=",
+    "mime_type": "text/html"
+   }
+  },
+  {
+   "id": "f0002",
+   "started_at": 1791695452.701489,
+   "page_ref": null,
+   "resource_type": null,
+   "request": {
+    "method": "GET",
+    "url": "http://127.0.0.1.nip.io:60914/css/site.css",
+    "headers": [
+     [
+      "Accept",
+      "*/*"
+     ],
+     [
+      "Referer",
+      "http://127.0.0.1.nip.io:60914/Login.aspx"
+     ],
+     [
+      "Accept-Language",
+      "ja"
+     ],
+     [
+      "UA-CPU",
+      "AMD64"
+     ],
+     [
+      "Accept-Encoding",
+      "gzip, deflate"
+     ],
+     [
+      "User-Agent",
+      "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729)"
+     ],
+     [
+      "Host",
+      "127.0.0.1.nip.io:60914"
+     ],
+     [
+      "Proxy-Connection",
+      "Keep-Alive"
+     ],
+     [
+      "Cookie",
+      "ASP.NET_SessionId=10bpzigjmgvvihumibmcv8i8"
+     ]
+    ],
+    "body_b64": null
+   },
+   "response": {
+    "status": 200,
+    "headers": [
+     [
+      "Server",
+      "Microsoft-IIS/8.5"
+     ],
+     [
+      "Date",
+      "Sun, 11 Oct 2026 05:10:52 GMT"
+     ],
+     [
+      "Content-Type",
+      "text/css"
+     ],
+     [
+      "Content-Length",
+      "1022"
+     ],
+     [
+      "Last-Modified",
+      "Thu, 01 Oct 2026 00:00:00 GMT"
+     ],
+     [
+      "ETag",
+      "\"80c1a3e2f4d9d1:0\""
+     ],
+     [
+      "Accept-Ranges",
+      "bytes"
+     ],
+     [
+      "X-AspNet-Version",
+      "4.0.30319"
+     ],
+     [
+      "X-Powered-By",
+      "ASP.NET"
+     ]
+    ],
+    "body_b64": "Ym9keSB7IG1hcmdpbjogMDsgZm9udC1mYW1pbHk6ICJNUyBQR290aGljIiwgIk1TIFVJIEdvdGhpYyIsIHNhbnMtc2VyaWY7IGZvbnQtc2l6ZTogMTNweDsgYmFja2dyb3VuZDogI2Y0ZjZmOTsgY29sb3I6ICMyMjI7IH0KI2hlYWRlciB7IGJhY2tncm91bmQ6ICMxZjNhNzA7IGNvbG9yOiAjZmZmOyBwYWRkaW5nOiA2cHggMTBweDsgaGVpZ2h0OiAyNnB4OyB9CiNoZWFkZXIgaW1nIHsgdmVydGljYWwtYWxpZ246IG1pZGRsZTsgYm9yZGVyOiAxcHggc29saWQgI2ZmZjsgfQojaGVhZGVyIC5zeXMgeyBmb250LXNpemU6IDE2cHg7IGZvbnQtd2VpZ2h0OiBib2xkOyBtYXJnaW4tbGVmdDogNnB4OyB2ZXJ0aWNhbC1hbGlnbjogbWlkZGxlOyB9CiNoZWFkZXIgLnVzZXIgeyBmbG9hdDogcmlnaHQ7IG1hcmdpbi10b3A6IDRweDsgfQojY29udGVudCB7IHBhZGRpbmc6IDEwcHggMTRweDsgfQpoMiB7IGZvbnQtc2l6ZTogMTVweDsgYm9yZGVyLWxlZnQ6IDZweCBzb2xpZCAjMWYzYTcwOyBwYWRkaW5nLWxlZnQ6IDZweDsgfQp0YWJsZS5mb3JtIHRoIHsgdGV4dC1hbGlnbjogbGVmdDsgYmFja2dyb3VuZDogI2RmZTZmMjsgcGFkZGluZzogM3B4IDhweDsgZm9udC13ZWlnaHQ6IG5vcm1hbDsgfQp0YWJsZS5mb3JtIHRkIHsgcGFkZGluZzogM3B4IDhweDsgfQp0YWJsZS5ncmlkIHsgYm9yZGVyLWNvbGxhcHNlOiBjb2xsYXBzZTsgYmFja2dyb3VuZDogI2ZmZjsgfQp0YWJsZS5ncmlkIHRoIHsgYmFja2dyb3VuZDogIzFmM2E3MDsgY29sb3I6ICNmZmY7IHBhZGRpbmc6IDJweCA4cHg7IH0KdGFibGUuZ3JpZCB0ZCB7IHBhZGRpbmc6IDJweCA4cHg7IH0KdHIuYWx0IHRkIHsgYmFja2dyb3VuZDogI2VlZjJmODsgfQp0ci5wYWdlciB0ZCB7IGJhY2tncm91bmQ6ICNmZmY7IHRleHQtYWxpZ246IGNlbnRlcjsgfQoubXNnIHsgY29sb3I6ICNjMDA7IGZvbnQtd2VpZ2h0OiBib2xkOyB9Ci5jb3VudCB7IG1hcmdpbjogNnB4IDA7IH0KdWwubWVudSBsaSB7IG1hcmdpbjogNnB4IDA7IGZvbnQtc2l6ZTogMTRweDsgfQo=",
+    "mime_type": "text/css"
+   }
+  },
+  {
+   "id": "f0003",
+   "started_at": 1791695452.7267137,
+   "page_ref": null,
+   "resource_type": null,
+   "request": {
+    "method": "GET",
+    "url": "http://127.0.0.1.nip.io:60914/img/logo.gif",
+    "headers": [
+     [
+      "Accept",
+      "*/*"
+     ],
+     [
+      "Referer",
+      "http://127.0.0.1.nip.io:60914/Login.aspx"
+     ],
+     [
+      "Accept-Language",
+      "ja"
+     ],
+     [
+      "UA-CPU",
+      "AMD64"
+     ],
+     [
+      "Accept-Encoding",
+      "gzip, deflate"
+     ],
+     [
+      "User-Agent",
+      "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729)"
+     ],
+     [
+      "Host",
+      "127.0.0.1.nip.io:60914"
+     ],
+     [
+      "Proxy-Connection",
+      "Keep-Alive"
+     ],
+     [
+      "Cookie",
+      "ASP.NET_SessionId=10bpzigjmgvvihumibmcv8i8"
+     ]
+    ],
+    "body_b64": null
+   },
+   "response": {
+    "status": 200,
+    "headers": [
+     [
+      "Server",
+      "Microsoft-IIS/8.5"
+     ],
+     [
+      "Date",
+      "Sun, 11 Oct 2026 05:10:52 GMT"
+     ],
+     [
+      "Content-Type",
+      "image/gif"
+     ],
+     [
+      "Content-Length",
+      "35"
+     ],
+     [
+      "Last-Modified",
+      "Thu, 01 Oct 2026 00:00:00 GMT"
+     ],
+     [
+      "ETag",
+      "\"80c1a3e2f4d9d2:0\""
+     ],
+     [
+      "Accept-Ranges",
+      "bytes"
+     ],
+     [
+      "X-AspNet-Version",
+      "4.0.30319"
+     ],
+     [
+      "X-Powered-By",
+      "ASP.NET"
+     ]
+    ],
+    "body_b64": "R0lGODlhAQABAIAAAB86cP///ywAAAAAAQABAAACAkQBADs=",
+    "mime_type": "image/gif"
+   }
+  },
+  {
+   "id": "f0004",
+   "started_at": 1791695453.9946494,
+   "page_ref": null,
+   "resource_type": null,
+   "request": {
+    "method": "POST",
+    "url": "http://127.0.0.1.nip.io:60914/Login.aspx",
+    "headers": [
+     [
+      "Accept",
+      "image/gif, image/jpeg, image/pjpeg, application/x-ms-application, application/xaml+xml, application/x-ms-xbap, */*"
+     ],
+     [
+      "Referer",
+      "http://127.0.0.1.nip.io:60914/Login.aspx"
+     ],
+     [
+      "Accept-Language",
+      "ja"
+     ],
+     [
+      "Content-Type",
+      "application/x-www-form-urlencoded"
+     ],
+     [
+      "UA-CPU",
+      "AMD64"
+     ],
+     [
+      "Accept-Encoding",
+      "gzip, deflate"
+     ],
+     [
+      "User-Agent",
+      "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729)"
+     ],
+     [
+      "Content-Length",
+      "327"
+     ],
+     [
+      "Host",
+      "127.0.0.1.nip.io:60914"
+     ],
+     [
+      "Proxy-Connection",
+      "Keep-Alive"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Cookie",
+      "ASP.NET_SessionId=10bpzigjmgvvihumibmcv8i8"
+     ]
+    ],
+    "body_b64": "X19WSUVXU1RBVEU9JTJGd0VQRHdVS3dOOFAwY21uWVR6RkN6eEVhVnlzamVLMVR3OE0lMkZvRDVhJTJGblo3cTBxMHJNZWlTeUt0ZVZwbk9hNkpibFJ0RXpOT09uOHBVc205SEFDV014ZlB0eEtENSUyQnI4SVAwbTlqbndzamtxYzNJMjhib0ZmdlImX19WSUVXU1RBVEVHRU5FUkFUT1I9QzJFRTlBQkImX19FVkVOVFZBTElEQVRJT049JTJGd0VXMXFuV3hYN2E3cGZhdloxQlR0dnZsNldoNE92NWZvNFFmMU9TMzJpdGxqR09qUjl3ZTVrSUt6aDkmdHh0VXNlcklkPXRhbmFrYSZ0eHRQYXNzd29yZD1TZWlzYW4lMjMyMDI2JTIxJmJ0bkxvZ2luPSU4MyU4RCU4M08lODNDJTgzJTkz"
+   },
+   "response": {
+    "status": 302,
+    "headers": [
+     [
+      "Server",
+      "Microsoft-IIS/8.5"
+     ],
+     [
+      "Date",
+      "Sun, 11 Oct 2026 05:10:53 GMT"
+     ],
+     [
+      "Content-Type",
+      "text/html; charset=Shift_JIS"
+     ],
+     [
+      "Content-Length",
+      "127"
+     ],
+     [
+      "Cache-Control",
+      "private"
+     ],
+     [
+      "Location",
+      "/Menu.aspx"
+     ],
+     [
+      "Set-Cookie",
+      "ASP.NET_SessionId=zn7ef0ikb3v3rbhic8wdqqf9; path=/; HttpOnly"
+     ],
+     [
+      "Set-Cookie",
+      ".ASPXAUTH=AC642EE24C0AD7E1B6AF326B7F7569C766C4D08D0F2AD69CEE99FB46E9C5AA32; path=/; HttpOnly"
+     ],
+     [
+      "X-AspNet-Version",
+      "4.0.30319"
+     ],
+     [
+      "X-Powered-By",
+      "ASP.NET"
+     ]
+    ],
+    "body_b64": "PGh0bWw+PGhlYWQ+PHRpdGxlPk9iamVjdCBtb3ZlZDwvdGl0bGU+PC9oZWFkPjxib2R5Pg0KPGgyPk9iamVjdCBtb3ZlZCB0byA8YSBocmVmPSIvTWVudS5hc3B4Ij5oZXJlPC9hPi48L2gyPg0KPC9ib2R5PjwvaHRtbD4NCg==",
+    "mime_type": "text/html"
+   }
+  },
+  {
+   "id": "f0005",
+   "started_at": 1791695454.0110369,
+   "page_ref": null,
+   "resource_type": null,
+   "request": {
+    "method": "GET",
+    "url": "http://127.0.0.1.nip.io:60914/Menu.aspx",
+    "headers": [
+     [
+      "Accept",
+      "image/gif, image/jpeg, image/pjpeg, application/x-ms-application, application/xaml+xml, application/x-ms-xbap, */*"
+     ],
+     [
+      "Referer",
+      "http://127.0.0.1.nip.io:60914/Login.aspx"
+     ],
+     [
+      "Accept-Language",
+      "ja"
+     ],
+     [
+      "UA-CPU",
+      "AMD64"
+     ],
+     [
+      "Accept-Encoding",
+      "gzip, deflate"
+     ],
+     [
+      "User-Agent",
+      "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729)"
+     ],
+     [
+      "Host",
+      "127.0.0.1.nip.io:60914"
+     ],
+     [
+      "Proxy-Connection",
+      "Keep-Alive"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Cookie",
+      "ASP.NET_SessionId=zn7ef0ikb3v3rbhic8wdqqf9; .ASPXAUTH=AC642EE24C0AD7E1B6AF326B7F7569C766C4D08D0F2AD69CEE99FB46E9C5AA32"
+     ]
+    ],
+    "body_b64": null
+   },
+   "response": {
+    "status": 200,
+    "headers": [
+     [
+      "Server",
+      "Microsoft-IIS/8.5"
+     ],
+     [
+      "Date",
+      "Sun, 11 Oct 2026 05:10:54 GMT"
+     ],
+     [
+      "Content-Type",
+      "text/html; charset=Shift_JIS"
+     ],
+     [
+      "Content-Length",
+      "1446"
+     ],
+     [
+      "Cache-Control",
+      "no-cache"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Expires",
+      "-1"
+     ],
+     [
+      "X-AspNet-Version",
+      "4.0.30319"
+     ],
+     [
+      "X-Powered-By",
+      "ASP.NET"
+     ]
+    ],
+    "body_b64": "PCFET0NUWVBFIGh0bWwgUFVCTElDICItLy9XM0MvL0RURCBYSFRNTCAxLjAgVHJhbnNpdGlvbmFsLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL1RSL3hodG1sMS9EVEQveGh0bWwxLXRyYW5zaXRpb25hbC5kdGQiPg0KPGh0bWwgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGh0bWwiPg0KPGhlYWQ+PG1ldGEgaHR0cC1lcXVpdj0iQ29udGVudC1UeXBlIiBjb250ZW50PSJ0ZXh0L2h0bWw7IGNoYXJzZXQ9U2hpZnRfSklTIiAvPjx0aXRsZT6Qto5ZiseXnYNWg1iDZYOAIC0gg4GDaoOFgVs8L3RpdGxlPjxsaW5rIGhyZWY9Ii9jc3Mvc2l0ZS5jc3MiIHJlbD0ic3R5bGVzaGVldCIgdHlwZT0idGV4dC9jc3MiIC8+PGxpbmsgcmVsPSJzaG9ydGN1dCBpY29uIiBocmVmPSIvZmF2aWNvbi5pY28iIC8+PC9oZWFkPg0KPGJvZHk+DQo8ZGl2IGlkPSJoZWFkZXIiPjxzcGFuIGNsYXNzPSJ1c2VyIj6TY5KGIJG+mFkggrOC8Twvc3Bhbj48aW1nIHNyYz0iL2ltZy9sb2dvLmdpZiIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiBhbHQ9IiIgLz48c3BhbiBjbGFzcz0ic3lzIj6Qto5ZiseXnYNWg1iDZYOAPC9zcGFuPjwvZGl2Pg0KPGRpdiBpZD0iY29udGVudCI+DQo8Zm9ybSBuYW1lPSJmb3JtMSIgbWV0aG9kPSJwb3N0IiBhY3Rpb249Ik1lbnUuYXNweCIgaWQ9ImZvcm0xIj4NCjxkaXY+DQo8aW5wdXQgdHlwZT0iaGlkZGVuIiBuYW1lPSJfX1ZJRVdTVEFURSIgaWQ9Il9fVklFV1NUQVRFIiB2YWx1ZT0iL3dFUER3VUtTTzBPR25Oc1loU0V5aDRhMFRsd0V6K1ZTUGtQVzlRME0wd3djZ1NMSUNidkkxOEs1cHQxMWpJeXlBMlUyRmVkVEdkcEV5V0tIYjJHWEVyVEE4VERSU2tWdFladzJ4ZGZHeWVmUUJIdlZWK3FXZmtKIiAvPg0KPC9kaXY+DQo8ZGl2Pg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19WSUVXU1RBVEVHRU5FUkFUT1IiIGlkPSJfX1ZJRVdTVEFURUdFTkVSQVRPUiIgdmFsdWU9IkI2RTdBMUY0IiAvPg0KPC9kaXY+DQo8cD48c3BhbiBpZD0ibGJsV2VsY29tZSI+guaCpIKxgrsgk2OShiCRvphZIIKzgvE8L3NwYW4+PC9wPg0KPGgyPoOBg2qDhYFbPC9oMj4NCjx1bCBjbGFzcz0ibWVudSI+DQo8bGk+PGEgaHJlZj0iIyIgb25jbGljaz0id2luZG93Lm9wZW4oJ1NlYXJjaC5hc3B4P2tleT14QkJIT0hwWFlaZ0ZLeU5acHVXeScsJ3NlYXJjaCcsJ3dpZHRoPTk4MCxoZWlnaHQ9NzIwLHJlc2l6YWJsZT15ZXMsc2Nyb2xsYmFycz15ZXMnKTtyZXR1cm4gZmFsc2U7IiBpZD0ibG5rU2VhcmNoIj6Qto5ZjsCQ0Y/Gie88L2E+PC9saT4NCjxsaT48YSBpZD0ibG5rTmV3cyIgaHJlZj0iTmV3cy5hc3B4IiB0YXJnZXQ9Il9ibGFuayI+gqiSbYLngrk8L2E+PC9saT4NCjxsaT48YSBpZD0ibG5rTG9nb3V0IiBocmVmPSJMb2dvdXQuYXNweCI+g42DT4NBg0WDZzwvYT48L2xpPg0KPC91bD4NCjwvZm9ybT4NCjwvZGl2Pg0KPC9ib2R5Pg0KPC9odG1sPg0K",
+    "mime_type": "text/html"
+   }
+  },
+  {
+   "id": "f0006",
+   "started_at": 1791695454.5403955,
+   "page_ref": null,
+   "resource_type": null,
+   "request": {
+    "method": "GET",
+    "url": "http://127.0.0.1.nip.io:60914/Search.aspx?key=xBBHOHpXYZgFKyNZpuWy",
+    "headers": [
+     [
+      "Accept",
+      "*/*"
+     ],
+     [
+      "Accept-Language",
+      "ja"
+     ],
+     [
+      "UA-CPU",
+      "AMD64"
+     ],
+     [
+      "Accept-Encoding",
+      "gzip, deflate"
+     ],
+     [
+      "User-Agent",
+      "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729)"
+     ],
+     [
+      "Host",
+      "127.0.0.1.nip.io:60914"
+     ],
+     [
+      "Proxy-Connection",
+      "Keep-Alive"
+     ],
+     [
+      "Cookie",
+      "ASP.NET_SessionId=zn7ef0ikb3v3rbhic8wdqqf9; .ASPXAUTH=AC642EE24C0AD7E1B6AF326B7F7569C766C4D08D0F2AD69CEE99FB46E9C5AA32"
+     ]
+    ],
+    "body_b64": null
+   },
+   "response": {
+    "status": 200,
+    "headers": [
+     [
+      "Server",
+      "Microsoft-IIS/8.5"
+     ],
+     [
+      "Date",
+      "Sun, 11 Oct 2026 05:10:54 GMT"
+     ],
+     [
+      "Content-Type",
+      "text/html; charset=Shift_JIS"
+     ],
+     [
+      "Content-Length",
+      "3683"
+     ],
+     [
+      "Cache-Control",
+      "no-cache"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Expires",
+      "-1"
+     ],
+     [
+      "X-AspNet-Version",
+      "4.0.30319"
+     ],
+     [
+      "X-Powered-By",
+      "ASP.NET"
+     ]
+    ],
+    "body_b64": "PCFET0NUWVBFIGh0bWwgUFVCTElDICItLy9XM0MvL0RURCBYSFRNTCAxLjAgVHJhbnNpdGlvbmFsLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL1RSL3hodG1sMS9EVEQveGh0bWwxLXRyYW5zaXRpb25hbC5kdGQiPg0KPGh0bWwgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGh0bWwiPg0KPGhlYWQ+PG1ldGEgaHR0cC1lcXVpdj0iQ29udGVudC1UeXBlIiBjb250ZW50PSJ0ZXh0L2h0bWw7IGNoYXJzZXQ9U2hpZnRfSklTIiAvPjx0aXRsZT6Qto5ZiseXnYNWg1iDZYOAIC0gkLaOWY7AkNGPxonvPC90aXRsZT48bGluayBocmVmPSIvY3NzL3NpdGUuY3NzIiByZWw9InN0eWxlc2hlZXQiIHR5cGU9InRleHQvY3NzIiAvPjxsaW5rIHJlbD0ic2hvcnRjdXQgaWNvbiIgaHJlZj0iL2Zhdmljb24uaWNvIiAvPjwvaGVhZD4NCjxib2R5Pg0KPGRpdiBpZD0iaGVhZGVyIj48c3BhbiBjbGFzcz0idXNlciI+k2OShiCRvphZIIKzgvE8L3NwYW4+PGltZyBzcmM9Ii9pbWcvbG9nby5naWYiIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgYWx0PSIiIC8+PHNwYW4gY2xhc3M9InN5cyI+kLaOWYrHl52DVoNYg2WDgDwvc3Bhbj48L2Rpdj4NCjxkaXYgaWQ9ImNvbnRlbnQiPg0KPGZvcm0gbmFtZT0iZm9ybTEiIG1ldGhvZD0icG9zdCIgYWN0aW9uPSJTZWFyY2guYXNweD9rZXk9eEJCSE9IcFhZWmdGS3lOWnB1V3kiIGlkPSJmb3JtMSI+DQo8ZGl2Pg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19FVkVOVFRBUkdFVCIgaWQ9Il9fRVZFTlRUQVJHRVQiIHZhbHVlPSIiIC8+DQo8aW5wdXQgdHlwZT0iaGlkZGVuIiBuYW1lPSJfX0VWRU5UQVJHVU1FTlQiIGlkPSJfX0VWRU5UQVJHVU1FTlQiIHZhbHVlPSIiIC8+DQo8aW5wdXQgdHlwZT0iaGlkZGVuIiBuYW1lPSJfX1ZJRVdTVEFURSIgaWQ9Il9fVklFV1NUQVRFIiB2YWx1ZT0iL3dFUER3VUtpNngzaWhBclhZYTU4M3MvRTRQMFFndHY3empIM1MvN0YySjBEb0c1emNmeXAvYndxc1JHbXNoeWZjN1JXYk5udVBzeHlDTTY1cW9oNWpidWFGcTcwL3BRR3Rab1NZR2hWUzh1MXViNGcwRWFFTnhIIiAvPg0KPC9kaXY+DQo8c2NyaXB0IHR5cGU9InRleHQvamF2YXNjcmlwdCI+Ci8vPCFbQ0RBVEFbCnZhciB0aGVGb3JtID0gZG9jdW1lbnQuZm9ybXNbJ2Zvcm0xJ107CmlmICghdGhlRm9ybSkgewogICAgdGhlRm9ybSA9IGRvY3VtZW50LmZvcm1zWzBdOwp9CmZ1bmN0aW9uIF9fZG9Qb3N0QmFjayhldmVudFRhcmdldCwgZXZlbnRBcmd1bWVudCkgewogICAgaWYgKCF0aGVGb3JtLm9uc3VibWl0IHx8ICh0aGVGb3JtLm9uc3VibWl0KCkgIT0gZmFsc2UpKSB7CiAgICAgICAgdGhlRm9ybS5fX0VWRU5UVEFSR0VULnZhbHVlID0gZXZlbnRUYXJnZXQ7CiAgICAgICAgdGhlRm9ybS5fX0VWRU5UQVJHVU1FTlQudmFsdWUgPSBldmVudEFyZ3VtZW50OwogICAgICAgIHRoZUZvcm0uc3VibWl0KCk7CiAgICB9Cn0KLy9dXT4KPC9zY3JpcHQ+DQo8ZGl2Pg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19WSUVXU1RBVEVHRU5FUkFUT1IiIGlkPSJfX1ZJRVdTVEFURUdFTkVSQVRPUiIgdmFsdWU9IjVGMEQ4QzIxIiAvPg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19FVkVOVFZBTElEQVRJT04iIGlkPSJfX0VWRU5UVkFMSURBVElPTiIgdmFsdWU9Ii93RVc1ZlhNMXkyb2k4ZFcwNm05OHBYeG5pYVBLRnBQN05LV0xteUJhN09hSUxsWlZoVlFJSDJGdFp6VSIgLz4NCjwvZGl2Pg0KPGgyPpC2jlmOwJDRj8aJ7zwvaDI+DQo8dGFibGUgY2xhc3M9ImZvcm0iPg0KPHRyPjx0aD6NSI/qPC90aD48dGQ+PHNlbGVjdCBuYW1lPSJkZGxQbGFudCIgb25jaGFuZ2U9Il9fZG9Qb3N0QmFjaygnZGRsUGxhbnQnLCcnKSIgaWQ9ImRkbFBsYW50IiBzdHlsZT0id2lkdGg6MTYwcHg7Ij4NCjxvcHRpb24gc2VsZWN0ZWQ9InNlbGVjdGVkIiB2YWx1ZT0iIj4tLSCRSZHwgrWCxIKtgr6Cs4KiIC0tPC9vcHRpb24+DQo8b3B0aW9uIHZhbHVlPSIwMSI+lnuO0I1Ij+o8L29wdGlvbj4NCjxvcHRpb24gdmFsdWU9IjAyIj6R5pPxjUiP6jwvb3B0aW9uPg0KPC9zZWxlY3Q+PC90ZD48L3RyPg0KPHRyPjx0aD6DiYNDg5M8L3RoPjx0ZD48c2VsZWN0IG5hbWU9ImRkbExpbmUiIGlkPSJkZGxMaW5lIiBzdHlsZT0id2lkdGg6MTYwcHg7Ij4NCg0KPC9zZWxlY3Q+PC90ZD48L3RyPg0KPHRyPjx0aD6SvDwvdGg+PHRkPjxzZWxlY3QgbmFtZT0iZGRsU2hpZnQiIGlkPSJkZGxTaGlmdCI+DQo8b3B0aW9uIHNlbGVjdGVkPSJzZWxlY3RlZCIgdmFsdWU9IkFMTCI+kVOCxDwvb3B0aW9uPg0KPG9wdGlvbiB2YWx1ZT0iRCI+k/qLzjwvb3B0aW9uPg0KPG9wdGlvbiB2YWx1ZT0iTiI+lumLzjwvb3B0aW9uPg0KPC9zZWxlY3Q+PC90ZD48L3RyPg0KPHRyPjx0aD6K+orUPC90aD48dGQ+PGlucHV0IG5hbWU9InR4dEZyb20iIHR5cGU9InRleHQiIHZhbHVlPSIyMDI2LzA5LzAxIiBtYXhsZW5ndGg9IjEwIiBpZD0idHh0RnJvbSIgc3R5bGU9IndpZHRoOjkwcHg7IiAvPiCCqYLnIDxpbnB1dCBuYW1lPSJ0eHRUbyIgdHlwZT0idGV4dCIgdmFsdWU9IjIwMjYvMTAvMTAiIG1heGxlbmd0aD0iMTAiIGlkPSJ0eHRUbyIgc3R5bGU9IndpZHRoOjkwcHg7IiAvPiCC3ILFgWl5eXl5L21tL2RkgWo8L3RkPjwvdHI+DQo8dHI+PHRoPpVplNQ8L3RoPjx0ZD48aW5wdXQgbmFtZT0idHh0SXRlbSIgdHlwZT0idGV4dCIgdmFsdWU9IiIgcmVhZG9ubHk9InJlYWRvbmx5IiBpZD0idHh0SXRlbSIgc3R5bGU9IndpZHRoOjEwMHB4OyIgLz4gPGlucHV0IHR5cGU9ImJ1dHRvbiIgbmFtZT0iYnRuUGljayIgdmFsdWU9IpVplNSRSZHwIiBpZD0iYnRuUGljayIgb25jbGljaz0idmFyIHBsYW50ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2RkbFBsYW50JykudmFsdWU7IGlmIChwbGFudCA9PSAnJykgeyBhbGVydCgnkOaCyY1Ij+qC8JFJkfCCtYLEgq2CvoKzgqKBQicpOyByZXR1cm4gZmFsc2U7IH0gdmFyIHIgPSB3aW5kb3cuc2hvd01vZGFsRGlhbG9nKCdJdGVtUGlja2VyLmFzcHg/cGxhbnQ9JyArIHBsYW50ICsgJyZrZXk9eEJCSE9IcFhZWmdGS3lOWnB1V3knLCB3aW5kb3csICdkaWFsb2dXaWR0aDo0MjBweDtkaWFsb2dIZWlnaHQ6MzYwcHgnKTsgaWYgKHIpIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0eHRJdGVtJykudmFsdWUgPSByOyByZXR1cm4gZmFsc2U7IiAvPiA8aW5wdXQgdHlwZT0iYnV0dG9uIiBuYW1lPSJidG5DbGVhckl0ZW0iIHZhbHVlPSKDToOKg0EiIGlkPSJidG5DbGVhckl0ZW0iIG9uY2xpY2s9ImRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0eHRJdGVtJykudmFsdWU9Jyc7IiAvPjwvdGQ+PC90cj4NCjwvdGFibGU+DQo8cD48aW5wdXQgdHlwZT0ic3VibWl0IiBuYW1lPSJidG5TZWFyY2giIHZhbHVlPSKMn431IiBpZD0iYnRuU2VhcmNoIiAvPiA8aW5wdXQgdHlwZT0ic3VibWl0IiBuYW1lPSJidG5FeGNlbCIgdmFsdWU9IkV4Y2Vsj2+XzSIgaWQ9ImJ0bkV4Y2VsIiAvPiA8aW5wdXQgdHlwZT0iYnV0dG9uIiBuYW1lPSJidG5DbG9zZSIgdmFsdWU9IpXCgraC6SIgaWQ9ImJ0bkNsb3NlIiBvbmNsaWNrPSJ3aW5kb3cuY2xvc2UoKTsiIC8+PC9wPg0KPHA+PHNwYW4gaWQ9ImxibE1lc3NhZ2UiIGNsYXNzPSJtc2ciPjwvc3Bhbj48L3A+DQo8cCBjbGFzcz0iY291bnQiPjxzcGFuIGlkPSJsYmxDb3VudCI+PC9zcGFuPjwvcD4NCg0KPC9mb3JtPg0KPC9kaXY+DQo8L2JvZHk+DQo8L2h0bWw+DQo=",
+    "mime_type": "text/html"
+   }
+  },
+  {
+   "id": "f0007",
+   "started_at": 1791695455.1110637,
+   "page_ref": null,
+   "resource_type": null,
+   "request": {
+    "method": "POST",
+    "url": "http://127.0.0.1.nip.io:60914/Search.aspx?key=xBBHOHpXYZgFKyNZpuWy",
+    "headers": [
+     [
+      "Accept",
+      "image/gif, image/jpeg, image/pjpeg, application/x-ms-application, application/xaml+xml, application/x-ms-xbap, */*"
+     ],
+     [
+      "Referer",
+      "http://127.0.0.1.nip.io:60914/Search.aspx?key=xBBHOHpXYZgFKyNZpuWy"
+     ],
+     [
+      "Accept-Language",
+      "ja"
+     ],
+     [
+      "Content-Type",
+      "application/x-www-form-urlencoded"
+     ],
+     [
+      "UA-CPU",
+      "AMD64"
+     ],
+     [
+      "Accept-Encoding",
+      "gzip, deflate"
+     ],
+     [
+      "User-Agent",
+      "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729)"
+     ],
+     [
+      "Content-Length",
+      "371"
+     ],
+     [
+      "Host",
+      "127.0.0.1.nip.io:60914"
+     ],
+     [
+      "Proxy-Connection",
+      "Keep-Alive"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Cookie",
+      "ASP.NET_SessionId=zn7ef0ikb3v3rbhic8wdqqf9; .ASPXAUTH=AC642EE24C0AD7E1B6AF326B7F7569C766C4D08D0F2AD69CEE99FB46E9C5AA32"
+     ]
+    ],
+    "body_b64": "X19FVkVOVFRBUkdFVD1kZGxQbGFudCZfX0VWRU5UQVJHVU1FTlQ9Jl9fVklFV1NUQVRFPSUyRndFUER3VUtpNngzaWhBclhZYTU4M3MlMkZFNFAwUWd0djd6akgzUyUyRjdGMkowRG9HNXpjZnlwJTJGYndxc1JHbXNoeWZjN1JXYk5udVBzeHlDTTY1cW9oNWpidWFGcTcwJTJGcFFHdFpvU1lHaFZTOHUxdWI0ZzBFYUVOeEgmX19WSUVXU1RBVEVHRU5FUkFUT1I9NUYwRDhDMjEmX19FVkVOVFZBTElEQVRJT049JTJGd0VXNWZYTTF5Mm9pOGRXMDZtOThwWHhuaWFQS0ZwUDdOS1dMbXlCYTdPYUlMbFpWaFZRSUgyRnRaelUmZGRsUGxhbnQ9MDEmZGRsU2hpZnQ9QUxMJnR4dEZyb209MjAyNiUyRjA5JTJGMDEmdHh0VG89MjAyNiUyRjEwJTJGMTAmdHh0SXRlbT0="
+   },
+   "response": {
+    "status": 200,
+    "headers": [
+     [
+      "Server",
+      "Microsoft-IIS/8.5"
+     ],
+     [
+      "Date",
+      "Sun, 11 Oct 2026 05:10:55 GMT"
+     ],
+     [
+      "Content-Type",
+      "text/html; charset=Shift_JIS"
+     ],
+     [
+      "Content-Length",
+      "3785"
+     ],
+     [
+      "Cache-Control",
+      "no-cache"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Expires",
+      "-1"
+     ],
+     [
+      "X-AspNet-Version",
+      "4.0.30319"
+     ],
+     [
+      "X-Powered-By",
+      "ASP.NET"
+     ]
+    ],
+    "body_b64": "PCFET0NUWVBFIGh0bWwgUFVCTElDICItLy9XM0MvL0RURCBYSFRNTCAxLjAgVHJhbnNpdGlvbmFsLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL1RSL3hodG1sMS9EVEQveGh0bWwxLXRyYW5zaXRpb25hbC5kdGQiPg0KPGh0bWwgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGh0bWwiPg0KPGhlYWQ+PG1ldGEgaHR0cC1lcXVpdj0iQ29udGVudC1UeXBlIiBjb250ZW50PSJ0ZXh0L2h0bWw7IGNoYXJzZXQ9U2hpZnRfSklTIiAvPjx0aXRsZT6Qto5ZiseXnYNWg1iDZYOAIC0gkLaOWY7AkNGPxonvPC90aXRsZT48bGluayBocmVmPSIvY3NzL3NpdGUuY3NzIiByZWw9InN0eWxlc2hlZXQiIHR5cGU9InRleHQvY3NzIiAvPjxsaW5rIHJlbD0ic2hvcnRjdXQgaWNvbiIgaHJlZj0iL2Zhdmljb24uaWNvIiAvPjwvaGVhZD4NCjxib2R5Pg0KPGRpdiBpZD0iaGVhZGVyIj48c3BhbiBjbGFzcz0idXNlciI+k2OShiCRvphZIIKzgvE8L3NwYW4+PGltZyBzcmM9Ii9pbWcvbG9nby5naWYiIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgYWx0PSIiIC8+PHNwYW4gY2xhc3M9InN5cyI+kLaOWYrHl52DVoNYg2WDgDwvc3Bhbj48L2Rpdj4NCjxkaXYgaWQ9ImNvbnRlbnQiPg0KPGZvcm0gbmFtZT0iZm9ybTEiIG1ldGhvZD0icG9zdCIgYWN0aW9uPSJTZWFyY2guYXNweD9rZXk9eEJCSE9IcFhZWmdGS3lOWnB1V3kiIGlkPSJmb3JtMSI+DQo8ZGl2Pg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19FVkVOVFRBUkdFVCIgaWQ9Il9fRVZFTlRUQVJHRVQiIHZhbHVlPSIiIC8+DQo8aW5wdXQgdHlwZT0iaGlkZGVuIiBuYW1lPSJfX0VWRU5UQVJHVU1FTlQiIGlkPSJfX0VWRU5UQVJHVU1FTlQiIHZhbHVlPSIiIC8+DQo8aW5wdXQgdHlwZT0iaGlkZGVuIiBuYW1lPSJfX1ZJRVdTVEFURSIgaWQ9Il9fVklFV1NUQVRFIiB2YWx1ZT0iL3dFUER3VUtSUUJzTzdua1RpTU5ERFFhZS81c1pxZlFwYSsra1JNbzRic0JNUjhoWUFVWlpZQ05TZWRuYWEyM3kyTmlJaXAzdHZ6cEYwUU5sSW1SZHNKdjVoR2tOWWNOM0t6a2ZhT3JIUHpzNzBVN0prdDZFbkp1IiAvPg0KPC9kaXY+DQo8c2NyaXB0IHR5cGU9InRleHQvamF2YXNjcmlwdCI+Ci8vPCFbQ0RBVEFbCnZhciB0aGVGb3JtID0gZG9jdW1lbnQuZm9ybXNbJ2Zvcm0xJ107CmlmICghdGhlRm9ybSkgewogICAgdGhlRm9ybSA9IGRvY3VtZW50LmZvcm1zWzBdOwp9CmZ1bmN0aW9uIF9fZG9Qb3N0QmFjayhldmVudFRhcmdldCwgZXZlbnRBcmd1bWVudCkgewogICAgaWYgKCF0aGVGb3JtLm9uc3VibWl0IHx8ICh0aGVGb3JtLm9uc3VibWl0KCkgIT0gZmFsc2UpKSB7CiAgICAgICAgdGhlRm9ybS5fX0VWRU5UVEFSR0VULnZhbHVlID0gZXZlbnRUYXJnZXQ7CiAgICAgICAgdGhlRm9ybS5fX0VWRU5UQVJHVU1FTlQudmFsdWUgPSBldmVudEFyZ3VtZW50OwogICAgICAgIHRoZUZvcm0uc3VibWl0KCk7CiAgICB9Cn0KLy9dXT4KPC9zY3JpcHQ+DQo8ZGl2Pg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19WSUVXU1RBVEVHRU5FUkFUT1IiIGlkPSJfX1ZJRVdTVEFURUdFTkVSQVRPUiIgdmFsdWU9IjVGMEQ4QzIxIiAvPg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19FVkVOVFZBTElEQVRJT04iIGlkPSJfX0VWRU5UVkFMSURBVElPTiIgdmFsdWU9Ii93RVduMnpNRkcvaWJBT2xlbzBaTncwdjhjSU55NEVWcDZ2WUp4WlI2ZkxlUWtoU1VhcHB1OTVWVnFLTiIgLz4NCjwvZGl2Pg0KPGgyPpC2jlmOwJDRj8aJ7zwvaDI+DQo8dGFibGUgY2xhc3M9ImZvcm0iPg0KPHRyPjx0aD6NSI/qPC90aD48dGQ+PHNlbGVjdCBuYW1lPSJkZGxQbGFudCIgb25jaGFuZ2U9Il9fZG9Qb3N0QmFjaygnZGRsUGxhbnQnLCcnKSIgaWQ9ImRkbFBsYW50IiBzdHlsZT0id2lkdGg6MTYwcHg7Ij4NCjxvcHRpb24gdmFsdWU9IiI+LS0gkUmR8IK1gsSCrYK+grOCoiAtLTwvb3B0aW9uPg0KPG9wdGlvbiBzZWxlY3RlZD0ic2VsZWN0ZWQiIHZhbHVlPSIwMSI+lnuO0I1Ij+o8L29wdGlvbj4NCjxvcHRpb24gdmFsdWU9IjAyIj6R5pPxjUiP6jwvb3B0aW9uPg0KPC9zZWxlY3Q+PC90ZD48L3RyPg0KPHRyPjx0aD6DiYNDg5M8L3RoPjx0ZD48c2VsZWN0IG5hbWU9ImRkbExpbmUiIGlkPSJkZGxMaW5lIiBzdHlsZT0id2lkdGg6MTYwcHg7Ij4NCjxvcHRpb24gc2VsZWN0ZWQ9InNlbGVjdGVkIiB2YWx1ZT0iTDExIj6RZ5enMYOJg0ODkzwvb3B0aW9uPg0KPG9wdGlvbiB2YWx1ZT0iTDEyIj6RZ5enMoOJg0ODkzwvb3B0aW9uPg0KPC9zZWxlY3Q+PC90ZD48L3RyPg0KPHRyPjx0aD6SvDwvdGg+PHRkPjxzZWxlY3QgbmFtZT0iZGRsU2hpZnQiIGlkPSJkZGxTaGlmdCI+DQo8b3B0aW9uIHNlbGVjdGVkPSJzZWxlY3RlZCIgdmFsdWU9IkFMTCI+kVOCxDwvb3B0aW9uPg0KPG9wdGlvbiB2YWx1ZT0iRCI+k/qLzjwvb3B0aW9uPg0KPG9wdGlvbiB2YWx1ZT0iTiI+lumLzjwvb3B0aW9uPg0KPC9zZWxlY3Q+PC90ZD48L3RyPg0KPHRyPjx0aD6K+orUPC90aD48dGQ+PGlucHV0IG5hbWU9InR4dEZyb20iIHR5cGU9InRleHQiIHZhbHVlPSIyMDI2LzA5LzAxIiBtYXhsZW5ndGg9IjEwIiBpZD0idHh0RnJvbSIgc3R5bGU9IndpZHRoOjkwcHg7IiAvPiCCqYLnIDxpbnB1dCBuYW1lPSJ0eHRUbyIgdHlwZT0idGV4dCIgdmFsdWU9IjIwMjYvMTAvMTAiIG1heGxlbmd0aD0iMTAiIGlkPSJ0eHRUbyIgc3R5bGU9IndpZHRoOjkwcHg7IiAvPiCC3ILFgWl5eXl5L21tL2RkgWo8L3RkPjwvdHI+DQo8dHI+PHRoPpVplNQ8L3RoPjx0ZD48aW5wdXQgbmFtZT0idHh0SXRlbSIgdHlwZT0idGV4dCIgdmFsdWU9IiIgcmVhZG9ubHk9InJlYWRvbmx5IiBpZD0idHh0SXRlbSIgc3R5bGU9IndpZHRoOjEwMHB4OyIgLz4gPGlucHV0IHR5cGU9ImJ1dHRvbiIgbmFtZT0iYnRuUGljayIgdmFsdWU9IpVplNSRSZHwIiBpZD0iYnRuUGljayIgb25jbGljaz0idmFyIHBsYW50ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2RkbFBsYW50JykudmFsdWU7IGlmIChwbGFudCA9PSAnJykgeyBhbGVydCgnkOaCyY1Ij+qC8JFJkfCCtYLEgq2CvoKzgqKBQicpOyByZXR1cm4gZmFsc2U7IH0gdmFyIHIgPSB3aW5kb3cuc2hvd01vZGFsRGlhbG9nKCdJdGVtUGlja2VyLmFzcHg/cGxhbnQ9JyArIHBsYW50ICsgJyZrZXk9eEJCSE9IcFhZWmdGS3lOWnB1V3knLCB3aW5kb3csICdkaWFsb2dXaWR0aDo0MjBweDtkaWFsb2dIZWlnaHQ6MzYwcHgnKTsgaWYgKHIpIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0eHRJdGVtJykudmFsdWUgPSByOyByZXR1cm4gZmFsc2U7IiAvPiA8aW5wdXQgdHlwZT0iYnV0dG9uIiBuYW1lPSJidG5DbGVhckl0ZW0iIHZhbHVlPSKDToOKg0EiIGlkPSJidG5DbGVhckl0ZW0iIG9uY2xpY2s9ImRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0eHRJdGVtJykudmFsdWU9Jyc7IiAvPjwvdGQ+PC90cj4NCjwvdGFibGU+DQo8cD48aW5wdXQgdHlwZT0ic3VibWl0IiBuYW1lPSJidG5TZWFyY2giIHZhbHVlPSKMn431IiBpZD0iYnRuU2VhcmNoIiAvPiA8aW5wdXQgdHlwZT0ic3VibWl0IiBuYW1lPSJidG5FeGNlbCIgdmFsdWU9IkV4Y2Vsj2+XzSIgaWQ9ImJ0bkV4Y2VsIiAvPiA8aW5wdXQgdHlwZT0iYnV0dG9uIiBuYW1lPSJidG5DbG9zZSIgdmFsdWU9IpXCgraC6SIgaWQ9ImJ0bkNsb3NlIiBvbmNsaWNrPSJ3aW5kb3cuY2xvc2UoKTsiIC8+PC9wPg0KPHA+PHNwYW4gaWQ9ImxibE1lc3NhZ2UiIGNsYXNzPSJtc2ciPjwvc3Bhbj48L3A+DQo8cCBjbGFzcz0iY291bnQiPjxzcGFuIGlkPSJsYmxDb3VudCI+PC9zcGFuPjwvcD4NCg0KPC9mb3JtPg0KPC9kaXY+DQo8L2JvZHk+DQo8L2h0bWw+DQo=",
+    "mime_type": "text/html"
+   }
+  },
+  {
+   "id": "f0008",
+   "started_at": 1791695456.5056884,
+   "page_ref": null,
+   "resource_type": null,
+   "request": {
+    "method": "GET",
+    "url": "http://127.0.0.1.nip.io:60914/ItemPicker.aspx?plant=01&key=xBBHOHpXYZgFKyNZpuWy",
+    "headers": [
+     [
+      "Accept",
+      "*/*"
+     ],
+     [
+      "Accept-Language",
+      "ja"
+     ],
+     [
+      "UA-CPU",
+      "AMD64"
+     ],
+     [
+      "Accept-Encoding",
+      "gzip, deflate"
+     ],
+     [
+      "User-Agent",
+      "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729)"
+     ],
+     [
+      "Host",
+      "127.0.0.1.nip.io:60914"
+     ],
+     [
+      "Proxy-Connection",
+      "Keep-Alive"
+     ],
+     [
+      "Cookie",
+      "ASP.NET_SessionId=zn7ef0ikb3v3rbhic8wdqqf9; .ASPXAUTH=AC642EE24C0AD7E1B6AF326B7F7569C766C4D08D0F2AD69CEE99FB46E9C5AA32"
+     ]
+    ],
+    "body_b64": null
+   },
+   "response": {
+    "status": 200,
+    "headers": [
+     [
+      "Server",
+      "Microsoft-IIS/8.5"
+     ],
+     [
+      "Date",
+      "Sun, 11 Oct 2026 05:10:56 GMT"
+     ],
+     [
+      "Content-Type",
+      "text/html; charset=Shift_JIS"
+     ],
+     [
+      "Content-Length",
+      "1792"
+     ],
+     [
+      "Cache-Control",
+      "no-cache"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Expires",
+      "-1"
+     ],
+     [
+      "X-AspNet-Version",
+      "4.0.30319"
+     ],
+     [
+      "X-Powered-By",
+      "ASP.NET"
+     ]
+    ],
+    "body_b64": "PCFET0NUWVBFIGh0bWwgUFVCTElDICItLy9XM0MvL0RURCBYSFRNTCAxLjAgVHJhbnNpdGlvbmFsLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL1RSL3hodG1sMS9EVEQveGh0bWwxLXRyYW5zaXRpb25hbC5kdGQiPg0KPGh0bWwgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGh0bWwiPg0KPGhlYWQ+PG1ldGEgaHR0cC1lcXVpdj0iQ29udGVudC1UeXBlIiBjb250ZW50PSJ0ZXh0L2h0bWw7IGNoYXJzZXQ9U2hpZnRfSklTIiAvPjx0aXRsZT6VaZTUkUmR8DwvdGl0bGU+PGxpbmsgaHJlZj0iL2Nzcy9zaXRlLmNzcyIgcmVsPSJzdHlsZXNoZWV0IiB0eXBlPSJ0ZXh0L2NzcyIgLz48bGluayByZWw9InNob3J0Y3V0IGljb24iIGhyZWY9Ii9mYXZpY29uLmljbyIgLz48YmFzZSB0YXJnZXQ9Il9zZWxmIiAvPjwvaGVhZD4NCjxib2R5Pg0KPGRpdiBpZD0iaGVhZGVyIj48c3BhbiBjbGFzcz0idXNlciI+k2OShiCRvphZIIKzgvE8L3NwYW4+PGltZyBzcmM9Ii9pbWcvbG9nby5naWYiIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgYWx0PSIiIC8+PHNwYW4gY2xhc3M9InN5cyI+kLaOWYrHl52DVoNYg2WDgDwvc3Bhbj48L2Rpdj4NCjxkaXYgaWQ9ImNvbnRlbnQiPg0KPGZvcm0gbmFtZT0iZm9ybTEiIG1ldGhvZD0icG9zdCIgYWN0aW9uPSJJdGVtUGlja2VyLmFzcHg/cGxhbnQ9MDEmYW1wO2tleT14QkJIT0hwWFlaZ0ZLeU5acHVXeSIgaWQ9ImZvcm0xIj4NCjxkaXY+DQo8aW5wdXQgdHlwZT0iaGlkZGVuIiBuYW1lPSJfX1ZJRVdTVEFURSIgaWQ9Il9fVklFV1NUQVRFIiB2YWx1ZT0iL3dFUER3VUttMGJueHpOOHZpV0hVK1pzb1MwM295Y1Fxa1Q1LzZBMjR1ajJPTURQSW5hZ3VyMDRsbHZURHpGbWVxbS96LzgvWm4yOHVDZVYyUUxZNTdYTS9oV2ZTT0JOcTV3bkJZVGh6K0tVcFpBcG5lTTZuaUZ6IiAvPg0KPC9kaXY+DQo8ZGl2Pg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19WSUVXU1RBVEVHRU5FUkFUT1IiIGlkPSJfX1ZJRVdTVEFURUdFTkVSQVRPUiIgdmFsdWU9IkU4MUIyQzlGIiAvPg0KPC9kaXY+DQo8aDI+lWmU1JFJkfAglnuO0I1Ij+o8L2gyPg0KPHA+PHNwYW4gaWQ9ImxibE1lc3NhZ2UiIGNsYXNzPSJtc2ciPjwvc3Bhbj48L3A+DQo8dGFibGUgaWQ9InRibEl0ZW1zIiBjbGFzcz0iZ3JpZCIgYm9yZGVyPSIxIiBjZWxsc3BhY2luZz0iMCI+DQo8dHI+PHRoPpVplNQ8L3RoPjx0aD6VaZa8PC90aD48L3RyPg0KPHRyPjx0ZD48YSBocmVmPSIjIiBpZD0iaXRlbV9BLTEwMDEiIG9uY2xpY2s9IndpbmRvdy5yZXR1cm5WYWx1ZT0nQS0xMDAxJzt3aW5kb3cuY2xvc2UoKTtyZXR1cm4gZmFsc2U7Ij5BLTEwMDE8L2E+PC90ZD48dGQ+g3WDiYNQg2KDZzwvdGQ+PC90cj4NCjx0cj48dGQ+PGEgaHJlZj0iIyIgaWQ9Iml0ZW1fQS0xMDAyIiBvbmNsaWNrPSJ3aW5kb3cucmV0dXJuVmFsdWU9J0EtMTAwMic7d2luZG93LmNsb3NlKCk7cmV0dXJuIGZhbHNlOyI+QS0xMDAyPC9hPjwvdGQ+PHRkPoNYg2WBWzwvdGQ+PC90cj4NCjx0cj48dGQ+PGEgaHJlZj0iIyIgaWQ9Iml0ZW1fQS0xMDAzIiBvbmNsaWNrPSJ3aW5kb3cucmV0dXJuVmFsdWU9J0EtMTAwMyc7d2luZG93LmNsb3NlKCk7cmV0dXJuIGZhbHNlOyI+QS0xMDAzPC9hPjwvdGQ+PHRkPoNKg2+BWzwvdGQ+PC90cj4NCjwvdGFibGU+DQo8cD48aW5wdXQgdHlwZT0iYnV0dG9uIiBpZD0iYnRuQ2FuY2VsIiB2YWx1ZT0ig0yDg4OTg1qDiyIgb25jbGljaz0id2luZG93LnJldHVyblZhbHVlPScnO3dpbmRvdy5jbG9zZSgpOyIgLz48L3A+DQo8L2Zvcm0+DQo8L2Rpdj4NCjwvYm9keT4NCjwvaHRtbD4NCg==",
+    "mime_type": "text/html"
+   }
+  },
+  {
+   "id": "f0009",
+   "started_at": 1791695457.5798678,
+   "page_ref": null,
+   "resource_type": null,
+   "request": {
+    "method": "POST",
+    "url": "http://127.0.0.1.nip.io:60914/Search.aspx?key=xBBHOHpXYZgFKyNZpuWy",
+    "headers": [
+     [
+      "Accept",
+      "image/gif, image/jpeg, image/pjpeg, application/x-ms-application, application/xaml+xml, application/x-ms-xbap, */*"
+     ],
+     [
+      "Referer",
+      "http://127.0.0.1.nip.io:60914/Search.aspx?key=xBBHOHpXYZgFKyNZpuWy"
+     ],
+     [
+      "Accept-Language",
+      "ja"
+     ],
+     [
+      "Content-Type",
+      "application/x-www-form-urlencoded"
+     ],
+     [
+      "UA-CPU",
+      "AMD64"
+     ],
+     [
+      "Accept-Encoding",
+      "gzip, deflate"
+     ],
+     [
+      "User-Agent",
+      "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729)"
+     ],
+     [
+      "Content-Length",
+      "402"
+     ],
+     [
+      "Host",
+      "127.0.0.1.nip.io:60914"
+     ],
+     [
+      "Proxy-Connection",
+      "Keep-Alive"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Cookie",
+      "ASP.NET_SessionId=zn7ef0ikb3v3rbhic8wdqqf9; .ASPXAUTH=AC642EE24C0AD7E1B6AF326B7F7569C766C4D08D0F2AD69CEE99FB46E9C5AA32"
+     ]
+    ],
+    "body_b64": "X19FVkVOVFRBUkdFVD0mX19FVkVOVEFSR1VNRU5UPSZfX1ZJRVdTVEFURT0lMkZ3RVBEd1VLUlFCc083bmtUaU1ORERRYWUlMkY1c1pxZlFwYSUyQiUyQmtSTW80YnNCTVI4aFlBVVpaWUNOU2VkbmFhMjN5Mk5pSWlwM3R2enBGMFFObEltUmRzSnY1aEdrTlljTjNLemtmYU9ySFB6czcwVTdKa3Q2RW5KdSZfX1ZJRVdTVEFURUdFTkVSQVRPUj01RjBEOEMyMSZfX0VWRU5UVkFMSURBVElPTj0lMkZ3RVduMnpNRkclMkZpYkFPbGVvMFpOdzB2OGNJTnk0RVZwNnZZSnhaUjZmTGVRa2hTVWFwcHU5NVZWcUtOJmRkbFBsYW50PTAxJmRkbExpbmU9TDExJmRkbFNoaWZ0PUQmdHh0RnJvbT0yMDI2JTJGMDklMkYwMSZ0eHRUbz0yMDI2JTJGMTAlMkYxMCZ0eHRJdGVtPUEtMTAwMiZidG5TZWFyY2g9JThDJTlGJThEJUY1"
+   },
+   "response": {
+    "status": 200,
+    "headers": [
+     [
+      "Server",
+      "Microsoft-IIS/8.5"
+     ],
+     [
+      "Date",
+      "Sun, 11 Oct 2026 05:10:57 GMT"
+     ],
+     [
+      "Content-Type",
+      "text/html; charset=Shift_JIS"
+     ],
+     [
+      "Content-Length",
+      "7343"
+     ],
+     [
+      "Cache-Control",
+      "no-cache"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Expires",
+      "-1"
+     ],
+     [
+      "X-AspNet-Version",
+      "4.0.30319"
+     ],
+     [
+      "X-Powered-By",
+      "ASP.NET"
+     ]
+    ],
+    "body_b64": "PCFET0NUWVBFIGh0bWwgUFVCTElDICItLy9XM0MvL0RURCBYSFRNTCAxLjAgVHJhbnNpdGlvbmFsLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL1RSL3hodG1sMS9EVEQveGh0bWwxLXRyYW5zaXRpb25hbC5kdGQiPg0KPGh0bWwgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGh0bWwiPg0KPGhlYWQ+PG1ldGEgaHR0cC1lcXVpdj0iQ29udGVudC1UeXBlIiBjb250ZW50PSJ0ZXh0L2h0bWw7IGNoYXJzZXQ9U2hpZnRfSklTIiAvPjx0aXRsZT6Qto5ZiseXnYNWg1iDZYOAIC0gkLaOWY7AkNGPxonvPC90aXRsZT48bGluayBocmVmPSIvY3NzL3NpdGUuY3NzIiByZWw9InN0eWxlc2hlZXQiIHR5cGU9InRleHQvY3NzIiAvPjxsaW5rIHJlbD0ic2hvcnRjdXQgaWNvbiIgaHJlZj0iL2Zhdmljb24uaWNvIiAvPjwvaGVhZD4NCjxib2R5Pg0KPGRpdiBpZD0iaGVhZGVyIj48c3BhbiBjbGFzcz0idXNlciI+k2OShiCRvphZIIKzgvE8L3NwYW4+PGltZyBzcmM9Ii9pbWcvbG9nby5naWYiIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgYWx0PSIiIC8+PHNwYW4gY2xhc3M9InN5cyI+kLaOWYrHl52DVoNYg2WDgDwvc3Bhbj48L2Rpdj4NCjxkaXYgaWQ9ImNvbnRlbnQiPg0KPGZvcm0gbmFtZT0iZm9ybTEiIG1ldGhvZD0icG9zdCIgYWN0aW9uPSJTZWFyY2guYXNweD9rZXk9eEJCSE9IcFhZWmdGS3lOWnB1V3kiIGlkPSJmb3JtMSI+DQo8ZGl2Pg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19FVkVOVFRBUkdFVCIgaWQ9Il9fRVZFTlRUQVJHRVQiIHZhbHVlPSIiIC8+DQo8aW5wdXQgdHlwZT0iaGlkZGVuIiBuYW1lPSJfX0VWRU5UQVJHVU1FTlQiIGlkPSJfX0VWRU5UQVJHVU1FTlQiIHZhbHVlPSIiIC8+DQo8aW5wdXQgdHlwZT0iaGlkZGVuIiBuYW1lPSJfX1ZJRVdTVEFURSIgaWQ9Il9fVklFV1NUQVRFIiB2YWx1ZT0iL3dFUER3VUtiUWRiaTZkL21vU0lXZXBtWGtOZXg3UlYyWkJsSzYySDJENXczQnFOZ2V1aEdmL2tnQ2lxOHlhNGp2MzJzZUEzRktsY0hMZG5tWTRad0lEWmRIbXFGc2NaNTRaS09wV0M0QnpWUldia0M5SmlLWStHIiAvPg0KPC9kaXY+DQo8c2NyaXB0IHR5cGU9InRleHQvamF2YXNjcmlwdCI+Ci8vPCFbQ0RBVEFbCnZhciB0aGVGb3JtID0gZG9jdW1lbnQuZm9ybXNbJ2Zvcm0xJ107CmlmICghdGhlRm9ybSkgewogICAgdGhlRm9ybSA9IGRvY3VtZW50LmZvcm1zWzBdOwp9CmZ1bmN0aW9uIF9fZG9Qb3N0QmFjayhldmVudFRhcmdldCwgZXZlbnRBcmd1bWVudCkgewogICAgaWYgKCF0aGVGb3JtLm9uc3VibWl0IHx8ICh0aGVGb3JtLm9uc3VibWl0KCkgIT0gZmFsc2UpKSB7CiAgICAgICAgdGhlRm9ybS5fX0VWRU5UVEFSR0VULnZhbHVlID0gZXZlbnRUYXJnZXQ7CiAgICAgICAgdGhlRm9ybS5fX0VWRU5UQVJHVU1FTlQudmFsdWUgPSBldmVudEFyZ3VtZW50OwogICAgICAgIHRoZUZvcm0uc3VibWl0KCk7CiAgICB9Cn0KLy9dXT4KPC9zY3JpcHQ+DQo8ZGl2Pg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19WSUVXU1RBVEVHRU5FUkFUT1IiIGlkPSJfX1ZJRVdTVEFURUdFTkVSQVRPUiIgdmFsdWU9IjVGMEQ4QzIxIiAvPg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19FVkVOVFZBTElEQVRJT04iIGlkPSJfX0VWRU5UVkFMSURBVElPTiIgdmFsdWU9Ii93RVd3YnB2S0tsOERXYU0vY0MrUmx4MGJ1NnRPWjZlOHUyYXJ5MVErSmwvRVV4Y3pwU2tqQW4yWFdNTCIgLz4NCjwvZGl2Pg0KPGgyPpC2jlmOwJDRj8aJ7zwvaDI+DQo8dGFibGUgY2xhc3M9ImZvcm0iPg0KPHRyPjx0aD6NSI/qPC90aD48dGQ+PHNlbGVjdCBuYW1lPSJkZGxQbGFudCIgb25jaGFuZ2U9Il9fZG9Qb3N0QmFjaygnZGRsUGxhbnQnLCcnKSIgaWQ9ImRkbFBsYW50IiBzdHlsZT0id2lkdGg6MTYwcHg7Ij4NCjxvcHRpb24gdmFsdWU9IiI+LS0gkUmR8IK1gsSCrYK+grOCoiAtLTwvb3B0aW9uPg0KPG9wdGlvbiBzZWxlY3RlZD0ic2VsZWN0ZWQiIHZhbHVlPSIwMSI+lnuO0I1Ij+o8L29wdGlvbj4NCjxvcHRpb24gdmFsdWU9IjAyIj6R5pPxjUiP6jwvb3B0aW9uPg0KPC9zZWxlY3Q+PC90ZD48L3RyPg0KPHRyPjx0aD6DiYNDg5M8L3RoPjx0ZD48c2VsZWN0IG5hbWU9ImRkbExpbmUiIGlkPSJkZGxMaW5lIiBzdHlsZT0id2lkdGg6MTYwcHg7Ij4NCjxvcHRpb24gc2VsZWN0ZWQ9InNlbGVjdGVkIiB2YWx1ZT0iTDExIj6RZ5enMYOJg0ODkzwvb3B0aW9uPg0KPG9wdGlvbiB2YWx1ZT0iTDEyIj6RZ5enMoOJg0ODkzwvb3B0aW9uPg0KPC9zZWxlY3Q+PC90ZD48L3RyPg0KPHRyPjx0aD6SvDwvdGg+PHRkPjxzZWxlY3QgbmFtZT0iZGRsU2hpZnQiIGlkPSJkZGxTaGlmdCI+DQo8b3B0aW9uIHZhbHVlPSJBTEwiPpFTgsQ8L29wdGlvbj4NCjxvcHRpb24gc2VsZWN0ZWQ9InNlbGVjdGVkIiB2YWx1ZT0iRCI+k/qLzjwvb3B0aW9uPg0KPG9wdGlvbiB2YWx1ZT0iTiI+lumLzjwvb3B0aW9uPg0KPC9zZWxlY3Q+PC90ZD48L3RyPg0KPHRyPjx0aD6K+orUPC90aD48dGQ+PGlucHV0IG5hbWU9InR4dEZyb20iIHR5cGU9InRleHQiIHZhbHVlPSIyMDI2LzA5LzAxIiBtYXhsZW5ndGg9IjEwIiBpZD0idHh0RnJvbSIgc3R5bGU9IndpZHRoOjkwcHg7IiAvPiCCqYLnIDxpbnB1dCBuYW1lPSJ0eHRUbyIgdHlwZT0idGV4dCIgdmFsdWU9IjIwMjYvMTAvMTAiIG1heGxlbmd0aD0iMTAiIGlkPSJ0eHRUbyIgc3R5bGU9IndpZHRoOjkwcHg7IiAvPiCC3ILFgWl5eXl5L21tL2RkgWo8L3RkPjwvdHI+DQo8dHI+PHRoPpVplNQ8L3RoPjx0ZD48aW5wdXQgbmFtZT0idHh0SXRlbSIgdHlwZT0idGV4dCIgdmFsdWU9IkEtMTAwMiIgcmVhZG9ubHk9InJlYWRvbmx5IiBpZD0idHh0SXRlbSIgc3R5bGU9IndpZHRoOjEwMHB4OyIgLz4gPGlucHV0IHR5cGU9ImJ1dHRvbiIgbmFtZT0iYnRuUGljayIgdmFsdWU9IpVplNSRSZHwIiBpZD0iYnRuUGljayIgb25jbGljaz0idmFyIHBsYW50ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2RkbFBsYW50JykudmFsdWU7IGlmIChwbGFudCA9PSAnJykgeyBhbGVydCgnkOaCyY1Ij+qC8JFJkfCCtYLEgq2CvoKzgqKBQicpOyByZXR1cm4gZmFsc2U7IH0gdmFyIHIgPSB3aW5kb3cuc2hvd01vZGFsRGlhbG9nKCdJdGVtUGlja2VyLmFzcHg/cGxhbnQ9JyArIHBsYW50ICsgJyZrZXk9eEJCSE9IcFhZWmdGS3lOWnB1V3knLCB3aW5kb3csICdkaWFsb2dXaWR0aDo0MjBweDtkaWFsb2dIZWlnaHQ6MzYwcHgnKTsgaWYgKHIpIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0eHRJdGVtJykudmFsdWUgPSByOyByZXR1cm4gZmFsc2U7IiAvPiA8aW5wdXQgdHlwZT0iYnV0dG9uIiBuYW1lPSJidG5DbGVhckl0ZW0iIHZhbHVlPSKDToOKg0EiIGlkPSJidG5DbGVhckl0ZW0iIG9uY2xpY2s9ImRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0eHRJdGVtJykudmFsdWU9Jyc7IiAvPjwvdGQ+PC90cj4NCjwvdGFibGU+DQo8cD48aW5wdXQgdHlwZT0ic3VibWl0IiBuYW1lPSJidG5TZWFyY2giIHZhbHVlPSKMn431IiBpZD0iYnRuU2VhcmNoIiAvPiA8aW5wdXQgdHlwZT0ic3VibWl0IiBuYW1lPSJidG5FeGNlbCIgdmFsdWU9IkV4Y2Vsj2+XzSIgaWQ9ImJ0bkV4Y2VsIiAvPiA8aW5wdXQgdHlwZT0iYnV0dG9uIiBuYW1lPSJidG5DbG9zZSIgdmFsdWU9IpXCgraC6SIgaWQ9ImJ0bkNsb3NlIiBvbmNsaWNrPSJ3aW5kb3cuY2xvc2UoKTsiIC8+PC9wPg0KPHA+PHNwYW4gaWQ9ImxibE1lc3NhZ2UiIGNsYXNzPSJtc2ciPjwvc3Bhbj48L3A+DQo8cCBjbGFzcz0iY291bnQiPjxzcGFuIGlkPSJsYmxDb3VudCI+ilmTloyPkJQ6IDM1IIyPgWkxLzIgg3mBW4NXgWo8L3NwYW4+PC9wPg0KPGRpdj4NCjx0YWJsZSBjbGFzcz0iZ3JpZCIgY2VsbHNwYWNpbmc9IjAiIHJ1bGVzPSJhbGwiIGJvcmRlcj0iMSIgaWQ9Imd2UmVzdWx0IiBzdHlsZT0iYm9yZGVyLWNvbGxhcHNlOmNvbGxhcHNlOyI+DQo8dHI+PHRoIHNjb3BlPSJjb2wiPpP6lXQ8L3RoPjx0aCBzY29wZT0iY29sIj6DiYNDg5M8L3RoPjx0aCBzY29wZT0iY29sIj6SvDwvdGg+PHRoIHNjb3BlPSJjb2wiPpVplNQ8L3RoPjx0aCBzY29wZT0iY29sIj6MdonmkJQ8L3RoPjx0aCBzY29wZT0iY29sIj6OwJDRkJQ8L3RoPjx0aCBzY29wZT0iY29sIj6Vc5fHkJQ8L3RoPjwvdHI+DQo8dHI+PHRkPjIwMjYvMDkvMDE8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xNTA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjE1MjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+NDwvdGQ+PC90cj4NCjx0ciBjbGFzcz0iYWx0Ij48dGQ+MjAyNi8wOS8wMjwvdGQ+PHRkPkwxMTwvdGQ+PHRkPpP6i848L3RkPjx0ZD5BLTEwMDI8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjE1MDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTM5PC90ZD48dGQgYWxpZ249InJpZ2h0Ij41PC90ZD48L3RyPg0KPHRyPjx0ZD4yMDI2LzA5LzAzPC90ZD48dGQ+TDExPC90ZD48dGQ+k/qLzjwvdGQ+PHRkPkEtMTAwMjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTAwPC90ZD48dGQgYWxpZ249InJpZ2h0Ij45ODwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MDwvdGQ+PC90cj4NCjx0ciBjbGFzcz0iYWx0Ij48dGQ+MjAyNi8wOS8wNDwvdGQ+PHRkPkwxMTwvdGQ+PHRkPpP6i848L3RkPjx0ZD5BLTEwMDI8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjE1MDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTQ4PC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xPC90ZD48L3RyPg0KPHRyPjx0ZD4yMDI2LzA5LzA1PC90ZD48dGQ+TDExPC90ZD48dGQ+k/qLzjwvdGQ+PHRkPkEtMTAwMjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTUwPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xNDA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjE8L3RkPjwvdHI+DQo8dHIgY2xhc3M9ImFsdCI+PHRkPjIwMjYvMDkvMDc8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4yMDA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjE4OTwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MjwvdGQ+PC90cj4NCjx0cj48dGQ+MjAyNi8wOS8wODwvdGQ+PHRkPkwxMTwvdGQ+PHRkPpP6i848L3RkPjx0ZD5BLTEwMDI8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjEwMDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+OTQ8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjI8L3RkPjwvdHI+DQo8dHIgY2xhc3M9ImFsdCI+PHRkPjIwMjYvMDkvMDk8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xMjA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjEyMTwvdGQ+PHRkIGFsaWduPSJyaWdodCI+NTwvdGQ+PC90cj4NCjx0cj48dGQ+MjAyNi8wOS8xMDwvdGQ+PHRkPkwxMTwvdGQ+PHRkPpP6i848L3RkPjx0ZD5BLTEwMDI8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjEwMDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+ODU8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjQ8L3RkPjwvdHI+DQo8dHIgY2xhc3M9ImFsdCI+PHRkPjIwMjYvMDkvMTE8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xMjA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjExMzwvdGQ+PHRkIGFsaWduPSJyaWdodCI+NjwvdGQ+PC90cj4NCjx0cj48dGQ+MjAyNi8wOS8xMjwvdGQ+PHRkPkwxMTwvdGQ+PHRkPpP6i848L3RkPjx0ZD5BLTEwMDI8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjgwPC90ZD48dGQgYWxpZ249InJpZ2h0Ij43NjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+NDwvdGQ+PC90cj4NCjx0ciBjbGFzcz0iYWx0Ij48dGQ+MjAyNi8wOS8xNDwvdGQ+PHRkPkwxMTwvdGQ+PHRkPpP6i848L3RkPjx0ZD5BLTEwMDI8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjEwMDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+OTQ8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjQ8L3RkPjwvdHI+DQo8dHI+PHRkPjIwMjYvMDkvMTU8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij44MDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+Nzc8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjA8L3RkPjwvdHI+DQo8dHIgY2xhc3M9ImFsdCI+PHRkPjIwMjYvMDkvMTY8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xMDA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjEwNTwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MjwvdGQ+PC90cj4NCjx0cj48dGQ+MjAyNi8wOS8xNzwvdGQ+PHRkPkwxMTwvdGQ+PHRkPpP6i848L3RkPjx0ZD5BLTEwMDI8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjEyMDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTI0PC90ZD48dGQgYWxpZ249InJpZ2h0Ij40PC90ZD48L3RyPg0KPHRyIGNsYXNzPSJhbHQiPjx0ZD4yMDI2LzA5LzE4PC90ZD48dGQ+TDExPC90ZD48dGQ+k/qLzjwvdGQ+PHRkPkEtMTAwMjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTUwPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xNDQ8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjU8L3RkPjwvdHI+DQo8dHI+PHRkPjIwMjYvMDkvMTk8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij44MDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+Nzc8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjQ8L3RkPjwvdHI+DQo8dHIgY2xhc3M9ImFsdCI+PHRkPjIwMjYvMDkvMjE8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij44MDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+NjY8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjE8L3RkPjwvdHI+DQo8dHI+PHRkPjIwMjYvMDkvMjI8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xMDA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjg2PC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xPC90ZD48L3RyPg0KPHRyIGNsYXNzPSJhbHQiPjx0ZD4yMDI2LzA5LzIzPC90ZD48dGQ+TDExPC90ZD48dGQ+k/qLzjwvdGQ+PHRkPkEtMTAwMjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTAwPC90ZD48dGQgYWxpZ249InJpZ2h0Ij45MjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MjwvdGQ+PC90cj4NCjx0ciBjbGFzcz0icGFnZXIiPjx0ZCBjb2xzcGFuPSI3Ij48dGFibGUgYm9yZGVyPSIwIj48dHI+PHRkPjxzcGFuPjE8L3NwYW4+PC90ZD48dGQ+PGEgaHJlZj0iamF2YXNjcmlwdDpfX2RvUG9zdEJhY2soJ2d2UmVzdWx0JywnUGFnZSQyJykiPjI8L2E+PC90ZD48L3RyPjwvdGFibGU+PC90ZD48L3RyPg0KPC90YWJsZT4NCjwvZGl2Pg0KPC9mb3JtPg0KPC9kaXY+DQo8L2JvZHk+DQo8L2h0bWw+DQo=",
+    "mime_type": "text/html"
+   }
+  },
+  {
+   "id": "f0010",
+   "started_at": 1791695458.08261,
+   "page_ref": null,
+   "resource_type": null,
+   "request": {
+    "method": "POST",
+    "url": "http://127.0.0.1.nip.io:60914/Search.aspx?key=xBBHOHpXYZgFKyNZpuWy",
+    "headers": [
+     [
+      "Accept",
+      "image/gif, image/jpeg, image/pjpeg, application/x-ms-application, application/xaml+xml, application/x-ms-xbap, */*"
+     ],
+     [
+      "Referer",
+      "http://127.0.0.1.nip.io:60914/Search.aspx?key=xBBHOHpXYZgFKyNZpuWy"
+     ],
+     [
+      "Accept-Language",
+      "ja"
+     ],
+     [
+      "Content-Type",
+      "application/x-www-form-urlencoded"
+     ],
+     [
+      "UA-CPU",
+      "AMD64"
+     ],
+     [
+      "Accept-Encoding",
+      "gzip, deflate"
+     ],
+     [
+      "User-Agent",
+      "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729)"
+     ],
+     [
+      "Content-Length",
+      "401"
+     ],
+     [
+      "Host",
+      "127.0.0.1.nip.io:60914"
+     ],
+     [
+      "Proxy-Connection",
+      "Keep-Alive"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Cookie",
+      "ASP.NET_SessionId=zn7ef0ikb3v3rbhic8wdqqf9; .ASPXAUTH=AC642EE24C0AD7E1B6AF326B7F7569C766C4D08D0F2AD69CEE99FB46E9C5AA32"
+     ]
+    ],
+    "body_b64": "X19FVkVOVFRBUkdFVD1ndlJlc3VsdCZfX0VWRU5UQVJHVU1FTlQ9UGFnZSUyNDImX19WSUVXU1RBVEU9JTJGd0VQRHdVS2JRZGJpNmQlMkZtb1NJV2VwbVhrTmV4N1JWMlpCbEs2MkgyRDV3M0JxTmdldWhHZiUyRmtnQ2lxOHlhNGp2MzJzZUEzRktsY0hMZG5tWTRad0lEWmRIbXFGc2NaNTRaS09wV0M0QnpWUldia0M5SmlLWSUyQkcmX19WSUVXU1RBVEVHRU5FUkFUT1I9NUYwRDhDMjEmX19FVkVOVFZBTElEQVRJT049JTJGd0VXd2JwdktLbDhEV2FNJTJGY0MlMkJSbHgwYnU2dE9aNmU4dTJhcnkxUSUyQkpsJTJGRVV4Y3pwU2tqQW4yWFdNTCZkZGxQbGFudD0wMSZkZGxMaW5lPUwxMSZkZGxTaGlmdD1EJnR4dEZyb209MjAyNiUyRjA5JTJGMDEmdHh0VG89MjAyNiUyRjEwJTJGMTAmdHh0SXRlbT1BLTEwMDI="
+   },
+   "response": {
+    "status": 200,
+    "headers": [
+     [
+      "Server",
+      "Microsoft-IIS/8.5"
+     ],
+     [
+      "Date",
+      "Sun, 11 Oct 2026 05:10:58 GMT"
+     ],
+     [
+      "Content-Type",
+      "text/html; charset=Shift_JIS"
+     ],
+     [
+      "Content-Length",
+      "6583"
+     ],
+     [
+      "Cache-Control",
+      "no-cache"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Expires",
+      "-1"
+     ],
+     [
+      "X-AspNet-Version",
+      "4.0.30319"
+     ],
+     [
+      "X-Powered-By",
+      "ASP.NET"
+     ]
+    ],
+    "body_b64": "PCFET0NUWVBFIGh0bWwgUFVCTElDICItLy9XM0MvL0RURCBYSFRNTCAxLjAgVHJhbnNpdGlvbmFsLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL1RSL3hodG1sMS9EVEQveGh0bWwxLXRyYW5zaXRpb25hbC5kdGQiPg0KPGh0bWwgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGh0bWwiPg0KPGhlYWQ+PG1ldGEgaHR0cC1lcXVpdj0iQ29udGVudC1UeXBlIiBjb250ZW50PSJ0ZXh0L2h0bWw7IGNoYXJzZXQ9U2hpZnRfSklTIiAvPjx0aXRsZT6Qto5ZiseXnYNWg1iDZYOAIC0gkLaOWY7AkNGPxonvPC90aXRsZT48bGluayBocmVmPSIvY3NzL3NpdGUuY3NzIiByZWw9InN0eWxlc2hlZXQiIHR5cGU9InRleHQvY3NzIiAvPjxsaW5rIHJlbD0ic2hvcnRjdXQgaWNvbiIgaHJlZj0iL2Zhdmljb24uaWNvIiAvPjwvaGVhZD4NCjxib2R5Pg0KPGRpdiBpZD0iaGVhZGVyIj48c3BhbiBjbGFzcz0idXNlciI+k2OShiCRvphZIIKzgvE8L3NwYW4+PGltZyBzcmM9Ii9pbWcvbG9nby5naWYiIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgYWx0PSIiIC8+PHNwYW4gY2xhc3M9InN5cyI+kLaOWYrHl52DVoNYg2WDgDwvc3Bhbj48L2Rpdj4NCjxkaXYgaWQ9ImNvbnRlbnQiPg0KPGZvcm0gbmFtZT0iZm9ybTEiIG1ldGhvZD0icG9zdCIgYWN0aW9uPSJTZWFyY2guYXNweD9rZXk9eEJCSE9IcFhZWmdGS3lOWnB1V3kiIGlkPSJmb3JtMSI+DQo8ZGl2Pg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19FVkVOVFRBUkdFVCIgaWQ9Il9fRVZFTlRUQVJHRVQiIHZhbHVlPSIiIC8+DQo8aW5wdXQgdHlwZT0iaGlkZGVuIiBuYW1lPSJfX0VWRU5UQVJHVU1FTlQiIGlkPSJfX0VWRU5UQVJHVU1FTlQiIHZhbHVlPSIiIC8+DQo8aW5wdXQgdHlwZT0iaGlkZGVuIiBuYW1lPSJfX1ZJRVdTVEFURSIgaWQ9Il9fVklFV1NUQVRFIiB2YWx1ZT0iL3dFUER3VUtxK0tQWGUrOGRFNUZwNWhZY3pTZ1ZkY2lQcEpuQ1VQQjQ5WWJQcEY3dDAzQ1IvN2RWNjkvc2Q3aHZUMmhWK1h1U2k0Q0QxWFNwWjV1Ui9aVEFoQ2dqcHBBWDUySzFJMXZmWGpHRENQQW1taHc5Tm56IiAvPg0KPC9kaXY+DQo8c2NyaXB0IHR5cGU9InRleHQvamF2YXNjcmlwdCI+Ci8vPCFbQ0RBVEFbCnZhciB0aGVGb3JtID0gZG9jdW1lbnQuZm9ybXNbJ2Zvcm0xJ107CmlmICghdGhlRm9ybSkgewogICAgdGhlRm9ybSA9IGRvY3VtZW50LmZvcm1zWzBdOwp9CmZ1bmN0aW9uIF9fZG9Qb3N0QmFjayhldmVudFRhcmdldCwgZXZlbnRBcmd1bWVudCkgewogICAgaWYgKCF0aGVGb3JtLm9uc3VibWl0IHx8ICh0aGVGb3JtLm9uc3VibWl0KCkgIT0gZmFsc2UpKSB7CiAgICAgICAgdGhlRm9ybS5fX0VWRU5UVEFSR0VULnZhbHVlID0gZXZlbnRUYXJnZXQ7CiAgICAgICAgdGhlRm9ybS5fX0VWRU5UQVJHVU1FTlQudmFsdWUgPSBldmVudEFyZ3VtZW50OwogICAgICAgIHRoZUZvcm0uc3VibWl0KCk7CiAgICB9Cn0KLy9dXT4KPC9zY3JpcHQ+DQo8ZGl2Pg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19WSUVXU1RBVEVHRU5FUkFUT1IiIGlkPSJfX1ZJRVdTVEFURUdFTkVSQVRPUiIgdmFsdWU9IjVGMEQ4QzIxIiAvPg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19FVkVOVFZBTElEQVRJT04iIGlkPSJfX0VWRU5UVkFMSURBVElPTiIgdmFsdWU9Ii93RVdVYW9kb1lxRWFGMWRUUGFjM2toZExtY01tL0NkUG9qcGxDQ3BTR1N4QmQ1STJ3ZkdVNjBFVzBPMSIgLz4NCjwvZGl2Pg0KPGgyPpC2jlmOwJDRj8aJ7zwvaDI+DQo8dGFibGUgY2xhc3M9ImZvcm0iPg0KPHRyPjx0aD6NSI/qPC90aD48dGQ+PHNlbGVjdCBuYW1lPSJkZGxQbGFudCIgb25jaGFuZ2U9Il9fZG9Qb3N0QmFjaygnZGRsUGxhbnQnLCcnKSIgaWQ9ImRkbFBsYW50IiBzdHlsZT0id2lkdGg6MTYwcHg7Ij4NCjxvcHRpb24gdmFsdWU9IiI+LS0gkUmR8IK1gsSCrYK+grOCoiAtLTwvb3B0aW9uPg0KPG9wdGlvbiBzZWxlY3RlZD0ic2VsZWN0ZWQiIHZhbHVlPSIwMSI+lnuO0I1Ij+o8L29wdGlvbj4NCjxvcHRpb24gdmFsdWU9IjAyIj6R5pPxjUiP6jwvb3B0aW9uPg0KPC9zZWxlY3Q+PC90ZD48L3RyPg0KPHRyPjx0aD6DiYNDg5M8L3RoPjx0ZD48c2VsZWN0IG5hbWU9ImRkbExpbmUiIGlkPSJkZGxMaW5lIiBzdHlsZT0id2lkdGg6MTYwcHg7Ij4NCjxvcHRpb24gc2VsZWN0ZWQ9InNlbGVjdGVkIiB2YWx1ZT0iTDExIj6RZ5enMYOJg0ODkzwvb3B0aW9uPg0KPG9wdGlvbiB2YWx1ZT0iTDEyIj6RZ5enMoOJg0ODkzwvb3B0aW9uPg0KPC9zZWxlY3Q+PC90ZD48L3RyPg0KPHRyPjx0aD6SvDwvdGg+PHRkPjxzZWxlY3QgbmFtZT0iZGRsU2hpZnQiIGlkPSJkZGxTaGlmdCI+DQo8b3B0aW9uIHZhbHVlPSJBTEwiPpFTgsQ8L29wdGlvbj4NCjxvcHRpb24gc2VsZWN0ZWQ9InNlbGVjdGVkIiB2YWx1ZT0iRCI+k/qLzjwvb3B0aW9uPg0KPG9wdGlvbiB2YWx1ZT0iTiI+lumLzjwvb3B0aW9uPg0KPC9zZWxlY3Q+PC90ZD48L3RyPg0KPHRyPjx0aD6K+orUPC90aD48dGQ+PGlucHV0IG5hbWU9InR4dEZyb20iIHR5cGU9InRleHQiIHZhbHVlPSIyMDI2LzA5LzAxIiBtYXhsZW5ndGg9IjEwIiBpZD0idHh0RnJvbSIgc3R5bGU9IndpZHRoOjkwcHg7IiAvPiCCqYLnIDxpbnB1dCBuYW1lPSJ0eHRUbyIgdHlwZT0idGV4dCIgdmFsdWU9IjIwMjYvMTAvMTAiIG1heGxlbmd0aD0iMTAiIGlkPSJ0eHRUbyIgc3R5bGU9IndpZHRoOjkwcHg7IiAvPiCC3ILFgWl5eXl5L21tL2RkgWo8L3RkPjwvdHI+DQo8dHI+PHRoPpVplNQ8L3RoPjx0ZD48aW5wdXQgbmFtZT0idHh0SXRlbSIgdHlwZT0idGV4dCIgdmFsdWU9IkEtMTAwMiIgcmVhZG9ubHk9InJlYWRvbmx5IiBpZD0idHh0SXRlbSIgc3R5bGU9IndpZHRoOjEwMHB4OyIgLz4gPGlucHV0IHR5cGU9ImJ1dHRvbiIgbmFtZT0iYnRuUGljayIgdmFsdWU9IpVplNSRSZHwIiBpZD0iYnRuUGljayIgb25jbGljaz0idmFyIHBsYW50ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2RkbFBsYW50JykudmFsdWU7IGlmIChwbGFudCA9PSAnJykgeyBhbGVydCgnkOaCyY1Ij+qC8JFJkfCCtYLEgq2CvoKzgqKBQicpOyByZXR1cm4gZmFsc2U7IH0gdmFyIHIgPSB3aW5kb3cuc2hvd01vZGFsRGlhbG9nKCdJdGVtUGlja2VyLmFzcHg/cGxhbnQ9JyArIHBsYW50ICsgJyZrZXk9eEJCSE9IcFhZWmdGS3lOWnB1V3knLCB3aW5kb3csICdkaWFsb2dXaWR0aDo0MjBweDtkaWFsb2dIZWlnaHQ6MzYwcHgnKTsgaWYgKHIpIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0eHRJdGVtJykudmFsdWUgPSByOyByZXR1cm4gZmFsc2U7IiAvPiA8aW5wdXQgdHlwZT0iYnV0dG9uIiBuYW1lPSJidG5DbGVhckl0ZW0iIHZhbHVlPSKDToOKg0EiIGlkPSJidG5DbGVhckl0ZW0iIG9uY2xpY2s9ImRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0eHRJdGVtJykudmFsdWU9Jyc7IiAvPjwvdGQ+PC90cj4NCjwvdGFibGU+DQo8cD48aW5wdXQgdHlwZT0ic3VibWl0IiBuYW1lPSJidG5TZWFyY2giIHZhbHVlPSKMn431IiBpZD0iYnRuU2VhcmNoIiAvPiA8aW5wdXQgdHlwZT0ic3VibWl0IiBuYW1lPSJidG5FeGNlbCIgdmFsdWU9IkV4Y2Vsj2+XzSIgaWQ9ImJ0bkV4Y2VsIiAvPiA8aW5wdXQgdHlwZT0iYnV0dG9uIiBuYW1lPSJidG5DbG9zZSIgdmFsdWU9IpXCgraC6SIgaWQ9ImJ0bkNsb3NlIiBvbmNsaWNrPSJ3aW5kb3cuY2xvc2UoKTsiIC8+PC9wPg0KPHA+PHNwYW4gaWQ9ImxibE1lc3NhZ2UiIGNsYXNzPSJtc2ciPjwvc3Bhbj48L3A+DQo8cCBjbGFzcz0iY291bnQiPjxzcGFuIGlkPSJsYmxDb3VudCI+ilmTloyPkJQ6IDM1IIyPgWkyLzIgg3mBW4NXgWo8L3NwYW4+PC9wPg0KPGRpdj4NCjx0YWJsZSBjbGFzcz0iZ3JpZCIgY2VsbHNwYWNpbmc9IjAiIHJ1bGVzPSJhbGwiIGJvcmRlcj0iMSIgaWQ9Imd2UmVzdWx0IiBzdHlsZT0iYm9yZGVyLWNvbGxhcHNlOmNvbGxhcHNlOyI+DQo8dHI+PHRoIHNjb3BlPSJjb2wiPpP6lXQ8L3RoPjx0aCBzY29wZT0iY29sIj6DiYNDg5M8L3RoPjx0aCBzY29wZT0iY29sIj6SvDwvdGg+PHRoIHNjb3BlPSJjb2wiPpVplNQ8L3RoPjx0aCBzY29wZT0iY29sIj6MdonmkJQ8L3RoPjx0aCBzY29wZT0iY29sIj6OwJDRkJQ8L3RoPjx0aCBzY29wZT0iY29sIj6Vc5fHkJQ8L3RoPjwvdHI+DQo8dHI+PHRkPjIwMjYvMDkvMjQ8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xMDA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjk0PC90ZD48dGQgYWxpZ249InJpZ2h0Ij40PC90ZD48L3RyPg0KPHRyIGNsYXNzPSJhbHQiPjx0ZD4yMDI2LzA5LzI1PC90ZD48dGQ+TDExPC90ZD48dGQ+k/qLzjwvdGQ+PHRkPkEtMTAwMjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+ODA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjgwPC90ZD48dGQgYWxpZ249InJpZ2h0Ij41PC90ZD48L3RyPg0KPHRyPjx0ZD4yMDI2LzA5LzI2PC90ZD48dGQ+TDExPC90ZD48dGQ+k/qLzjwvdGQ+PHRkPkEtMTAwMjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+ODA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjc1PC90ZD48dGQgYWxpZ249InJpZ2h0Ij41PC90ZD48L3RyPg0KPHRyIGNsYXNzPSJhbHQiPjx0ZD4yMDI2LzA5LzI4PC90ZD48dGQ+TDExPC90ZD48dGQ+k/qLzjwvdGQ+PHRkPkEtMTAwMjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTIwPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xMTQ8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjM8L3RkPjwvdHI+DQo8dHI+PHRkPjIwMjYvMDkvMjk8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xMjA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjEwNjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+NDwvdGQ+PC90cj4NCjx0ciBjbGFzcz0iYWx0Ij48dGQ+MjAyNi8wOS8zMDwvdGQ+PHRkPkwxMTwvdGQ+PHRkPpP6i848L3RkPjx0ZD5BLTEwMDI8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjIwMDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTg5PC90ZD48dGQgYWxpZ249InJpZ2h0Ij40PC90ZD48L3RyPg0KPHRyPjx0ZD4yMDI2LzEwLzAxPC90ZD48dGQ+TDExPC90ZD48dGQ+k/qLzjwvdGQ+PHRkPkEtMTAwMjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTIwPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xMDk8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjE8L3RkPjwvdHI+DQo8dHIgY2xhc3M9ImFsdCI+PHRkPjIwMjYvMTAvMDI8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xMDA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjEwMTwvdGQ+PHRkIGFsaWduPSJyaWdodCI+NTwvdGQ+PC90cj4NCjx0cj48dGQ+MjAyNi8xMC8wMzwvdGQ+PHRkPkwxMTwvdGQ+PHRkPpP6i848L3RkPjx0ZD5BLTEwMDI8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjgwPC90ZD48dGQgYWxpZ249InJpZ2h0Ij43NDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MDwvdGQ+PC90cj4NCjx0ciBjbGFzcz0iYWx0Ij48dGQ+MjAyNi8xMC8wNTwvdGQ+PHRkPkwxMTwvdGQ+PHRkPpP6i848L3RkPjx0ZD5BLTEwMDI8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjE1MDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTUwPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xPC90ZD48L3RyPg0KPHRyPjx0ZD4yMDI2LzEwLzA2PC90ZD48dGQ+TDExPC90ZD48dGQ+k/qLzjwvdGQ+PHRkPkEtMTAwMjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTUwPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4xNTE8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjU8L3RkPjwvdHI+DQo8dHIgY2xhc3M9ImFsdCI+PHRkPjIwMjYvMTAvMDc8L3RkPjx0ZD5MMTE8L3RkPjx0ZD6T+ovOPC90ZD48dGQ+QS0xMDAyPC90ZD48dGQgYWxpZ249InJpZ2h0Ij4yMDA8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjE5MzwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MDwvdGQ+PC90cj4NCjx0cj48dGQ+MjAyNi8xMC8wODwvdGQ+PHRkPkwxMTwvdGQ+PHRkPpP6i848L3RkPjx0ZD5BLTEwMDI8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjIwMDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MjA1PC90ZD48dGQgYWxpZ249InJpZ2h0Ij4zPC90ZD48L3RyPg0KPHRyIGNsYXNzPSJhbHQiPjx0ZD4yMDI2LzEwLzA5PC90ZD48dGQ+TDExPC90ZD48dGQ+k/qLzjwvdGQ+PHRkPkEtMTAwMjwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTAwPC90ZD48dGQgYWxpZ249InJpZ2h0Ij45MDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+NDwvdGQ+PC90cj4NCjx0cj48dGQ+MjAyNi8xMC8xMDwvdGQ+PHRkPkwxMTwvdGQ+PHRkPpP6i848L3RkPjx0ZD5BLTEwMDI8L3RkPjx0ZCBhbGlnbj0icmlnaHQiPjIwMDwvdGQ+PHRkIGFsaWduPSJyaWdodCI+MTkzPC90ZD48dGQgYWxpZ249InJpZ2h0Ij42PC90ZD48L3RyPg0KPHRyIGNsYXNzPSJwYWdlciI+PHRkIGNvbHNwYW49IjciPjx0YWJsZSBib3JkZXI9IjAiPjx0cj48dGQ+PGEgaHJlZj0iamF2YXNjcmlwdDpfX2RvUG9zdEJhY2soJ2d2UmVzdWx0JywnUGFnZSQxJykiPjE8L2E+PC90ZD48dGQ+PHNwYW4+Mjwvc3Bhbj48L3RkPjwvdHI+PC90YWJsZT48L3RkPjwvdHI+DQo8L3RhYmxlPg0KPC9kaXY+DQo8L2Zvcm0+DQo8L2Rpdj4NCjwvYm9keT4NCjwvaHRtbD4NCg==",
+    "mime_type": "text/html"
+   }
+  },
+  {
+   "id": "f0011",
+   "started_at": 1791695458.5667386,
+   "page_ref": null,
+   "resource_type": null,
+   "request": {
+    "method": "POST",
+    "url": "http://127.0.0.1.nip.io:60914/Search.aspx?key=xBBHOHpXYZgFKyNZpuWy",
+    "headers": [
+     [
+      "Accept",
+      "image/gif, image/jpeg, image/pjpeg, application/x-ms-application, application/xaml+xml, application/x-ms-xbap, */*"
+     ],
+     [
+      "Referer",
+      "http://127.0.0.1.nip.io:60914/Search.aspx?key=xBBHOHpXYZgFKyNZpuWy"
+     ],
+     [
+      "Accept-Language",
+      "ja"
+     ],
+     [
+      "Content-Type",
+      "application/x-www-form-urlencoded"
+     ],
+     [
+      "UA-CPU",
+      "AMD64"
+     ],
+     [
+      "Accept-Encoding",
+      "gzip, deflate"
+     ],
+     [
+      "User-Agent",
+      "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729)"
+     ],
+     [
+      "Content-Length",
+      "410"
+     ],
+     [
+      "Host",
+      "127.0.0.1.nip.io:60914"
+     ],
+     [
+      "Proxy-Connection",
+      "Keep-Alive"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Cookie",
+      "ASP.NET_SessionId=zn7ef0ikb3v3rbhic8wdqqf9; .ASPXAUTH=AC642EE24C0AD7E1B6AF326B7F7569C766C4D08D0F2AD69CEE99FB46E9C5AA32"
+     ]
+    ],
+    "body_b64": "X19FVkVOVFRBUkdFVD0mX19FVkVOVEFSR1VNRU5UPSZfX1ZJRVdTVEFURT0lMkZ3RVBEd1VLcSUyQktQWGUlMkI4ZEU1RnA1aFljelNnVmRjaVBwSm5DVVBCNDlZYlBwRjd0MDNDUiUyRjdkVjY5JTJGc2Q3aHZUMmhWJTJCWHVTaTRDRDFYU3BaNXVSJTJGWlRBaENnanBwQVg1MksxSTF2ZlhqR0RDUEFtbWh3OU5ueiZfX1ZJRVdTVEFURUdFTkVSQVRPUj01RjBEOEMyMSZfX0VWRU5UVkFMSURBVElPTj0lMkZ3RVdVYW9kb1lxRWFGMWRUUGFjM2toZExtY01tJTJGQ2RQb2pwbENDcFNHU3hCZDVJMndmR1U2MEVXME8xJmRkbFBsYW50PTAxJmRkbExpbmU9TDExJmRkbFNoaWZ0PUQmdHh0RnJvbT0yMDI2JTJGMDklMkYwMSZ0eHRUbz0yMDI2JTJGMTAlMkYxMCZ0eHRJdGVtPUEtMTAwMiZidG5FeGNlbD1FeGNlbCU4Rm8lOTclQ0Q="
+   },
+   "response": {
+    "status": 200,
+    "headers": [
+     [
+      "Server",
+      "Microsoft-IIS/8.5"
+     ],
+     [
+      "Date",
+      "Sun, 11 Oct 2026 05:10:58 GMT"
+     ],
+     [
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+     ],
+     [
+      "Content-Length",
+      "2848"
+     ],
+     [
+      "Content-Disposition",
+      "attachment; filename=%E7%94%9F%E7%94%A3%E5%AE%9F%E7%B8%BE_01_L11_20261011.xlsx"
+     ],
+     [
+      "Cache-Control",
+      "private"
+     ],
+     [
+      "X-AspNet-Version",
+      "4.0.30319"
+     ],
+     [
+      "X-Powered-By",
+      "ASP.NET"
+     ]
+    ],
+    "body_b64": "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",
+    "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+   }
+  },
+  {
+   "id": "f0012",
+   "started_at": 1791695459.2992432,
+   "page_ref": null,
+   "resource_type": null,
+   "request": {
+    "method": "GET",
+    "url": "http://127.0.0.1.nip.io:60914/News.aspx",
+    "headers": [
+     [
+      "Accept",
+      "*/*"
+     ],
+     [
+      "Referer",
+      "http://127.0.0.1.nip.io:60914/Menu.aspx"
+     ],
+     [
+      "Accept-Language",
+      "ja"
+     ],
+     [
+      "UA-CPU",
+      "AMD64"
+     ],
+     [
+      "Accept-Encoding",
+      "gzip, deflate"
+     ],
+     [
+      "User-Agent",
+      "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729)"
+     ],
+     [
+      "Host",
+      "127.0.0.1.nip.io:60914"
+     ],
+     [
+      "Proxy-Connection",
+      "Keep-Alive"
+     ],
+     [
+      "Cookie",
+      "ASP.NET_SessionId=zn7ef0ikb3v3rbhic8wdqqf9; .ASPXAUTH=AC642EE24C0AD7E1B6AF326B7F7569C766C4D08D0F2AD69CEE99FB46E9C5AA32"
+     ]
+    ],
+    "body_b64": null
+   },
+   "response": {
+    "status": 200,
+    "headers": [
+     [
+      "Server",
+      "Microsoft-IIS/8.5"
+     ],
+     [
+      "Date",
+      "Sun, 11 Oct 2026 05:10:59 GMT"
+     ],
+     [
+      "Content-Type",
+      "text/html; charset=Shift_JIS"
+     ],
+     [
+      "Content-Length",
+      "1487"
+     ],
+     [
+      "Cache-Control",
+      "no-cache"
+     ],
+     [
+      "Pragma",
+      "no-cache"
+     ],
+     [
+      "Expires",
+      "-1"
+     ],
+     [
+      "X-AspNet-Version",
+      "4.0.30319"
+     ],
+     [
+      "X-Powered-By",
+      "ASP.NET"
+     ]
+    ],
+    "body_b64": "PCFET0NUWVBFIGh0bWwgUFVCTElDICItLy9XM0MvL0RURCBYSFRNTCAxLjAgVHJhbnNpdGlvbmFsLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL1RSL3hodG1sMS9EVEQveGh0bWwxLXRyYW5zaXRpb25hbC5kdGQiPg0KPGh0bWwgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGh0bWwiPg0KPGhlYWQ+PG1ldGEgaHR0cC1lcXVpdj0iQ29udGVudC1UeXBlIiBjb250ZW50PSJ0ZXh0L2h0bWw7IGNoYXJzZXQ9U2hpZnRfSklTIiAvPjx0aXRsZT6Qto5ZiseXnYNWg1iDZYOAIC0ggqiSbYLngrk8L3RpdGxlPjxsaW5rIGhyZWY9Ii9jc3Mvc2l0ZS5jc3MiIHJlbD0ic3R5bGVzaGVldCIgdHlwZT0idGV4dC9jc3MiIC8+PGxpbmsgcmVsPSJzaG9ydGN1dCBpY29uIiBocmVmPSIvZmF2aWNvbi5pY28iIC8+PC9oZWFkPg0KPGJvZHk+DQo8ZGl2IGlkPSJoZWFkZXIiPjxzcGFuIGNsYXNzPSJ1c2VyIj6TY5KGIJG+mFkggrOC8Twvc3Bhbj48aW1nIHNyYz0iL2ltZy9sb2dvLmdpZiIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiBhbHQ9IiIgLz48c3BhbiBjbGFzcz0ic3lzIj6Qto5ZiseXnYNWg1iDZYOAPC9zcGFuPjwvZGl2Pg0KPGRpdiBpZD0iY29udGVudCI+DQo8Zm9ybSBuYW1lPSJmb3JtMSIgbWV0aG9kPSJwb3N0IiBhY3Rpb249Ik5ld3MuYXNweCIgaWQ9ImZvcm0xIj4NCjxkaXY+DQo8aW5wdXQgdHlwZT0iaGlkZGVuIiBuYW1lPSJfX1ZJRVdTVEFURSIgaWQ9Il9fVklFV1NUQVRFIiB2YWx1ZT0iL3dFUER3VUtsZkRzWi9tUko4WFB3VnlYbS9POWVOSll6T0pDcUZ3MVJiMk9Kd3kzVnRaWnllMVhab0M4b0pBWWc4ckFxeXM4WTRqY1h5SllPeXd3OFR5VXl6UURtcUlXNzdzcTlPNzVmSUtITHhOc2FnbGNBczFVIiAvPg0KPC9kaXY+DQo8ZGl2Pg0KPGlucHV0IHR5cGU9ImhpZGRlbiIgbmFtZT0iX19WSUVXU1RBVEVHRU5FUkFUT1IiIGlkPSJfX1ZJRVdTVEFURUdFTkVSQVRPUiIgdmFsdWU9IjNBOUU0NEQwIiAvPg0KPC9kaXY+DQo8aDI+gqiSbYLngrk8L2gyPg0KPHRhYmxlIGlkPSJ0YmxOZXdzIiBjbGFzcz0iZ3JpZCIgYm9yZGVyPSIxIiBjZWxsc3BhY2luZz0iMCI+DQo8dHI+PHRoPpP6lXQ8L3RoPjx0aD6T4JdlPC90aD48L3RyPg0KPHRyPjx0ZD4yMDI2LzEwLzA1PC90ZD48dGQ+g1aDWINlg4CDgYOTg2WDaYOTg1iCzIKokm2C54K5gWkxMC8xNyAyMDowMCCCqYLnIDI0OjAwIILcgsWS4o5+grWC3IK3gWo8L3RkPjwvdHI+DQo8dHI+PHRkPjIwMjYvMDkvMjg8L3RkPjx0ZD6R5pPxjUiP6iCTaJGVg4mDQ4OTgsyVaZTUgvCSx4nBgrWC3IK1gr2BQjwvdGQ+PC90cj4NCjx0cj48dGQ+MjAyNi8wOS8xNTwvdGQ+PHRkPoNwg1iDj4Fbg2iCzSA5MCCT+oKygsaCyZXPjViCtYLEgq2CvoKzgqKBQjwvdGQ+PC90cj4NCjwvdGFibGU+DQo8cD48aW5wdXQgdHlwZT0iYnV0dG9uIiB2YWx1ZT0ilcKCtoLpIiBvbmNsaWNrPSJ3aW5kb3cuY2xvc2UoKTsiIC8+PC9wPg0KPC9mb3JtPg0KPC9kaXY+DQo8L2JvZHk+DQo8L2h0bWw+DQo=",
+    "mime_type": "text/html"
+   }
+  }
+ ]
+}

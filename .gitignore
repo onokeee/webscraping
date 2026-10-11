@@ -9,3 +9,11 @@ venv/
 *.mitm
 *.har.bak
 /recordings/
+
+# ローカル環境
+.claude/
+/reqrec_work/
+
+# 記録用ブラウザの事前ビルド（python -m reqrec.iehost build）
+reqrec/iehost/RecBrowser.exe
+reqrec/iehost/RecBrowser.exe.sha256

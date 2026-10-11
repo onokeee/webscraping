@@ -39,6 +39,7 @@ include = ["reqrec*"]
 
 [tool.setuptools.package-data]
 "reqrec.webapp" = ["templates/*.html", "static/*"]
+"reqrec.iehost" = ["*.cs", "RecBrowser.exe", "RecBrowser.exe.sha256"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

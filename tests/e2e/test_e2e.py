@@ -213,7 +213,7 @@ def test_generated_script_with_embedded_password(captured: Captured, tmp_path: P
 
 
 def test_redacted_script_fails_loudly_without_the_secret(captured: Captured, tmp_path: Path) -> None:
-    """Without REQREC_PASSWORD the login is refused (403) and the script must not pretend to work."""
+    """Without REQREC_PASSWORD the script stops before sending anything, naming the variable."""
     _plan, source = _plan_and_generate(captured.recording, PlanOptions())
     script = _write_script(tmp_path, source)
 
@@ -221,12 +221,11 @@ def test_redacted_script_fails_loudly_without_the_secret(captured: Captured, tmp
     env = {k: v for k, v in os.environ.items() if k != "REQREC_PASSWORD"}
     proc = _run_script(script, env)
     assert proc.returncode != 0, _dump(proc, source)
-    assert proc.stderr.strip(), "no error message on stderr"
-    assert "403" in proc.stderr or "Forbidden" in proc.stderr, proc.stderr
+    assert "REQREC_PASSWORD" in proc.stderr and "設定されていません" in proc.stderr, proc.stderr
+    assert "Traceback" not in proc.stderr
     assert "id,name" not in proc.stdout
-    # it stopped right after the rejected login
-    posts = site_b.requests_for("POST", "/login")
-    assert len(posts) == 1 and posts[0]["form"]["password"] == ""
+    # no request at all: an empty password is never sent
+    assert site_b.requests_for("POST", "/login") == []
     assert site_b.requests_for("GET", "/dashboard") == []
     assert site_b.requests_for(route="/api/items") == []
 
