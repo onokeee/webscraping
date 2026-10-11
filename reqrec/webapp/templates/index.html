@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>reqrec — HTTP 記録からスクレイピングスクリプトを自動生成</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f5fbf'/%3E%3Ccircle cx='16' cy='16' r='7' fill='%23fff'/%3E%3Ccircle cx='16' cy='16' r='3.5' fill='%23c0392b'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v={{ version }}">
+</head>
+<body data-token="{{ token }}"
+      data-is-windows="{{ 'true' if is_windows else 'false' }}"
+      data-gui-address="{{ gui_address }}"
+      data-mitm-available="{{ 'true' if mitmproxy_available else 'false' }}"
+      data-workdir="{{ workdir }}">
+
+<header class="topbar">
+  <div class="topbar-row">
+    <div class="brand">
+      <span class="brand-name">reqrec</span>
+      <span class="brand-tagline">ブラウザ操作の HTTP 通信を記録して、Python のスクレイピングスクリプトを自動生成します</span>
+    </div>
+    <div class="status-bar" id="status-bar" role="status" aria-live="polite">
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-text">準備完了。まず「1 記録」か「2 読み込み」から始めてください。</span>
+    </div>
+  </div>
+  <nav class="steps-nav" id="nav" aria-label="作業の流れ">
+    <button type="button" class="nav-step active" data-panel="record"><span class="nav-num">1</span><span class="nav-label">記録</span><span class="nav-badge" id="badge-record" hidden></span></button>
+    <span class="nav-arrow" aria-hidden="true">→</span>
+    <button type="button" class="nav-step" data-panel="load"><span class="nav-num">2</span><span class="nav-label">読み込み</span><span class="nav-badge" id="badge-load" hidden></span></button>
+    <span class="nav-arrow" aria-hidden="true">→</span>
+    <button type="button" class="nav-step" data-panel="steps"><span class="nav-num">3</span><span class="nav-label">ステップ</span><span class="nav-badge" id="badge-steps" hidden></span></button>
+    <span class="nav-arrow" aria-hidden="true">→</span>
+    <button type="button" class="nav-step" data-panel="code"><span class="nav-num">4</span><span class="nav-label">コード</span><span class="nav-badge" id="badge-code" hidden></span></button>
+    <span class="nav-arrow" aria-hidden="true">→</span>
+    <button type="button" class="nav-step" data-panel="run"><span class="nav-num">5</span><span class="nav-label">実行</span><span class="nav-badge" id="badge-run" hidden></span></button>
+  </nav>
+</header>
+
+<main class="content">
+
+<!-- ===================================================== 1 記録 -->
+<section id="panel-record" class="panel active" aria-labelledby="h-record">
+  <div class="panel-head">
+    <h1 id="h-record">1. ブラウザの通信を記録する</h1>
+    <p class="lead">このツールが用意するプロキシ (中継サーバー) をブラウザに設定し、普段どおりにサイトを操作すると、やり取りされた HTTP 通信がすべて記録されます。別タブで開いた画面も同じプロキシを通るので、そのまま記録されます。<br>
+    すでに HAR ファイル (ブラウザの開発者ツールで保存した通信ログ) がある場合は、この手順を飛ばして「<a href="#" data-goto="load">2 読み込み</a>」へ進んでください。</p>
+  </div>
+
+  {% if not mitmproxy_available %}
+  <div class="notice warn">
+    <strong>mitmproxy が見つかりません。</strong> 記録機能を使うには、コマンドプロンプト (ターミナル) で
+    <code>pip install "reqrec[record]"</code> を実行し、GUI を再起動してください。HAR ファイルの読み込みはそのまま使えます。
+  </div>
+  {% endif %}
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>記録の設定</h2>
+      <div class="form-grid">
+        <label for="rec-port">プロキシのポート番号</label>
+        <div><input id="rec-port" type="number" min="1" max="65535" value="8080" class="w-s"> <span class="hint">通常は 8080 のままで構いません</span></div>
+
+        <label for="rec-hosts">記録するサイト (ホスト名)</label>
+        <div><input id="rec-hosts" type="text" placeholder="例: example.co.jp, api.example.co.jp (空欄 = すべて記録)" class="w-full">
+          <div class="hint">カンマ区切りで複数指定できます。サブドメインも含めて記録されます。空欄なら開いたサイトをすべて記録します。</div></div>
+
+        <label for="rec-listen">待ち受けアドレス</label>
+        <div><input id="rec-listen" type="text" value="127.0.0.1" class="w-m"> <span class="hint">この PC のブラウザだけ使う場合は 127.0.0.1 のまま</span></div>
+
+        <label>追加モード</label>
+        <div><label class="check"><input id="rec-append" type="checkbox"><span>停止したとき、すでに読み込んである記録に<strong>追加して結合</strong>する</span></label></div>
+
+        <label class="win-only" hidden>Windows</label>
+        <div class="win-only" hidden>
+          <label class="check"><input id="rec-sysproxy" type="checkbox"><span><strong>システムプロキシを自動で設定する</strong>（Edge の IE モード / Windows 全体に適用。停止時に元の設定へ戻します）</span></label>
+        </div>
+      </div>
+      <div class="actions">
+        <button type="button" id="btn-rec-start" class="btn primary">● 記録開始</button>
+        <button type="button" id="btn-rec-stop" class="btn danger" disabled>■ 記録停止して読み込む</button>
+      </div>
+      <p class="hint">※ この GUI 自身への通信 (<code id="self-address">{{ gui_address }}</code>) は記録から自動的に除外されます。</p>
+    </div>
+
+    <div class="card">
+      <h2>記録の状態</h2>
+      <div class="rec-status">
+        <div class="rec-indicator" id="rec-indicator"><span class="rec-light"></span><span id="rec-state-text">停止中</span></div>
+        <div class="rec-count"><span class="rec-count-num" id="rec-flow-count">0</span><span class="rec-count-label">件のリクエストを記録</span></div>
+      </div>
+      <dl class="kv">
+        <dt>プロキシのアドレス</dt><dd id="rec-proxy-address">—</dd>
+        <dt>出力ファイル</dt><dd id="rec-out">—</dd>
+      </dl>
+      <div id="rec-error" class="notice error" hidden></div>
+      <details id="rec-log-details">
+        <summary>プロキシのログを表示</summary>
+        <pre class="console small" id="rec-log"></pre>
+      </details>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>ブラウザ側の手順</h2>
+    <ol class="howto">
+      <li><strong>プロキシを設定する</strong> — ブラウザ (または Windows) の HTTP / HTTPS プロキシを <code id="howto-proxy">127.0.0.1:8080</code> にします。
+        <ul>
+          <li>Chrome / Edge を専用プロファイルで起動する例: <code id="howto-chrome">chrome --proxy-server="127.0.0.1:8080" --user-data-dir=%TEMP%\reqrec-profile</code></li>
+          <li><strong>Edge の IE モード</strong>は Windows の「インターネット オプション」(コントロール パネル → ネットワークとインターネット → インターネット オプション → 接続 → LAN の設定) のプロキシ設定を使います。Windows ではこの画面の「システムプロキシを自動で設定する」にチェックを入れると自動で設定・復元します。</li>
+        </ul>
+      </li>
+      <li><strong>CA 証明書を一度だけ登録する</strong> — HTTPS サイトを記録するために必要です。記録開始後、プロキシ経由で <code>http://mitm.it</code> を開いて自分の OS 用の証明書をダウンロードするか、<code>~/.mitmproxy/mitmproxy-ca-cert.pem</code> (Windows なら <code>%USERPROFILE%\.mitmproxy\mitmproxy-ca-cert.cer</code>) を「信頼されたルート証明機関」に登録します。<span class="win-only" hidden>Windows では下の「CA 証明書をインストール」ボタンで登録できます。</span></li>
+      <li><strong>記録したい操作を行う</strong> — ログイン → 一覧を開く → 詳細を見る、のように取得したい結果まで普段どおりに操作します。レスポンスを受け取るたびに自動保存されます。</li>
+      <li><strong>[記録停止して読み込む]</strong> を押すと、記録が読み込まれて「3 ステップ」へ進みます。</li>
+    </ol>
+    <details>
+      <summary>コンソールと同じ手順書を表示</summary>
+      <pre class="console small" id="rec-instructions">(記録を開始すると表示されます)</pre>
+    </details>
+  </div>
+
+  <div class="card win-only" hidden>
+    <h2>Windows の設定 (Edge IE モード向け)</h2>
+    <dl class="kv">
+      <dt>システムプロキシ</dt><dd id="win-proxy-status">確認中…</dd>
+      <dt>mitmproxy の CA 証明書</dt><dd id="win-cert-status">確認中…</dd>
+    </dl>
+    <div class="actions">
+      <button type="button" id="btn-win-cert" class="btn">CA 証明書をインストール</button>
+      <button type="button" id="btn-win-proxy-restore" class="btn">プロキシ設定を元に戻す</button>
+      <button type="button" id="btn-win-refresh" class="btn ghost">状態を更新</button>
+    </div>
+    <pre class="console small" id="win-output" hidden></pre>
+  </div>
+</section>
+
+<!-- ===================================================== 2 読み込み -->
+<section id="panel-load" class="panel" aria-labelledby="h-load">
+  <div class="panel-head">
+    <h1 id="h-load">2. 記録ファイルを読み込む</h1>
+    <p class="lead">「1 記録」で保存したファイルのほか、ブラウザの開発者ツール (F12 → ネットワーク → 「すべて HAR として保存」) で保存した <strong>.har</strong>、mitmproxy の <strong>.mitm</strong> も読み込めます。<br>
+    <strong>別タブで開いた画面</strong>を HAR で記録した場合はタブごとに HAR を保存し、複数ファイルをまとめて選ぶか「追加して結合」で読み込むと 1 つの流れとして扱えます。</p>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>ファイルを選んで読み込む</h2>
+      <div class="dropzone" id="dropzone">
+        <input id="file-input" type="file" multiple accept=".har,.json,.mitm,.flows,.flow">
+        <p>ここにファイルをドラッグ＆ドロップするか、クリックして選択 (.har / .json / .mitm、複数可)</p>
+        <p class="hint" id="file-chosen">ファイルが選ばれていません</p>
+      </div>
+      <label class="check"><input id="append-toggle" type="checkbox"><span><strong>追加して結合</strong>する (読み込み済みの記録を置き換えず、時刻順に結合します)</span></label>
+      <div class="actions">
+        <button type="button" id="btn-upload" class="btn primary" disabled>読み込む</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>現在読み込まれている記録</h2>
+      <dl class="kv">
+        <dt>ファイル</dt><dd id="cur-sources">(なし)</dd>
+        <dt>リクエスト数</dt><dd id="cur-flows">0</dd>
+        <dt>ホスト</dt><dd id="cur-hosts">—</dd>
+      </dl>
+      <div class="actions">
+        <button type="button" id="btn-goto-steps" class="btn primary" disabled>3 ステップへ進む →</button>
+        <button type="button" id="btn-clear" class="btn ghost" disabled>記録をクリア</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>作業フォルダ内のファイルから開く</h2>
+    <p class="hint">作業フォルダ: <code>{{ workdir }}</code> — <code>recordings/</code> (この GUI で記録したもの) と <code>uploads/</code> (読み込んだファイル)</p>
+    <div class="table-wrap short">
+      <table class="data" id="files-table">
+        <thead><tr><th class="col-check"></th><th>ファイル名</th><th>フォルダ</th><th class="num">リクエスト数</th><th class="num">サイズ</th><th>更新日時</th></tr></thead>
+        <tbody><tr><td colspan="6" class="empty">読み込み中…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="actions">
+      <button type="button" id="btn-open-selected" class="btn primary" disabled>選択したファイルを開く</button>
+      <button type="button" id="btn-refresh-files" class="btn ghost">一覧を更新</button>
+      <span class="hint">複数選ぶと結合して開きます。「追加して結合」にチェックがあれば現在の記録にも追加します。</span>
+    </div>
+  </div>
+</section>
+
+<!-- ===================================================== 3 ステップ -->
+<section id="panel-steps" class="panel" aria-labelledby="h-steps">
+  <div class="panel-head">
+    <h1 id="h-steps">3. スクリプトにするステップを選ぶ</h1>
+    <p class="lead">記録したリクエストを自動で解析し、画像や解析サービスなどの不要な通信を除外して「ステップ」にまとめます。表のチェックを外す/付けると採用・除外を手動で変えられます。「結果」の列で<strong>最終的に出力したい画面 (データ) のリクエスト</strong>を選べます。行をクリックすると内容を確認できます。</p>
+  </div>
+
+  <div id="steps-empty" class="notice info">記録が読み込まれていません。「<a href="#" data-goto="record">1 記録</a>」または「<a href="#" data-goto="load">2 読み込み</a>」で記録を読み込んでください。</div>
+
+  <div id="steps-body" hidden>
+  <div class="grid-2 steps-top">
+    <div class="card">
+      <h2>フィルタ設定 <span class="hint">(変更すると自動で再計算します)</span></h2>
+      <div class="opts">
+        <label class="check"><input type="checkbox" class="opt" data-opt="keep_static"><span>静的ファイル (画像 / CSS / JS / フォント) も残す</span></label>
+        <label class="check"><input type="checkbox" class="opt" data-opt="keep_trackers"><span>トラッカー / 解析サービスへの通信も残す</span></label>
+        <label class="check"><input type="checkbox" class="opt" data-opt="keep_all"><span>すべて残す (自動のノイズ除外を無効にする)</span></label>
+        <label class="check"><input type="checkbox" class="opt" data-opt="collapse_redirects" checked><span>リダイレクトを 1 つのステップに統合する</span></label>
+        <label class="check"><input type="checkbox" class="opt" data-opt="detect_loops" checked><span>ループ (ページ送りなど) を検出してまとめる</span></label>
+        <label class="check"><input type="checkbox" class="opt" data-opt="redact_secrets" checked><span>パスワードなどの秘密情報を環境変数から読む (スクリプトに書き込まない)</span></label>
+        <label class="check"><input type="checkbox" class="opt" data-opt="detect_auth" checked><span>HTTP 認証 (Windows 統合認証 NTLM / Basic / Digest) のやり取りを検出して統合する</span></label>
+        <label class="check"><input type="checkbox" class="gopt" data-gopt="legacy_tls"><span>古い TLS / 暗号しか使えないサーバー (IE モードで使っている社内サーバーなど) 向けの接続設定を生成コードに入れる</span></label>
+      </div>
+      <div class="form-grid compact">
+        <label for="opt-include-hosts">このホストだけ採用</label>
+        <div><input id="opt-include-hosts" type="text" class="opt-text w-full" data-opt="include_hosts" placeholder="例: example.co.jp (空欄 = 制限なし)"></div>
+        <label for="opt-exclude-hosts">このホストは除外</label>
+        <div><input id="opt-exclude-hosts" type="text" class="opt-text w-full" data-opt="exclude_hosts" placeholder="例: cdn.example.com, fonts.googleapis.com"></div>
+        <label for="opt-min-len">依存検出する値の最小文字数</label>
+        <div><input id="opt-min-len" type="number" min="1" value="4" class="opt-num w-s" data-opt="min_value_length"></div>
+        <label for="opt-max-steps">ステップ数の上限</label>
+        <div><input id="opt-max-steps" type="number" min="1" class="opt-num w-s" data-opt="max_steps" placeholder="なし"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>解析結果</h2>
+      <div class="stats">
+        <div class="stat"><span class="stat-num" id="sum-steps">0</span><span class="stat-label">ステップ</span></div>
+        <div class="stat"><span class="stat-num" id="sum-kept">0</span><span class="stat-label">採用リクエスト</span></div>
+        <div class="stat"><span class="stat-num" id="sum-dropped">0</span><span class="stat-label">除外</span></div>
+        <div class="stat"><span class="stat-num" id="sum-vars">0</span><span class="stat-label">自動抽出する値</span></div>
+      </div>
+      <dl class="kv">
+        <dt>結果にするステップ</dt><dd id="sum-final">最後のステップ (既定)　<button type="button" id="btn-final-clear" class="btn tiny ghost" hidden>指定を解除</button></dd>
+        <dt>HTTP 認証</dt><dd id="sum-auth">検出されませんでした</dd>
+        <dt>定数 / 秘密情報</dt><dd id="sum-constants">なし</dd>
+        <dt>ループ</dt><dd id="sum-loops">なし</dd>
+        <dt>自動除外</dt><dd id="sum-self">—</dd>
+      </dl>
+      <div id="sum-warnings-wrap" hidden>
+        <h3>警告 <span class="hint">(生成されるスクリプトが期待どおり動かない可能性がある点)</span></h3>
+        <ul class="warnings" id="sum-warnings"></ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="table-toolbar">
+      <h2>リクエスト一覧 <span class="hint" id="table-count"></span></h2>
+      <div class="toolbar-right">
+        <input id="table-filter" type="search" placeholder="URL / ホスト / メソッドで絞り込み" class="w-l">
+        <label class="check"><input id="show-dropped" type="checkbox" checked><span>除外された行も表示</span></label>
+        <button type="button" id="btn-replan" class="btn ghost">再計算</button>
+        <button type="button" id="btn-goto-code" class="btn primary">4 コードへ進む →</button>
+      </div>
+    </div>
+    <p class="hint">☑ = スクリプトに採用　/　◉ 結果 = スクリプトの最後に出力するデータとして使うリクエスト　/　灰色の行 = 除外 (理由を「判定」列に表示)　/　行をクリック = リクエストとレスポンスの内容を表示</p>
+    <div class="table-wrap">
+      <table class="data flows" id="flow-table">
+        <thead>
+          <tr>
+            <th class="col-check" title="チェック = スクリプトに採用">採用</th>
+            <th class="col-radio" title="最終結果として出力するリクエスト">結果</th>
+            <th class="col-step">ステップ</th>
+            <th class="col-method">メソッド</th>
+            <th class="col-status">ステータス</th>
+            <th class="col-type">種類</th>
+            <th class="col-url">URL</th>
+            <th class="col-ref">参照元 (Referer)</th>
+            <th class="col-reason">判定</th>
+          </tr>
+        </thead>
+        <tbody id="flow-tbody"><tr><td colspan="9" class="empty">解析中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  </div>
+</section>
+
+<!-- ===================================================== 4 コード -->
+<section id="panel-code" class="panel" aria-labelledby="h-code">
+  <div class="panel-head">
+    <h1 id="h-code">4. スクリプトを生成する</h1>
+    <p class="lead">選んだステップから、<code>requests</code> と <code>BeautifulSoup</code> だけで動く Python スクリプトを生成します。生成後に保存すると「5 実行」から実行でき、ダウンロードして別の PC で動かすこともできます (必要なもの: Python 3.8 以上と <code>pip install requests beautifulsoup4</code>)。</p>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>生成オプション</h2>
+      <div class="form-grid compact">
+        <label for="gopt-parser">HTML パーサー</label>
+        <div><select id="gopt-parser" class="gopt" data-gopt="html_parser"><option value="html.parser" selected>html.parser (標準・追加インストール不要)</option><option value="lxml">lxml (高速・pip install lxml が必要)</option></select></div>
+        <label for="gopt-delay">ステップ間の待ち時間 (秒)</label>
+        <div><input id="gopt-delay" type="number" min="0" step="0.1" value="0" class="gopt w-s" data-gopt="delay"> <span class="hint">サーバーに負荷をかけないための間隔</span></div>
+        <label for="gopt-timeout">タイムアウト (秒)</label>
+        <div><input id="gopt-timeout" type="number" min="1" step="1" value="30" class="gopt w-s" data-gopt="timeout"></div>
+      </div>
+      <div class="opts">
+        <label class="check"><input type="checkbox" class="gopt" data-gopt="comments" checked><span>日本語の説明コメントを入れる</span></label>
+        <label class="check"><input type="checkbox" class="gopt" data-gopt="strict_status"><span>記録時と違うステータスコードが返ったらエラーにする (厳格モード)</span></label>
+      </div>
+      <div class="actions">
+        <button type="button" id="btn-generate" class="btn primary">⚙ 生成</button>
+      </div>
+      <div id="gen-summary" class="summary-text" hidden></div>
+      <div id="gen-warnings-wrap" hidden>
+        <h3>警告</h3>
+        <ul class="warnings" id="gen-warnings"></ul>
+      </div>
+      <div id="gen-secrets-wrap" hidden>
+        <h3>実行時に必要な環境変数</h3>
+        <p class="hint">パスワードなどはスクリプトに書き込まれません。「5 実行」で入力するか、実行前に環境変数として設定してください。</p>
+        <ul class="env-list" id="gen-secrets"></ul>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>保存</h2>
+      <div class="form-grid compact">
+        <label for="script-name">ファイル名</label>
+        <div><div class="input-suffix"><input id="script-name" type="text" placeholder="scrape_example" class="w-m"><span>.py</span></div>
+          <div class="hint">保存先: <code>{{ workdir }}/scripts/</code></div></div>
+      </div>
+      <div class="actions">
+        <button type="button" id="btn-save" class="btn primary" disabled>保存</button>
+        <a id="btn-download" class="btn disabled" href="#" download aria-disabled="true">ダウンロード</a>
+        <button type="button" id="btn-goto-run" class="btn ghost" disabled>5 実行へ進む →</button>
+      </div>
+      <p class="hint" id="save-result"></p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>生成されたコード <span class="hint" id="code-lines"></span></h2>
+    <pre class="code" id="code-preview"><span class="placeholder">(「生成」を押すとここにスクリプトが表示されます)</span></pre>
+  </div>
+</section>
+
+<!-- ===================================================== 5 実行 -->
+<section id="panel-run" class="panel" aria-labelledby="h-run">
+  <div class="panel-head">
+    <h1 id="h-run">5. スクリプトを実行する</h1>
+    <p class="lead">保存したスクリプトをこの PC の Python で実行し、出力をここに表示します。パスワードなどの秘密情報は入力欄から<strong>実行するプロセスにだけ</strong>渡され、ファイルには保存されません。</p>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>実行するスクリプト</h2>
+      <div class="form-grid compact">
+        <label for="run-script">スクリプト</label>
+        <div><select id="run-script" class="w-full"></select> <button type="button" id="btn-refresh-scripts" class="btn tiny ghost">一覧を更新</button></div>
+      </div>
+      <h3>環境変数 (秘密情報)</h3>
+      <div id="env-inputs" class="form-grid compact"><p class="hint">生成したスクリプトに秘密情報がなければ入力は不要です。</p></div>
+      <div class="actions">
+        <button type="button" id="btn-run" class="btn primary">▶ 実行</button>
+        <button type="button" id="btn-run-stop" class="btn danger" disabled>■ 停止</button>
+        <span id="run-state" class="run-state">待機中</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>結果を保存</h2>
+      <p class="hint">最後に実行したときの標準出力 (スクリプトが print したもの) をファイルに保存します。保存先: <code>{{ workdir }}/outputs/</code></p>
+      <div class="form-grid compact">
+        <label for="output-name">ファイル名</label>
+        <div><input id="output-name" type="text" placeholder="output.txt" class="w-m"></div>
+      </div>
+      <div class="actions">
+        <button type="button" id="btn-save-output" class="btn" disabled>結果を保存</button>
+      </div>
+      <p class="hint" id="save-output-result"></p>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>標準出力</h2>
+      <pre class="console" id="run-stdout"></pre>
+    </div>
+    <div class="card">
+      <h2>標準エラー (エラーメッセージ)</h2>
+      <pre class="console stderr" id="run-stderr"></pre>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<!-- ===================================================== 詳細ドロワー -->
+<div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+<aside id="drawer" class="drawer" hidden aria-label="リクエストの詳細">
+  <div class="drawer-head">
+    <div>
+      <div class="drawer-title"><span class="method" id="dr-method"></span> <span id="dr-status" class="status-pill"></span> <span id="dr-flow-id" class="hint"></span></div>
+      <div class="drawer-url" id="dr-url"></div>
+      <div class="hint" id="dr-meta"></div>
+    </div>
+    <button type="button" id="drawer-close" class="btn ghost" aria-label="閉じる">✕ 閉じる</button>
+  </div>
+  <div class="tabs" role="tablist">
+    <button type="button" class="tab active" data-tab="req" role="tab">リクエスト</button>
+    <button type="button" class="tab" data-tab="resp" role="tab">レスポンス</button>
+  </div>
+  <div class="tab-body active" id="tab-req">
+    <h3>クエリパラメータ</h3>
+    <table class="data kv-table" id="dr-req-query"><tbody></tbody></table>
+    <h3>ヘッダー</h3>
+    <table class="data kv-table" id="dr-req-headers"><tbody></tbody></table>
+    <h3>本文 <span class="hint" id="dr-req-body-info"></span></h3>
+    <table class="data kv-table" id="dr-req-form" hidden><tbody></tbody></table>
+    <pre class="code body" id="dr-req-body"></pre>
+  </div>
+  <div class="tab-body" id="tab-resp">
+    <h3>ヘッダー</h3>
+    <table class="data kv-table" id="dr-resp-headers"><tbody></tbody></table>
+    <h3>本文 <span class="hint" id="dr-resp-body-info"></span></h3>
+    <pre class="code body" id="dr-resp-body"></pre>
+  </div>
+</aside>
+
+<footer class="footer">reqrec {{ version }} — 作業フォルダ: <code>{{ workdir }}</code></footer>
+
+<script src="{{ url_for('static', filename='app.js') }}?v={{ version }}"></script>
+</body>
+</html>
