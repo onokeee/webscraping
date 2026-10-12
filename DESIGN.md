@@ -1,5 +1,185 @@
 # reqrec — design & module contracts
 
+## Module layout (2026-10-12)
+
+The whole application is **one module, `reqrec.py`, in the repository root** (no package folder,
+no data files).  The repository holds only `reqrec.py`, `pyproject.toml`, `README.md`, `DESIGN.md`,
+`.gitignore` and `tests/`.  The layout was flattened twice on 2026-10-12: first the package with
+sub-folders (HEAD 65346c2 and earlier) became one flat folder `reqrec/` with 11 files, then
+(**2026-10-12 (2)**) those 11 files became `reqrec.py`.  The history sections below (§1–§13.10) were
+written for the oldest layout and keep its names; read them through the table below.  The overview,
+the current-state sections §13.11–§13.13 and README.md use the current names.
+
+`reqrec.py` from top to bottom: the module docstring, one import block, `__version__`, one `__all__`
+(grouped by section), `_register_script_module()`, then one section per file of the 11-file layout,
+each headed `# ===== former reqrec/<file>: … =====` (search for that heading) with the former
+docstring kept as comments below it.  A file that had itself been merged from several modules keeps
+them as sub-sections with the same kind of heading (`# ===== former reqrec/filters.py: …`).  Order:
+`core`, `importers`, `analysis`, `codegen`, `recorder`, `iehost`, `RECBROWSER_CS`, `gui`, `GUI_HTML`,
+`cli`, and the entry point (`main()` and `if __name__ == "__main__": raise SystemExit(main())`).
+
+| step | former file | became |
+|---|---|---|
+| 2026-10-12 (2) | `reqrec/__init__.py` | the top of `reqrec.py`, before the first section: `__version__` and `__all__` (now one list for every section), plus `_register_script_module()` (below) |
+| 2026-10-12 (2) | `reqrec/core.py` | section `core` (`former reqrec/core.py`; sub-sections `former reqrec/model.py`, `former reqrec/util.py`) |
+| 2026-10-12 (2) | `reqrec/importers.py` | section `importers` (sub-sections `former reqrec/importers/__init__.py`, `…/har.py`, `…/mitm.py`); logger still `reqrec.importers` |
+| 2026-10-12 (2) | `reqrec/analysis.py` | section `analysis` (sub-sections `former reqrec/filters.py`, `deps.py`, `loops.py`, `plan.py`); bs4 is now imported inside the three functions that parse HTML |
+| 2026-10-12 (2) | `reqrec/codegen.py` | section `codegen` |
+| 2026-10-12 (2) | `reqrec/recorder.py` | section `recorder` (sub-sections addon, run, manager); `addons` stays, `ADDON_PATH` is now `reqrec.py` itself |
+| 2026-10-12 (2) | `reqrec/iehost.py` | section `iehost`: the namespace class `iehost` (below) and the top-level classes `IEHostError` / `BrowserProcess`.  Its `main()` (`python -m reqrec.iehost build \| status`) became the CLI sub-command `reqrec browser build \| status` (`cmd_browser_build` / `cmd_browser_status` / `cmd_browser_usage` in the `cli` section) |
+| 2026-10-12 (2) | `reqrec/RecBrowser.cs` | constant `RECBROWSER_CS` (raw string, heading `former reqrec/RecBrowser.cs`, right after the `iehost` section), byte for byte.  It is written to a file only to compile it: `<workdir>/bin/RecBrowser.cs`, or a temporary file for `reqrec browser build` |
+| 2026-10-12 (2) | `reqrec/RecBrowser.exe` + `.sha256` (git-ignored output of `python -m reqrec.iehost build`) | `RecBrowser.exe` + `.sha256` next to `reqrec.py` (output of `reqrec browser build`; `iehost.SHIPPED_DIR`; git-ignored as `/RecBrowser.exe*`) |
+| 2026-10-12 (2) | `reqrec/gui.py` | section `gui` (sub-sections winsupport, webapp/launch, webapp/state, webapp/routes, webapp/__init__).  Flask import name still `reqrec.gui`, blueprint still `reqrec` (endpoint names unchanged) |
+| 2026-10-12 (2) | `reqrec/gui.html` | constant `GUI_HTML` (raw string, heading `former reqrec/gui.html`, right after the `gui` section), byte for byte except two lines: the Jinja comment at the top, and the AppLocker message, which now names `python -m reqrec browser build` instead of `python -m reqrec.iehost build`.  `create_app` gives it to Jinja from memory as the template `gui.html` (`DictLoader`; the `.html` name keeps autoescaping on), so the index route renders it with `render_template` and Jinja compiles it once per app, as it did the former file; the Flask app has no template / static folder |
+| 2026-10-12 (2) | `reqrec/cli.py` | section `cli` (now with the `browser` sub-command); its `main()` and `_exit_code_from_system_exit` are the last section, the entry point |
+| 2026-10-12 | `__init__.py`, `codegen.py`, `cli.py` | unchanged (`reqrec/__init__.py`, `reqrec/codegen.py`, `reqrec/cli.py`) |
+| 2026-10-12 | `model.py`, `util.py` | `reqrec/core.py` (two sections, in this order) |
+| 2026-10-12 | `importers/__init__.py`, `importers/har.py`, `importers/mitm.py` | `reqrec/importers.py` (one module `log`, logger `reqrec.importers`) |
+| 2026-10-12 | `filters.py`, `deps.py`, `loops.py`, `plan.py` | `reqrec/analysis.py` (in this order: the deps section needs `DROP_REQUEST_HEADERS` at import time) |
+| 2026-10-12 | `recorder/__init__.py`, `recorder/addon.py`, `recorder/run.py`, `recorder/manager.py` | `reqrec/recorder.py` (addon, run, manager).  `ADDON_PATH` became that file itself (was `recorder/addon.py`); the manager's `_GRACE_AFTER_TERMINATE` became `_MANAGER_GRACE_AFTER_TERMINATE` |
+| 2026-10-12 | `winsupport.py` | the first section of `reqrec/gui.py`, except `is_windows` / `NOT_WINDOWS_MESSAGE`, which moved to `reqrec/core.py` |
+| 2026-10-12 | `webapp/launch.py`, `webapp/state.py`, `webapp/routes.py`, `webapp/__init__.py` | `reqrec/gui.py` (after the winsupport section, in this order).  The Flask app's import name became `reqrec.gui` (was `reqrec.webapp`) |
+| 2026-10-12 | `webapp/templates/index.html`, `webapp/static/app.css`, `webapp/static/app.js` | `reqrec/gui.html` (the CSS and JS inlined in `<style>` / `<script>` inside Jinja `raw` blocks, so `/static/*` is no longer served) |
+| 2026-10-12 | `iehost/__init__.py`, `iehost/__main__.py` | `reqrec/iehost.py` (`main()`) |
+| 2026-10-12 | `iehost/RecBrowser.cs` (and its build output `RecBrowser.exe` + `.sha256`) | `reqrec/RecBrowser.cs` (build output `reqrec/RecBrowser.exe` + `.sha256`) |
+| 2026-10-12 | `examples/README.md`, `examples/example_scrape.py` (outside the package) | README.md 「同梱のサンプルで試す」, `tests/fixtures/example_scrape.py` |
+
+Each `reqrec/<x>.py` of the 11-file layout (except `__init__.py`) is the section `<x>` of `reqrec.py`, so a name from the
+history sections is found through its 2026-10-12 row and then the 2026-10-12 (2) row
+(`webapp/routes.py` → `reqrec/gui.py` → the `gui` section, sub-section `former reqrec/webapp/routes.py`).
+
+| former command | now |
+|---|---|
+| `reqrec ...` (console script `reqrec = "reqrec.cli:main"`) | `reqrec ...` (`reqrec = "reqrec:main"`; `pyproject.toml` has `py-modules = ["reqrec"]`) |
+| `python -m reqrec.cli ...` | `python -m reqrec ...` (or `python path/to/reqrec.py ...`) |
+| `python -m reqrec.iehost build \| status` | `reqrec browser build \| status` (`python -m reqrec browser build \| status`); plain `reqrec browser` prints the usage and exits 2, as `python -m reqrec.iehost` did |
+| `mitmdump -s reqrec/recorder/addon.py` (later `-s reqrec/recorder.py`) | `mitmdump -s reqrec.py` |
+| §13.9's PyInstaller example `pyinstaller … --collect-all reqrec … -m reqrec.cli` | `pyinstaller --onefile --name reqrec --collect-all mitmproxy reqrec.py` (still unverified) |
+
+Qualified names in the history sections map onto plain top-level names: `model.X` / `util.X` /
+`core.X`, `importers.X`, `filters.X` / `deps.X` / `loops.X` / `plan.X` / `analysis.X`, `codegen.X`,
+`recorder.X` (`recorder.run.X`, `recorder.manager.X`), `winsupport.X` / `launch.X` / `state.X` /
+`routes.X` / `gui.X` and `cli.X` are all `reqrec.X` now (`reqrec.webapp.run_gui` → `reqrec.run_gui`),
+except the renamed names below; `iehost.X` stays `iehost.X` (`reqrec.iehost.X`).
+
+**How the one file is used.**
+* `reqrec ...` and `python -m reqrec ...`; `python reqrec.py ...` works too (it runs as `__main__`,
+  and nothing in it starts `python -m reqrec` as a child process).
+* **Distribution**: copy `reqrec.py` into the folder of a portable Python (the folder of `python.exe`)
+  in which `requests`, `beautifulsoup4`, `flask` (and `mitmproxy` for recording) are installed:
+  Windows' Python puts that folder on `sys.path`, so `<folder>\python.exe -m reqrec gui` works from any
+  current directory, and the recorder starts mitmdump with the same interpreter
+  (`mitmdump_launcher`), so `Scripts\` need not be on PATH.  Or `pip install` it (`py-modules`; the
+  file lands in `site-packages`, or stays in the checkout with `pip install -e`).  A wheel cannot put
+  `RecBrowser.exe` next to a top-level module, so the prebuilt recording browser is made after
+  installation with `reqrec browser build`, wherever `reqrec.py` then is (README 「Windows での配布と exe 化」).
+* `mitmdump -s reqrec.py`: `ADDON_PATH` is reqrec.py itself and the recorder section keeps `addons`.
+  There are no internal imports any more, so the former import dance is gone.  mitmproxy's script
+  loader executes the file as `__mitmproxy_script__.reqrec` **without** putting it in `sys.modules`,
+  but `dataclasses` looks the defining module up there (the annotations are strings) and would fail;
+  `_register_script_module()` at the top therefore registers the module object (found with
+  `gc.get_referrers`, a few ms) under its own name, as a normal import does.  mitmproxy also
+  registers the script module **itself** as an addon (next to the objects in `addons`) and calls every
+  attribute named like one of its event hooks (`request`, `response`, `error`, `load`, `running`,
+  `done` ...), so no top-level name may be a hook name: Flask's `request` proxy is imported as
+  `flask_request` (as `request` it was skipped only because an unbound proxy happens to be falsy;
+  `tests/test_recorder.py::TestScriptMode` checks every name against mitmproxy's hooks).  Importing
+  is otherwise side-effect free.  bs4 is imported inside the three analysis functions that use it; Flask is
+  imported at the top (mitmdump has already imported Flask for its own onboarding app, so it costs
+  nothing there).  mitmproxy opens the port before it loads `-s` scripts and holds requests that
+  arrive meanwhile, so they are still recorded.  Measured on the development PC (7 runs, median,
+  bytecode cached; former `reqrec/recorder.py` → `reqrec.py`): start → listening 1.63 s → 1.66 s,
+  start → first proxied request recorded 1.72 s → 1.76 s; loading the addon inside mitmproxy
+  21–25 ms → 41–47 ms (importing bs4 eagerly would add about 150 ms).  Without a bytecode cache
+  every process compiles the whole file first (about 0.55 s; the first proxied response comes about
+  0.5 s later).  That happens only where `__pycache__` next to `reqrec.py` cannot be written (a
+  read-only distribution folder, `PYTHONDONTWRITEBYTECODE`): `pip install` writes the cache itself,
+  any start from a writable folder writes it, and for a read-only folder `python -m compileall
+  reqrec.py` is run once after copying (README 「ポータブル Python のフォルダに置く」).  mitmproxy's
+  script loader (`SourceFileLoader`) uses the same `__pycache__/reqrec.cpython-3XX.pyc` as an import.
+* The recording browser (§13.12): `iehost.ensure_built(workdir)` writes `RECBROWSER_CS` to
+  `<workdir>/bin/RecBrowser.cs` and compiles that; `reqrec browser build` compiles it from a
+  temporary file into `RecBrowser.exe` + `RecBrowser.exe.sha256` **next to reqrec.py**
+  (`iehost.SHIPPED_DIR`; git-ignored as `/RecBrowser.exe*`).  The build digest is SHA-256 of
+  `RECBROWSER_CS` (UTF-8) plus the build settings — for an unchanged source the same value the former
+  file gave, so existing work folders are not rebuilt.  A CRLF checkout (`core.autocrlf`) does not
+  change it: Python reads source files with universal newlines, so the constant always has LF.
+* **The embedded files** `GUI_HTML` and `RECBROWSER_CS` are raw strings (`r'''…'''`): the text is
+  written exactly as in a file (`\n`, `\\` reach the HTML / C# unchanged).  They must not contain
+  `'''` and must not end with a backslash; neither contains CR or NUL.  Edit them in place
+  (README 開発者向け 「埋め込みの HTML / C# を直す」).  A change to `RECBROWSER_CS` changes the build
+  digest, so every work folder rebuilds once and a prebuilt `RecBrowser.exe` stops matching until
+  `reqrec browser build` is run again.
+* **Costs of one file** (development PC): `import reqrec` always imports Flask, so the commands that
+  do not use the GUI start about 0.17 s slower than at HEAD 65346c2 (median of `--version`:
+  `python -m reqrec.cli` 0.81 s → `python -m reqrec` 0.98 s); the GUI starts faster than the former
+  `reqrec.gui`, and mitmdump has Flask loaded already.  Importing Flask lazily would mean creating
+  the blueprint `bp` and registering its 26 routes only inside `create_app`, so it was not done.
+  `GET /` costs what it did with the former file (about 17 ms with the Flask test client; the
+  template is compiled once, see `GUI_HTML` above).
+* **History**: `git log --follow reqrec.py` stops at the commit that created the file (it is far
+  larger than any former file, so git sees no rename).  `git blame -w -C -C reqrec.py` traces
+  lines across it to the former files and their commits (about 92 % of the lines, checked on a
+  scratch commit of this layout), and `git log -- reqrec/` lists the former files' history.
+
+**One namespace.** Every top-level name is bound exactly once (checked with an `ast` walk over the
+module: only the optional-import fallback `_mitm_ctx` / `_mitm_http` is bound in both branches of
+its `try` / `except ImportError`).  Where former modules clashed, the more widely used name was kept
+and the other got a section prefix:
+
+| former name | now |
+|---|---|
+| `importers.log` | `_importers_log` (logger name `reqrec.importers` unchanged; the recorder keeps `log`) |
+| `importers._BOUNDARY_RE` | `_IMPORTERS_BOUNDARY_RE` (analysis keeps `_BOUNDARY_RE`) |
+| `importers._b64decode_lenient` | `_importers_b64decode_lenient` (analysis keeps `_b64decode_lenient`) |
+| `recorder._FLOW_ID_RE`, `gui._FLOW_ID_RE`, `cli._FLOW_ID_RE` | `_RECORDER_FLOW_ID_RE`, `_GUI_FLOW_ID_RE`, `_CLI_FLOW_ID_RE` (analysis keeps `_FLOW_ID_RE`) |
+| `gui._SCHEME_RE` | `_GUI_SCHEME_RE` (analysis keeps `_SCHEME_RE`) |
+| `gui._to_int` | `_gui_to_int` (importers keeps `_to_int`) |
+| `cli.normalise_flow_id` (empty -> `None`) | `cli_normalise_flow_id` (analysis keeps `normalise_flow_id`, empty -> `""`) |
+| `codegen._VERSION` | `__version__` |
+| `cli`'s fallback `load_recordings` | removed (the importers' `load_recordings` always exists) |
+| `iehost.main` | `cmd_browser_build` / `cmd_browser_status` / `cmd_browser_usage` (CLI) |
+| `iehost.build_command`, `_wait`, `_winreg`, `_write_text`, `_GRACE_AFTER_TERMINATE` | unchanged inside the `iehost` namespace (they clash with recorder / gui / cli names) |
+| `iehost.SOURCE_PATH` | removed: the source is `RECBROWSER_CS`.  The `source` argument of `ensure_built` / `availability` / `shipped_exe` / `build_shipped` is now the C# **text** (default `RECBROWSER_CS`); the distribution folder is `iehost.SHIPPED_DIR` or the new `folder` argument (`is_available` takes `folder` instead of `source`); `iehost.SOURCE_NAME` / `iehost.source_path(workdir)` name the file written for csc; `availability()["source"]` is that path |
+| each module's `__all__` | one `__all__` at the top, grouped by section |
+
+**The `iehost` namespace.** Callers use the recording-browser functions qualified
+(`iehost.launch(...)`, `iehost.availability(...)`, `iehost.EMULATION_LEVELS`), and several of its
+names exist in other sections, so the section keeps its former module as a namespace:
+`class iehost` with static methods and constants, never instantiated.  Inside, the functions refer
+to each other (and to `is_windows`, `BUILD_PLATFORM`, `SHIPPED_DIR` ...) through `iehost.`, so
+replacing one attribute behaves exactly as replacing an attribute of the former module did: tests
+`monkeypatch` `iehost.csc_path` / `iehost.is_windows` / `iehost.BUILD_PLATFORM`, and
+`iehost.launch` / `iehost.availability` as the GUI routes see them (`routes_mod.iehost`).  This kept
+the tests simplest (their `iehost.X` calls did not change).  `IEHostError` and `BrowserProcess` are
+top-level classes, also reachable as `iehost.IEHostError` / `iehost.BrowserProcess`.
+
+**Monkeypatching** a top-level name now affects every section: e.g. `mitmproxy_available` patched
+for a GUI test is also what `run_record` sees, where the former modules each had their own binding.
+For the same reason a test must not `importlib.reload` the module (it would replace every class
+other tests hold); `tests/test_gui.py` imports a fresh copy of the file instead.
+
+`tests/` was consolidated earlier (one flat folder plus `tests/fixtures/`; each former test
+module is a `# ===== former tests/<x>.py` section); the test files import everything from `reqrec`
+(`import reqrec as cli`, `from reqrec import iehost` ...).  Test file names quoted in the history sections
+are those of the time each section was written; read them through this table.
+
+| former test files (under `tests/`) | now |
+|---|---|
+| `test_importers.py`, `test_merge.py` | `test_core.py` |
+| `test_filters.py`, `test_loops.py`, `test_deps.py`, `test_plan.py`, `test_overrides.py`, `test_auth.py`, `test_review3_analysis.py` | `test_analysis.py` |
+| `test_codegen.py`, `test_codegen_phase2.py`, `test_review3_codegen.py` | `test_codegen.py` |
+| `test_webapp.py`, `test_webapp_easy.py`, `test_webapp_iehost.py`, `test_winsupport.py` | `test_gui.py` |
+| `test_webapp_browser.py` | `test_gui_browser.py` (Playwright; `REQREC_CHROMIUM`) |
+| `test_integration.py`, `test_integration_legacy.py`, `e2e/test_e2e.py`, `e2e/test_server_capture.py`, `e2e/test_factory_replay.py` | `test_integration.py` |
+| `test_iehost_engine.py`, `test_iedriver.py`, `test_factory_site.py`, `e2e/test_gui_recording.py`, `e2e/test_factory_live.py` | `test_real_engine.py` (opt-in parts: `REQREC_IEHOST_TESTS=1`) |
+| `e2e/mock_adapter.py`, `e2e/server.py`, `e2e/capture.py` | `support.py` |
+| `iehost_fixtures/testsite.py`, `factory_site.py`, `factory_scenario.py`, `iedriver.py` | `ie_support.py` (`python -I tests/ie_support.py testsite\|factory-site\|iedriver ...`) |
+| `iehost_fixtures/IEDriver.cs` | `IEDriver.cs` |
+| `test_cli.py`, `test_recorder.py`, `test_iehost.py` | unchanged |
+
+## Overview
+
 `reqrec` records a website's HTTP traffic (via a mitmproxy-based recording proxy, a HAR file
 exported from browser DevTools, or a saved mitmproxy flow file) and generates a **standalone
 Python script** (`requests` + `BeautifulSoup`) that replays the same conversation — like a macro
@@ -15,14 +195,15 @@ The three stages are deliberately separated so each can be tested alone:
 
 | stage | input → output | module |
 |---|---|---|
-| import / record | HAR / .mitm / live proxy → `Recording` | `reqrec/importers/*`, `reqrec/recorder/*` |
-| analyse | `Recording` → `Plan` | `reqrec/filters.py`, `reqrec/deps.py`, `reqrec/loops.py`, `reqrec/plan.py` |
-| generate | `Plan` → Python source | `reqrec/codegen.py` |
-| UI | argparse CLI | `reqrec/cli.py` |
+| import / record | HAR / .mitm / live proxy → `Recording` | `importers`, `recorder` sections of `reqrec.py` |
+| analyse | `Recording` → `Plan` | `analysis` section (filters → deps → loops → plan sub-sections) |
+| generate | `Plan` → Python source | `codegen` section |
+| UI | argparse CLI; Flask GUI (§13.6, §13.11); recording browser (§13.12) | `cli`; `gui` + `GUI_HTML`; `iehost` + `RECBROWSER_CS` |
 
-All shared types live in **`reqrec/model.py`**; shared helpers in **`reqrec/util.py`**.  Both are
-finished and are the single source of truth — read them first. If you believe a field is missing,
-do **not** edit `model.py`; add a module-local workaround and report the request.
+All shared types live in the **`core` section** of `reqrec.py` (its former `model.py` sub-section);
+shared helpers in its former `util.py` sub-section.  Both are finished and are the single source of truth — read them first.
+If you believe a field is missing, do **not** edit the model; add a module-local workaround and
+report the request.
 
 ## 1. Recording layer (`model.py`)
 
@@ -583,7 +764,7 @@ HAR: DevTools 設定「ポップアップに対して DevTools を自動的に�
 Nobody edits `model.py`, `util.py`, `pyproject.toml` or another owner's files. No `git` commands.
 `tests/test_integration.py` and `tests/e2e/**` belong to the integrator.
 
-## 13.11 かんたんモード (easy mode)  (reqrec/webapp/, reqrec/webapp/launch.py)
+## 13.11 かんたんモード (easy mode)  (reqrec.py: gui section, GUI_HTML)
 
 Target users are factory-floor staff who must not have to know what a port, a proxy or a CA
 certificate is.  The GUI therefore opens in **easy mode** by default: one screen with
@@ -594,11 +775,11 @@ in the top bar (`body.easy-mode` hides the nav + panels via CSS; the choice is k
 client over the existing API plus the three endpoints below, and it keeps the advanced panels in
 sync (`Record.render`, `Load.applySummary`, `Steps.replan`, `Code.renderSecrets`, `Run`).
 
-**Flow (static/app.js, module `Easy`):**
+**Flow (the script in GUI_HTML, module `Easy`):**
 1. **start** — `POST /api/record/start {port: "auto", hosts: [], listen_host: "127.0.0.1",
    set_system_proxy: false, append: false, origin: "easy", browser: "iehost" (Windows with the recording browser) |
    "none" (other OSes), start_url: <address box>, https_passthrough: <iehost>, emulation: "keep"}`.
-   `"auto"` makes the server pick a free port with `state.find_free_port(listen_host,
+   `"auto"` makes the server pick a free port with `gui.find_free_port(listen_host,
    preferred=8080, avoid=(gui port,))`; the response carries `port`, `auto_port`, `browser_kind`,
    `browser` and `warnings`.  With `browser: "iehost"` the server waits for the proxy and opens the
    in-app recording browser itself (§13.12): no certificate, no system proxy, no Edge.
@@ -607,10 +788,10 @@ sync (`Record.render`, `Load.applySummary`, `Steps.replan`, `Code.renderSecrets`
    available="false"`) the easy screen does **not** change the system proxy or install the CA; it
    explains the reason and points to 詳細設定 → 記録方式 「自分でブラウザを設定する」.  A launch
    failure at run time (e.g. the exe blocked by AppLocker) is shown with guidance for the
-   administrator (`python -m reqrec.iehost build` + allow that folder) and kept in
+   administrator (`python -m reqrec browser build` + allow that folder) and kept in
    `/api/state` → `iehost.last_error` for the readiness list.
 3. **browser (other OSes)** — `POST /api/browser/open {url}` opens the default browser (Edge when
-   found: `launch.find_edge`) at the optional address (`launch.validate_url`: `http(s)://` only,
+   found: `gui.find_edge`) at the optional address (`gui.validate_url`: `http(s)://` only,
    bare host names and `host:port` get `http://`, other schemes such as `javascript:` are
    rejected); the user sets the proxy shown on screen by hand.  `{browser: "iehost"}` re-opens the
    recording browser instead (only for an iehost recording).
@@ -627,8 +808,8 @@ sync (`Record.render`, `Load.applySummary`, `Steps.replan`, `Code.renderSecrets`
    final_step_index, final_url, final_method, flows_total, warnings, secrets, auth, summary,
    code, sources}`.  A plan with no steps is a 400 with a plain-language explanation.
 6. **done** — file name / path / step list / warnings (common English warnings are shown in
-   Japanese server-side by `routes.warning_message` → `warning_details` / `note_details`), [ダウンロード], [保存先フォルダを開く] (`POST /api/folder/open
-   {folder: "scripts"|"outputs"|"recordings"|"uploads"|"workdir"}` → `launch.open_folder`:
+   Japanese server-side by `gui.warning_message` → `warning_details` / `note_details`), [ダウンロード], [保存先フォルダを開く] (`POST /api/folder/open
+   {folder: "scripts"|"outputs"|"recordings"|"uploads"|"workdir"}` → `gui.open_folder`:
    `os.startfile` / `open` / `xdg-open`; anything else is a 400), [試しに実行する] (env inputs
    for `secrets`, `Run.start` / `Run.stop`, output console, a plain-language hint for the common
    failures via `errorHint`, [結果をファイルに保存]), [もう一度記録する].
@@ -639,13 +820,13 @@ sync (`Record.render`, `Load.applySummary`, `Steps.replan`, `Code.renderSecrets`
 hook of `create_app`.  `/api/browser/open` only ever launches a URL that passed `validate_url`;
 `/api/folder/open` only opens the fixed work-folder subdirectories.
 
-**Tests:** `tests/test_webapp_easy.py` — page markup, `find_free_port`, `port: "auto"` with a
+**Tests:** `tests/test_gui.py` (its former `test_webapp_easy.py` section) — page markup, `find_free_port`, `port: "auto"` with a
 fake recorder, `/api/easy/build` on `login_flow_chrome.har` (file written, secrets reported,
 `last_script` updated, unsafe names rejected, token required), `/api/browser/open` and
-`/api/folder/open` with the launchers monkeypatched, and the `launch` helpers with injected
+`/api/folder/open` with the launchers monkeypatched, and the launch helpers (`find_edge`, `validate_url`, `open_url`, `open_folder`) with injected
 fakes (Edge discovery through paths / registry, URL validation, fallbacks).
 
-## 13.12 In-app IE-engine recording browser  (reqrec/iehost/, reqrec/webapp/)
+## 13.12 In-app IE-engine recording browser  (reqrec.py: iehost section, RECBROWSER_CS, gui section)
 
 **Why.** Factory PCs commonly use Edge IE mode for legacy intranet sites, have a PAC / auto-detect
 proxy configuration, and forbid installing certificates or changing Internet Options.  Edge IE mode
@@ -679,7 +860,7 @@ Options or Edge changes, and no certificate is needed because only plain `http:/
 * `INTERNET_OPTION_END_BROWSER_SESSION` + `INTERNET_SUPPRESS_COOKIE_PERSIST` at start-up: every
   recording starts from an empty session, so the login is always recorded.
 
-**`RecBrowser.cs`** (C# 5, compiled by `iehost.build_command`: `csc -nologo -target:winexe
+**`RECBROWSER_CS`** (the former `RecBrowser.cs`; C# 5, compiled by `iehost.build_command`: `csc -nologo -target:winexe
 -platform:x86 -r:System.Windows.Forms.dll -r:System.Drawing.dll` — always 32-bit, like IE mode's content process, so 32-bit in-process ActiveX controls load; the former rule was x86 only when only the 32-bit
 `Framework` compiler exists, i.e. on 32-bit Windows): command line `--proxy HOST:PORT [--bypass ""]
 [--url URL] [--title T] [--log PATH] [--https] [--selftest] [--seconds N]`.  Window title
@@ -694,12 +875,15 @@ codes: 0 normal close (X, 記録をおわる, WM_CLOSE), 2 bad arguments (e.g. n
 be recorded).  Log lines `HH:mm:ss.fff text` (UTF-8, no BOM, auto-flushed); one of the first lines
 is `proxy <server> -> ok|FAILED`.  No registry access.
 
-**`reqrec/iehost/__init__.py`** (importable everywhere; injectable `exists` / `run` / `popen` /
-`winreg`): `csc_path`, `availability(workdir) -> {available, reason, exe, built, source, csc,
-prebuilt}`, `exe_path(workdir) = <workdir>/bin/RecBrowser.exe`, `ensure_built` (rebuild when the
-exe is missing, the digest in `bin/RecBrowser.cs.sha256` differs (`_build_digest`: SHA-256 of the source **plus the build settings**, e.g. `platform=x86`, so changing build options alone rebuilds once), or `force`; a prebuilt exe next
-to the source is copied when there is no `csc.exe`; a **shipped** exe — built next to the source
-by `python -m reqrec.iehost build` with `RecBrowser.exe.sha256` matching the source — is run in
+**The `iehost` namespace** (section of reqrec.py, importable everywhere; `reqrec browser build|status`
+in the CLI; injectable `exists` / `run` / `popen` / `winreg`, and `source` (C# text, default
+`RECBROWSER_CS`) / `folder` (distribution folder, default `iehost.SHIPPED_DIR` = the folder of
+reqrec.py)): `iehost.csc_path`, `availability(workdir) -> {available, reason, exe, built, source, csc,
+prebuilt}` (`source` = `<workdir>/bin/RecBrowser.cs`), `exe_path(workdir) = <workdir>/bin/RecBrowser.exe`,
+`ensure_built` (writes `RECBROWSER_CS` to `<workdir>/bin/RecBrowser.cs` and compiles it when the
+exe is missing, the digest in `bin/RecBrowser.cs.sha256` differs (`_build_digest`: SHA-256 of the source text (UTF-8) **plus the build settings**, e.g. `platform=x86`, so changing build options alone rebuilds once), or `force`; a prebuilt exe in
+the distribution folder (`RecBrowser.exe` next to reqrec.py) is copied when there is no `csc.exe`; a **shipped** exe — built
+there by `reqrec browser build` (from a temporary copy of the source) with `RecBrowser.exe.sha256` matching the source — is run in
 place, so an AppLocker / SRP policy only has to allow the distribution folder), `launch(workdir,
 proxy, url, title, https_recorded) -> BrowserProcess` (log under
 `<workdir>/logs/recbrowser_<timestamp>.log`; job object `KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK`:
@@ -736,67 +920,69 @@ the recording browser it does **not** fall back to changing the system proxy / i
 it explains why and points to 詳細設定, where 記録方式, 最初に開くアドレス, 表示モード and the
 HTTPS pass-through switch are exposed.
 
-**Tests.** `tests/test_iehost.py` (pure logic with fakes), `tests/test_webapp_iehost.py` (API with a
-fake recorder and a fake `BrowserProcess`), `tests/test_iehost_engine.py` (opt-in real engine:
-`REQREC_IEHOST_TESTS=1`; compiles the host, runs the fixture site `tests/iehost_fixtures/testsite.py`
-and mitmdump on free ports, runs `--selftest`, checks the recording and that the registry is
+**Tests.** `tests/test_iehost.py` (pure logic with fakes), `tests/test_gui.py` (former
+`test_webapp_iehost.py` section: API with a fake recorder and a fake `BrowserProcess`),
+`tests/test_real_engine.py` (former `test_iehost_engine.py` section, opt-in real engine:
+`REQREC_IEHOST_TESTS=1`; compiles the host, runs the fixture site (`testsite` section of
+`tests/ie_support.py`) and mitmdump on free ports, runs `--selftest`, checks the recording and that the registry is
 unchanged).
 
-## 13.13 Factory scenario findings (deps.py, plan.py, codegen.py, webapp)
+## 13.13 Factory scenario findings (reqrec.py: analysis, codegen, gui sections)
 
-End-to-end runs of a realistic legacy intranet (`tests/iehost_fixtures/factory_site.py`: Shift_JIS
+End-to-end runs of a realistic legacy intranet (`factory_site` section of `tests/ie_support.py`: Shift_JIS
 WebForms, session id rotated at login, one-time `__VIEWSTATE` / `__EVENTVALIDATION`, a per-session
 URL key in `window.open`, autopostback dropdowns, a `showModalDialog` picker, grid paging, an Excel
 export with a percent-encoded Japanese file name) recorded in the recording browser and replayed
 against a fresh server led to these rules:
 
-* **Route-like path segments** (`deps.is_route_like` / `is_structural_path_segment`): words, page /
+* **Route-like path segments** (`analysis.is_route_like` / `is_structural_path_segment`): words, page /
   file names and screen ids (`Login.aspx`, `orders`, `SC0010.aspx`, `KJ010Search.aspx`) stay trace
   candidates, but only exact header / JSON / `<input>` / `<meta>` / cookie matches are accepted for
   them (never `html_attr`, `html_text`, regex or URL patterns — the URL must not depend on
   `action="Login.aspx"` markup), and they never become Constants.  An all-uppercase session key in the
   path (`/s/QZVBNMWRTYPXSDFKHJ/items`) is still traced to the JSON leaf that produced it.
-* **Random letters** (`deps.looks_random_letters`): letters-only values (parts split at `-` / `_`, the
+* **Random letters** (`analysis.looks_random_letters`): letters-only values (parts split at `-` / `_`, the
   stem before one extension) of ≥ 12 characters are judged by their case runs: identifiers with
   acronyms anywhere (`txtTokuisakiCD`, `hdnSearchKEY`, `getXMLHttpRequest`, `getElementById`) are
   words; irregular mixed case (`xBBHOHpXYZgFKyNZpuWy`, `xBBHOH-pXYZgFKyNZpuWy`) is a token (dynamic-
   looking, not route-like, may be traced by regex).  Measured on 20 000 random tokens: 96 % of 16–24
   character letter tokens and 96 % of digit-free base64url tokens are detected.
-* **Referer** (`plan._referer_with_fresh_values`): the recorded `Referer` is split into scheme+host,
+* **Referer** (`analysis._referer_with_fresh_values`): the recorded `Referer` is split into scheme+host,
   path, query and fragment; only whole path segments, `;name=value` path parameters and whole query
   values equal to a value traced for the same step (≥ 8 characters) are substituted — host / scheme
   stay literal; the percent-encoded spelling is handled (`str(X)` when the ref is `unquote(X)`, else
   `requests.utils.quote(str(ref), safe='')`); secret query items are replaced by their secret constant.
-* **Secrets** (`plan`): every field whose name looks secret becomes a secret constant whatever its
+* **Secrets** (`analysis`, plan section): every field whose name looks secret becomes a secret constant whatever its
   length or the candidate filters (`admin`, `123`), and the value cache is keyed by (value, secret-
   looking name), so a password equal to the user id is never emitted as a literal.
 * **Required secrets** (`codegen._required_secret_envs`): `main()` first checks the CONSTANTS it uses
   (`missing = [env for env, value in [(ENV, CONST), …] if not value]`) — secrets recorded non-empty
   plus the Basic / Digest auth password, never NTLM / Negotiate — and exits with 「環境変数 … が
   設定されていません」 before any request; a value typed into the constant block works.
-* **Downloads** (`codegen._DOWNLOAD_HELPERS_SRC`, `util.is_attachment_disposition`,
-  `util.download_filename`): a response is an attachment when `Content-Disposition` starts with
+* **Downloads** (`codegen._DOWNLOAD_HELPERS_SRC`, `core.is_attachment_disposition`,
+  `core.download_filename`): a response is an attachment when `Content-Disposition` starts with
   `attachment`, or contains `filename` and does not start with `inline`.  Every step (any kind,
   including HTML-table exports, loop iterations and the final step) saves binary bodies and
   attachments right after its call (`_save_if_attachment` / `_save_download`, `REQREC_OUTPUT_DIR` or
   cwd; the GUI run sets `<workdir>/outputs`).  Names: RFC 6266 / IE percent-encoding / raw UTF-8 or
   Shift_JIS / RFC 2047 encoded words; Windows reserved names get `_`, names over 150 characters are
-  shortened; unique within a run (`name (2).ext`).  `routes._downloads_of` lists exactly the steps the
+  shortened; unique within a run (`name (2).ext`).  `gui._downloads_of` lists exactly the steps the
   script saves (verified on both factory recordings × 8 option variants).
 * **Easy build payload** adds `downloads: [{index, method, url, filename, mime}]` (shown as
   「保存されるファイル」), and splits plan warnings into `warnings` (actionable) and `notes`
   (Shift_JIS re-encoding, "looks like a credential" — informational, not shown under 確認してください);
-  every warning gets a plain-Japanese `message` (`routes.warning_message`; a test checks all warnings
+  every warning gets a plain-Japanese `message` (`gui.warning_message`; a test checks all warnings
   `build_plan` produces on the fixtures).  Error kinds are distinct (`proxy` / `emulation` / `iehost`
-  launch); only a launch failure gets the AppLocker / `python -m reqrec.iehost build` guidance.
+  launch); only a launch failure gets the AppLocker / `python -m reqrec browser build` guidance.
   Recordings remember their `origin` (`easy` / `advanced`); only easy-started recordings auto-stop
   in easy mode.  The 試しに実行 inputs use friendly labels (「パスワード (入力欄: txtPassword)」;
   NTLM / Negotiate entries keep their "leave blank with sspi" instruction).
 
-Tests: `tests/e2e/test_factory_replay.py` (always on; the two recordings in
+Tests: `tests/test_integration.py`, former `test_factory_replay.py` section (always on; the two recordings in
 `tests/fixtures/factory_ie_recording_{digit,letter}_key.json` are generated and replayed against a
 fresh `factory_site` — full event sequence, Excel rows and name, no recorded session value in the
-code, second run, missing / wrong password), `tests/test_factory_site.py`, and the opt-in
-`tests/test_iedriver.py` (external driver `tests/iehost_fixtures/IEDriver.cs` / `iedriver.py`
-operating RecBrowser via `WM_HTML_GETOBJECT`) and `tests/iehost_fixtures/factory_scenario.py`
-(records the scenario in the real recording browser).
+code, second run, missing / wrong password), and `tests/test_real_engine.py`: the always-on former
+`test_factory_site.py` section, the opt-in former `test_iedriver.py` section (external driver
+`tests/IEDriver.cs` / the `iedriver` section of `tests/ie_support.py` operating RecBrowser via
+`WM_HTML_GETOBJECT`) and the opt-in former `e2e/test_factory_live.py` section, which records the
+scenario in the real recording browser with the `factory_scenario` section of `tests/ie_support.py`.

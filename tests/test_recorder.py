@@ -1,4 +1,4 @@
-"""Tests for reqrec.recorder (mitmproxy addon + mitmdump launcher)."""
+"""Tests for the recorder section of reqrec.py (mitmproxy addon + mitmdump launcher)."""
 
 from __future__ import annotations
 
@@ -18,12 +18,12 @@ from pathlib import Path
 
 import pytest
 
-from reqrec.importers.mitm import MITMPROXY_INSTALL_HINT
-from reqrec.model import Recording
-from reqrec.recorder import run as run_mod
-from reqrec.recorder.run import ADDON_PATH, MITMDUMP_PYTHON_STUB, build_command, format_instructions, run_record, stop_child
+from reqrec import MITMPROXY_INSTALL_HINT
+from reqrec import Recording
+import reqrec as run_mod
+from reqrec import ADDON_PATH, MITMDUMP_PYTHON_STUB, build_command, format_instructions, run_record, stop_child
 
-from reqrec.recorder.addon import DEFAULT_OUT, ReqRecAddon, addons, parse_hosts, write_recording_atomic
+from reqrec import DEFAULT_OUT, ReqRecAddon, addons, parse_hosts, write_recording_atomic
 
 try:
     from mitmproxy.test import taddons, tflow
@@ -224,7 +224,7 @@ class TestAddonWithMitmproxyContext:
 
     def test_write_failure_does_not_raise_from_hook(self, tmp_path: Path, monkeypatch):
         addon = ReqRecAddon(out=str(tmp_path / "rec.json"))
-        import reqrec.recorder.addon as addon_mod
+        import reqrec as addon_mod
 
         def boom(*a, **k):
             raise OSError("read-only file system")
@@ -272,7 +272,7 @@ class TestAddonWithMitmproxyContext:
 class TestScriptMode:
     def _load_as_mitmproxy_script(self):
         """Mimic mitmproxy's Script addon: exec the file under a dotted name with no parent package."""
-        fullname = "__mitmproxy_script__.addon"
+        fullname = "__mitmproxy_script__.reqrec"
         sys.modules.pop(fullname, None)
         old_path = list(sys.path)
         sys.path.insert(0, str(ADDON_FILE.parent))
@@ -288,7 +288,7 @@ class TestScriptMode:
 
     def test_file_loads_without_package_context(self, tmp_path: Path):
         module = self._load_as_mitmproxy_script()
-        assert module.__name__ == "__mitmproxy_script__.addon"
+        assert module.__name__ == "__mitmproxy_script__.reqrec"
         assert len(module.addons) == 1
         addon = module.addons[0]
         assert type(addon).__name__ == "ReqRecAddon"
@@ -296,9 +296,18 @@ class TestScriptMode:
         addon.response(_http_flow("example.test", "/from-script"))
         rec = Recording.load(str(tmp_path / "script.json"))
         assert rec.flows[0].request.url == "https://example.test/from-script"
+        # mitmproxy registers the script module itself as an addon too and calls every attribute
+        # named like an event hook, so no top-level name of reqrec.py may be a hook name (Flask's
+        # ``request`` proxy is imported as ``flask_request`` for this reason).
+        import mitmproxy.addons  # noqa: F401 - every hook is registered once mitmproxy's addons are imported
+        import mitmproxy.eventsequence  # noqa: F401
+        from mitmproxy import hooks
+
+        assert {"request", "response", "error", "load", "running", "done"} <= set(hooks.all_hooks)
+        assert sorted(name for name in hooks.all_hooks if hasattr(module, name)) == []
 
     def test_addon_path_points_to_the_module_file(self):
-        import reqrec.recorder.addon as addon_mod
+        import reqrec as addon_mod
 
         assert ADDON_FILE.is_file()
         assert os.path.samefile(ADDON_PATH, addon_mod.__file__)

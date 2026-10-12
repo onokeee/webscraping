@@ -18,7 +18,7 @@ import pytest
 pw_api = pytest.importorskip("playwright.sync_api", reason="playwright not installed")
 from playwright.sync_api import expect, sync_playwright  # noqa: E402
 
-from reqrec.webapp import create_app  # noqa: E402
+from reqrec import create_app  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 LOGIN_HAR = ROOT / "tests" / "fixtures" / "login_flow_chrome.har"
@@ -294,7 +294,7 @@ def _build_from_loaded(page):
 
 
 def test_easy_done_shows_plan_warnings_in_japanese_and_loop_downloads(page, server):
-    from tests.test_webapp_easy import _synthetic_recording
+    from tests.test_gui import _synthetic_recording
 
     _load_into_server(server, _synthetic_recording())
     _build_from_loaded(page)
@@ -311,7 +311,7 @@ def test_easy_done_shows_plan_warnings_in_japanese_and_loop_downloads(page, serv
 
 
 def test_easy_windows_auth_inputs_keep_their_instruction(page, server):
-    from reqrec.importers import load_recording
+    from reqrec import load_recording
 
     _load_into_server(server, load_recording(str(ROOT / "tests" / "fixtures" / "legacy_webforms_ntlm.har")))
     _build_from_loaded(page)
@@ -336,10 +336,10 @@ def _fail_start(page, kind, message):
         status=500, content_type="application/json", body=json.dumps({"error": message, "kind": kind})))
 
 
-@pytest.mark.skipif(os.name == "nt" and not __import__("reqrec.iehost", fromlist=["x"]).availability("x")["available"],
+@pytest.mark.skipif(os.name == "nt" and not __import__("reqrec").iehost.availability("x")["available"],
                     reason="the easy screen cannot record on this Windows PC")
 def test_easy_start_errors_are_explained_by_kind(page, server):
-    from reqrec.recorder.run import mitmproxy_available
+    from reqrec import mitmproxy_available
 
     if not mitmproxy_available():
         pytest.skip("mitmproxy not installed: the easy screen cannot start")
@@ -389,7 +389,7 @@ class _FakeRecorder:
         self.running = False
 
     def load_recording(self):
-        from reqrec.importers import load_recording
+        from reqrec import load_recording
 
         return load_recording(str(LOGIN_HAR))
 

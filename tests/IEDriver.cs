@@ -1,4 +1,4 @@
-// IEDriver.cs -- TEST-ONLY external driver for reqrec's recording browser (reqrec/iehost/RecBrowser.cs).
+// IEDriver.cs -- TEST-ONLY external driver for reqrec's recording browser (reqrec/RecBrowser.cs).
 //
 // Lets automated tests operate the pages shown inside a running RecBrowser.exe the way a user would:
 // the IE engine inside RecBrowser performs every navigation itself, so the HTTP that reaches the

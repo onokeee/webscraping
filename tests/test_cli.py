@@ -1,4 +1,4 @@
-"""Tests for ``reqrec.cli``.
+"""Tests for the cli section of ``reqrec.py`` (``reqrec`` / ``python -m reqrec``).
 
 The pipeline (``load_recording`` / ``build_plan`` / ``generate`` / ``run_record``) is monkeypatched
 with fakes so these tests exercise argument parsing, option -> dataclass mapping, output writing and
@@ -16,8 +16,9 @@ import sys
 
 import pytest
 
-from reqrec import __version__, cli, model
-from reqrec.model import (
+import reqrec as cli, reqrec as model
+from reqrec import __version__
+from reqrec import (
     AuthInfo,
     Constant,
     Dropped,
@@ -39,7 +40,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE = os.path.join(ROOT, "tests", "fixtures", "login_flow_chrome.har")
 FIREFOX_FIXTURE = os.path.join(ROOT, "tests", "fixtures", "api_firefox.har")
 LEGACY_FIXTURE = os.path.join(ROOT, "tests", "fixtures", "legacy_webforms_ntlm.har")
-EXAMPLES_DIR = os.path.join(ROOT, "examples")
+EXAMPLES_DIR = os.path.join(ROOT, "tests", "fixtures")  # the bundled example script (example_scrape.py)
 
 FAKE_SCRIPT = "import sys\nprint('fake generated script')\nsys.exit(0)\n"
 SECRET_VALUE = "Secr3t!-never-print-me"
@@ -636,12 +637,12 @@ def test_describe_source_for_merged_recordings():
 # --------------------------------------------------------------------------- phase 2: manual overrides (§13.1)
 
 def test_flow_id_helpers():
-    assert cli.normalise_flow_id("f0008") == "f0008"
-    assert cli.normalise_flow_id("F8") == "f0008"
-    assert cli.normalise_flow_id("8") == "f0008"
-    assert cli.normalise_flow_id("12345") == "f12345"
-    assert cli.normalise_flow_id(" ") is None and cli.normalise_flow_id(None) is None
-    assert cli.normalise_flow_id("custom-id") == "custom-id"  # non-standard ids are checked against the recording later
+    assert cli.cli_normalise_flow_id("f0008") == "f0008"
+    assert cli.cli_normalise_flow_id("F8") == "f0008"
+    assert cli.cli_normalise_flow_id("8") == "f0008"
+    assert cli.cli_normalise_flow_id("12345") == "f12345"
+    assert cli.cli_normalise_flow_id(" ") is None and cli.cli_normalise_flow_id(None) is None
+    assert cli.cli_normalise_flow_id("custom-id") == "custom-id"  # non-standard ids are checked against the recording later
     assert cli.split_flow_ids(["f0001, 2", "f0003;f0001", " 4 "]) == ["f0001", "f0002", "f0003", "f0004"]
     assert cli.split_flow_ids(None) == [] and cli.split_flow_ids([""]) == []
     assert cli._flow_ids_label([]) == "-"
@@ -837,7 +838,7 @@ def test_unexpected_exceptions_propagate(fakes, monkeypatch):
 
 def test_python_m_entry_point():
     result = subprocess.run(
-        [sys.executable, "-m", "reqrec.cli", "--version"], cwd=ROOT, capture_output=True, text=True, timeout=60,
+        [sys.executable, "-m", "reqrec", "--version"], cwd=ROOT, capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0
     assert result.stdout.strip() == f"reqrec {__version__}"
@@ -845,7 +846,7 @@ def test_python_m_entry_point():
 
 def test_bundled_example_scripts_compile():
     scripts = [f for f in os.listdir(EXAMPLES_DIR) if f.endswith(".py")] if os.path.isdir(EXAMPLES_DIR) else []
-    assert scripts, "examples/ should ship at least one example script"
+    assert scripts, "tests/fixtures/ should hold at least one example script"
     for name in scripts:
         path = os.path.join(EXAMPLES_DIR, name)
         with open(path, encoding="utf-8") as fh:

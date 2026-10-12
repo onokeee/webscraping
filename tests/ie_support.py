@@ -1,56 +1,18 @@
-"""Mock legacy factory production-management intranet (生産管理システム) for reqrec / IE-host tests.
+"""Test-only helpers of the IE-engine (RecBrowser) tests - stdlib only, importable by path.
 
-It imitates an ASP.NET WebForms site written for Internet Explorer and served by "IIS":
+* ``testsite``: tiny intranet-like site for ``RecBrowser.exe --selftest``,
+* ``factory_site``: mock legacy factory intranet (ASP.NET WebForms, Shift_JIS, one-time __VIEWSTATE),
+* ``factory_scenario``: records the factory site through the real recording browser,
+* ``iedriver``: Python wrapper for the test driver ``IEDriver.exe`` (source: ``IEDriver.cs`` next to
+  this file).
 
-* **Shift_JIS everywhere** — every HTML page carries ``Content-Type: text/html; charset=Shift_JIS``
-  and ``<meta http-equiv="Content-Type" content="text/html; charset=Shift_JIS">``; form posts arrive
-  percent-encoded in Shift_JIS and are decoded with cp932.  HTML/JS is ES3 / IE7-document-mode safe
-  (``onclick`` / ``onchange`` attributes, ``document.getElementById``, ``document.forms``).
-* **ASP.NET session + forms authentication** — ``GET /Login.aspx`` issues ``ASP.NET_SessionId``
-  (24 lowercase alnum); a successful login *rotates* the session id and sets ``.ASPXAUTH`` (64 hex,
-  HttpOnly).  Every page except the login page and the static files needs a valid
-  ``ASP.NET_SessionId`` + ``.ASPXAUTH`` pair, otherwise ``302 /Login.aspx?ReturnUrl=<path>``.
-* **One-time ``__VIEWSTATE`` / ``__EVENTVALIDATION``** — each rendered page gets fresh random
-  tokens bound to the session and to the page.  A postback with a missing / foreign / stale /
-  already used token is answered with HTTP 500 "Validation of viewstate MAC failed."; a posted
-  value the page never rendered (e.g. a line of another plant) with HTTP 500 "Invalid postback or
-  callback argument."  A postback that was *rejected* does not use up its tokens; the Excel
-  download does not use them up either (the browser keeps showing the same page, so the next click
-  posts the same tokens again).
-* **Popups** — Menu.aspx opens 生産実績照会 (Search.aspx) with ``window.open`` and a per-session
-  URL key (NAVKEY, cookieless-style; a wrong / missing key is a 403) and お知らせ (News.aspx) with
-  ``target="_blank"``.  Search.aspx is a ``__doPostBack`` page: an AutoPostBack plant dropdown
-  that fills the line dropdown, a ``showModalDialog`` item picker (ItemPicker.aspx, returns the
-  item code through ``window.returnValue``), a paged result grid (``gvResult``, 20 rows per page,
-  ``__doPostBack('gvResult','Page$2')``) and an Excel (.xlsx) download with an IE-style
-  percent-encoded UTF-8 file name.
+One section per former module of ``tests/iehost_fixtures/`` (headed
+``# ===== former tests/iehost_fixtures/<name>.py ... =====``).  Importing this module has no side
+effects.  Command line (see :func:`main`)::
 
-Every request is appended as one JSON line to the log file::
-
-    {"t", "method", "path", "query", "session", "auth_ok", "event", "status", "ua", "details"}
-
-``session`` is the server-side session the request's ``ASP.NET_SessionId`` cookie names (``null``
-when there is none / it is unknown); ``event`` is e.g. ``login_page``, ``login_ok``, ``login_fail``,
-``viewstate_reject``, ``eventvalidation_reject``, ``navkey_reject``, ``auth_redirect``, ``menu``,
-``search_page``, ``plant_change``, ``search``, ``page``, ``excel_export``, ``picker``, ``news``,
-``logout``, ``static``; ``details`` holds the filters, the export id, the rejection reason and the
-first characters of rejected tokens.
-
-Importing this module has no side effects (nothing is read from ``sys.argv``, no file or socket is
-touched).  Command line::
-
-    python -I factory_site.py LOGFILE PORT [HOST]
-
-From a test::
-
-    server = make_server(log_path, 0)           # port 0 = any free port; server.port / server.base_url
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    ...
-    server.shutdown(); server.server_close()
-
-or ``server = serve_in_thread(log_path)`` … ``server.stop()``.  Helpers: :data:`CREDENTIALS`,
-:func:`expected_rows`, :func:`read_xlsx_rows`, :func:`export_filename`, :func:`read_log`,
-:func:`hidden_fields`.
+    python -I tests/ie_support.py testsite LOGFILE PORT
+    python -I tests/ie_support.py factory-site LOGFILE PORT [HOST]
+    python -I tests/ie_support.py iedriver OUT_DIR
 """
 
 from __future__ import annotations
@@ -58,14 +20,19 @@ from __future__ import annotations
 import base64
 import datetime as _dt
 import functools
+import hashlib
 import io
 import json
+import os
 import random
 import re
 import secrets
+import shutil
+import socket
 import socketserver
 import string
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -74,21 +41,229 @@ from collections import OrderedDict
 from html import escape as _html_escape
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
-from urllib.parse import parse_qsl, quote, unquote_to_bytes, urlsplit
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qs, parse_qsl, quote, unquote_to_bytes, urlsplit
 from xml.etree import ElementTree as ET
 
 __all__ = [
-    "CREDENTIALS", "USER_NAME", "PLANTS", "LINES", "SHIFTS", "ITEMS", "PAGE_SIZE", "DEFAULT_FROM",
-    "DEFAULT_TO", "EXPORT_DATE", "EXPORT_HEADER", "EXPORT_ID_LABEL", "XLSX_CONTENT_TYPE",
-    "VIEWSTATE_GENERATORS", "FactoryServer", "make_server", "serve_in_thread", "main", "dataset",
-    "expected_rows", "export_filename", "build_xlsx", "read_xlsx_rows", "read_log", "hidden_fields",
-    "parse_form",
+    # testsite (RecBrowser self-test site)
+    "SELFTEST_FUNCTIONS", "EXPECTED_POST_BODY", "TESTSITE_SESSION_COOKIE", "make_handler", "serve", "testsite_main",
+    # factory_site (mock 生産管理システム)
+    "CREDENTIALS", "USER_NAME", "PLANTS", "LINES", "SHIFTS", "ITEMS", "PAGE_SIZE", "DEFAULT_FROM", "DEFAULT_TO",
+    "EXPORT_DATE", "EXPORT_HEADER", "EXPORT_ID_LABEL", "XLSX_CONTENT_TYPE", "VIEWSTATE_GENERATORS", "FactoryServer",
+    "make_server", "serve_in_thread", "factory_site_main", "dataset", "expected_rows", "export_filename",
+    "build_xlsx", "read_xlsx_rows", "read_log", "hidden_fields", "parse_form",
+    # factory_scenario
+    "SCENARIO_FILTER", "STEPS", "ScenarioError", "run_factory_recording", "site_host", "free_port",
+    # iedriver (IEDriver.exe wrapper)
+    "DRIVER_SOURCE", "CSC", "IEDriverError", "build_command", "build_driver", "IEDriver",
+    # command line
+    "main",
 ]
+
+
+# ===== former tests/iehost_fixtures/testsite.py: tiny intranet-like site for the RecBrowser self-test =====
+# Tiny intranet-like test site for the IE-host engine test (``tests/test_real_engine.py``).
+#
+# Plain http only.  ``RecBrowser.exe --selftest`` loads ``/index.html`` and calls the page functions
+# ``doOpen`` (window.open), ``doBlankPost`` (form target=_blank POST), ``doBlankLink`` (link
+# target=_blank), ``doModeless`` (showModelessDialog) and ``doModal`` (showModalDialog); every page
+# self-reports its document mode, window name, opener and cookies to ``/report`` so a run can be judged
+# from the recording alone.  Every request (and every self-report) is appended as a JSON line to the
+# log file given on the command line.
+#
+# Importing this module has no side effects (nothing is read from ``sys.argv``, no file or socket is
+# touched); the server only starts from :func:`testsite_main` / :func:`serve`::
+#
+#     python -I tests/ie_support.py testsite LOGFILE PORT
+
+HOST = "127.0.0.1"
+TESTSITE_DEFAULT_PORT = 8099
+TESTSITE_DEFAULT_LOG = "testsite.log"
+
+#: Page functions ``RecBrowser.exe --selftest`` invokes on /index.html, in this order (the last one
+#: opens a popup that closes itself with window.close(): the host must remove that tab again).
+SELFTEST_FUNCTIONS = ("doOpen", "doBlankPost", "doBlankLink", "doModeless", "doModal", "doClosePopup")
+
+#: Body of the ``target=_blank`` POST that ``doBlankPost`` submits (``secret=abc123`` + ``jp=日本語``).
+EXPECTED_POST_BODY = "secret=abc123&jp=%E6%97%A5%E6%9C%AC%E8%AA%9E"
+
+#: Session cookie set by /index.html; the pages echo it back in their self-report.
+TESTSITE_SESSION_COOKIE = "sid=TESTSESSION"
+
+COMMON_JS = """
+function report(tag, extra){
+  var q = 'tag=' + tag + '&mode=' + document.documentMode + '&name=' + encodeURIComponent(window.name || '')
+        + '&opener=' + (window.opener ? 'yes' : 'no') + '&ua=' + encodeURIComponent(navigator.userAgent)
+        + '&cookie=' + encodeURIComponent(document.cookie || '') + (extra ? '&' + extra : '');
+  try { var x = new XMLHttpRequest(); x.open('GET', '/report?' + q, true); x.send(); } catch (e) {}
+}
+"""
+
+INDEX = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>index</title></head><body>
+<h1>index page</h1>
+<form id="f" method="post" action="/post" target="_blank">
+  <input name="secret" value="abc123"><input name="jp" value="日本語"></form>
+<a id="lnk" href="/settings.html?via=blank" target="_blank">settings (target=_blank)</a>
+<script>%(common)s
+report('index');
+function doOpen(){ var w = window.open('/popup.html?via=open', 'cfgwin', 'width=500,height=400'); return w ? 'opened' : 'blocked'; }
+function doBlankPost(){ document.getElementById('f').submit(); return 'submitted'; }
+function doModal(){ try { var r = window.showModalDialog('/modal.html?via=modal', 'ARGS', 'dialogWidth:400px;dialogHeight:300px'); return 'modal returned: ' + r; } catch (e) { return 'modal error: ' + e.message; } }
+function doBlankLink(){ document.getElementById('lnk').click(); return 'clicked'; }
+function doModeless(){ try { var w = window.showModelessDialog('/modeless.html?via=modeless', 'ARGS', 'dialogWidth:400px;dialogHeight:300px'); return w ? 'modeless opened' : 'modeless blocked'; } catch (e) { return 'modeless error: ' + e.message; } }
+function doClosePopup(){ var w = window.open('/closer.html?via=close', 'closer', 'width=300,height=200'); return w ? 'opened' : 'blocked'; }
+</script></body></html>""" % {"common": COMMON_JS}
+
+CLOSER = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>closer</title></head><body>
+<h1>closes itself</h1>
+<script>%(common)s report('closer'); setTimeout(function(){ window.close(); }, 700);</script></body></html>""" % {"common": COMMON_JS}
+
+POPUP = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>%(title)s</title></head><body>
+<h1>%(title)s</h1><p>%(body)s</p>
+<script>%(common)s report('%(title)s'%(extra)s);</script></body></html>"""
+
+MODAL = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>modal</title></head><body>
+<h1>modal dialog</h1>
+<script>%(common)s
+var args = ''; try { args = window.dialogArguments; } catch (e) { args = 'n/a'; }
+report('modal', 'args=' + encodeURIComponent(args));
+setTimeout(function(){ try { window.returnValue = 'OK'; } catch (e) {} window.close(); }, 700);
+</script></body></html>""" % {"common": COMMON_JS}
+
+MODELESS = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>modeless</title></head><body>
+<h1>modeless dialog</h1>
+<script>%(common)s report('modeless'); setTimeout(function(){ window.close(); }, 700);</script></body></html>""" % {"common": COMMON_JS}
+
+
+def make_handler(log_path: str) -> type:
+    """Request handler class bound to ``log_path`` (one JSON object per line)."""
+
+    def log(entry: dict) -> None:
+        entry["t"] = round(time.time(), 3)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, body: str, status: int = 200, ctype: str = "text/html; charset=utf-8", extra: Optional[dict] = None) -> None:
+            data = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache")  # repeated runs must hit the proxy every time
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self) -> None:  # noqa: N802 (http.server naming)
+            u = urlsplit(self.path)
+            log({"method": "GET", "path": self.path, "ua": self.headers.get("User-Agent"), "cookie": self.headers.get("Cookie")})
+            if u.path == "/report":
+                log({"report": {k: v[0] for k, v in parse_qs(u.query).items()}})
+                self._send("ok", ctype="text/plain")
+            elif u.path in ("/", "/index.html"):
+                self._send(INDEX, extra={"Set-Cookie": TESTSITE_SESSION_COOKIE + "; Path=/"})
+            elif u.path == "/popup.html":
+                self._send(POPUP % {"title": "popup", "body": "opened via window.open", "common": COMMON_JS, "extra": ""})
+            elif u.path == "/settings.html":
+                self._send(POPUP % {"title": "settings", "body": "opened via target=_blank link", "common": COMMON_JS, "extra": ""})
+            elif u.path == "/modal.html":
+                self._send(MODAL)
+            elif u.path == "/modeless.html":
+                self._send(MODELESS)
+            elif u.path == "/closer.html":
+                self._send(CLOSER)
+            elif u.path == "/download.csv":
+                self._send("a,b\n1,2\n", ctype="text/csv", extra={"Content-Disposition": "attachment; filename=data.csv"})
+            else:
+                self._send("not found", status=404, ctype="text/plain")
+
+        def do_POST(self) -> None:  # noqa: N802
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n).decode("utf-8", "replace")
+            log({"method": "POST", "path": self.path, "body": body, "cookie": self.headers.get("Cookie")})
+            self._send(POPUP % {"title": "post", "body": "POST body: " + body, "common": COMMON_JS, "extra": ", 'post=' + encodeURIComponent(%r)" % body})
+
+        def log_message(self, *args) -> None:  # silence the default stderr access log
+            pass
+
+    return Handler
+
+
+def serve(log_path: str, port: int = TESTSITE_DEFAULT_PORT, host: str = HOST) -> None:
+    """Truncate ``log_path`` and serve forever (blocking)."""
+    open(log_path, "w", encoding="utf-8").close()
+    ThreadingHTTPServer((host, port), make_handler(log_path)).serve_forever()
+
+
+def testsite_main(argv: Optional[Sequence[str]] = None) -> None:
+    """Command line: ``ie_support.py testsite [LOGFILE [PORT]]``."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    log_path = args[0] if args else TESTSITE_DEFAULT_LOG
+    port = int(args[1]) if len(args) > 1 else TESTSITE_DEFAULT_PORT
+    serve(log_path, port)
+
+
+# ===== former tests/iehost_fixtures/factory_site.py: mock factory intranet (ASP.NET WebForms, Shift_JIS) =====
+# Mock legacy factory production-management intranet (生産管理システム) for reqrec / IE-host tests.
+#
+# It imitates an ASP.NET WebForms site written for Internet Explorer and served by "IIS":
+#
+# * **Shift_JIS everywhere** — every HTML page carries ``Content-Type: text/html; charset=Shift_JIS``
+#   and ``<meta http-equiv="Content-Type" content="text/html; charset=Shift_JIS">``; form posts arrive
+#   percent-encoded in Shift_JIS and are decoded with cp932.  HTML/JS is ES3 / IE7-document-mode safe
+#   (``onclick`` / ``onchange`` attributes, ``document.getElementById``, ``document.forms``).
+# * **ASP.NET session + forms authentication** — ``GET /Login.aspx`` issues ``ASP.NET_SessionId``
+#   (24 lowercase alnum); a successful login *rotates* the session id and sets ``.ASPXAUTH`` (64 hex,
+#   HttpOnly).  Every page except the login page and the static files needs a valid
+#   ``ASP.NET_SessionId`` + ``.ASPXAUTH`` pair, otherwise ``302 /Login.aspx?ReturnUrl=<path>``.
+# * **One-time ``__VIEWSTATE`` / ``__EVENTVALIDATION``** — each rendered page gets fresh random
+#   tokens bound to the session and to the page.  A postback with a missing / foreign / stale /
+#   already used token is answered with HTTP 500 "Validation of viewstate MAC failed."; a posted
+#   value the page never rendered (e.g. a line of another plant) with HTTP 500 "Invalid postback or
+#   callback argument."  A postback that was *rejected* does not use up its tokens; the Excel
+#   download does not use them up either (the browser keeps showing the same page, so the next click
+#   posts the same tokens again).
+# * **Popups** — Menu.aspx opens 生産実績照会 (Search.aspx) with ``window.open`` and a per-session
+#   URL key (NAVKEY, cookieless-style; a wrong / missing key is a 403) and お知らせ (News.aspx) with
+#   ``target="_blank"``.  Search.aspx is a ``__doPostBack`` page: an AutoPostBack plant dropdown
+#   that fills the line dropdown, a ``showModalDialog`` item picker (ItemPicker.aspx, returns the
+#   item code through ``window.returnValue``), a paged result grid (``gvResult``, 20 rows per page,
+#   ``__doPostBack('gvResult','Page$2')``) and an Excel (.xlsx) download with an IE-style
+#   percent-encoded UTF-8 file name.
+#
+# Every request is appended as one JSON line to the log file::
+#
+#     {"t", "method", "path", "query", "session", "auth_ok", "event", "status", "ua", "details"}
+#
+# ``session`` is the server-side session the request's ``ASP.NET_SessionId`` cookie names (``null``
+# when there is none / it is unknown); ``event`` is e.g. ``login_page``, ``login_ok``, ``login_fail``,
+# ``viewstate_reject``, ``eventvalidation_reject``, ``navkey_reject``, ``auth_redirect``, ``menu``,
+# ``search_page``, ``plant_change``, ``search``, ``page``, ``excel_export``, ``picker``, ``news``,
+# ``logout``, ``static``; ``details`` holds the filters, the export id, the rejection reason and the
+# first characters of rejected tokens.
+#
+# Importing this module has no side effects (nothing is read from ``sys.argv``, no file or socket is
+# touched).  Command line::
+#
+#     python -I tests/ie_support.py factory-site LOGFILE PORT [HOST]
+#
+# From a test::
+#
+#     server = make_server(log_path, 0)           # port 0 = any free port; server.port / server.base_url
+#     threading.Thread(target=server.serve_forever, daemon=True).start()
+#     ...
+#     server.shutdown(); server.server_close()
+#
+# or ``server = serve_in_thread(log_path)`` … ``server.stop()``.  Helpers: :data:`CREDENTIALS`,
+# :func:`expected_rows`, :func:`read_xlsx_rows`, :func:`export_filename`, :func:`read_log`,
+# :func:`hidden_fields`.
 
 # --------------------------------------------------------------------------- constants
 
-HOST = "127.0.0.1"
 DEFAULT_PORT = 8098
 DEFAULT_LOG = "factory_site.log"
 
@@ -1375,8 +1550,8 @@ def serve_in_thread(log_path: str, port: int = 0, host: str = HOST, truncate_log
     return make_server(log_path, port, host, truncate_log).start()
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
-    """Command line: ``factory_site.py [LOGFILE [PORT [HOST]]]``."""
+def factory_site_main(argv: Optional[Sequence[str]] = None) -> None:
+    """Command line: ``ie_support.py factory-site [LOGFILE [PORT [HOST]]]``."""
     args = list(sys.argv[1:] if argv is None else argv)
     log_path = args[0] if args else DEFAULT_LOG
     port = int(args[1]) if len(args) > 1 else DEFAULT_PORT
@@ -1389,6 +1564,646 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         pass
     finally:
         server.server_close()
+
+
+# ===== former tests/iehost_fixtures/factory_scenario.py: records the factory site in the real recording browser =====
+# Records the factory mock site (the ``factory_site`` section above) through the real recording browser - TEST ONLY.
+#
+# :func:`run_factory_recording` starts the mock 生産管理システム, a recorder (mitmdump + the reqrec addon,
+# the GUI's ``HTTPS_PASSTHROUGH_ARGS``) and ``RecBrowser.exe``, then operates the pages with the test driver
+# (``IEDriver.cs`` / the ``iedriver`` section below) exactly like a factory user would:
+#
+# ==================  ==========================================================================
+# step                what the user does (what the engine sends)
+# ==================  ==========================================================================
+# ``start``           the browser opens ``/Login.aspx`` (GET, ``ASP.NET_SessionId``)
+# ``login``           types tanaka / ``Seisan#2026!`` and clicks ログイン (POST -> 302 -> /Menu.aspx)
+# ``open_search``     clicks 生産実績照会 = ``window.open('Search.aspx?key=<NAVKEY>')`` -> popup tab
+# ``plant``           selects 本社工場 (AutoPostBack: ``__doPostBack('ddlPlant','')`` POST)
+# ``line_shift``      selects 組立1ライン and 日勤 (no request)
+# ``item_picker``     clicks 品番選択 = ``showModalDialog('ItemPicker.aspx?...')`` (GET in a dialog),
+#                     clicks A-1002 there; the dialog closes and txtItem becomes ``A-1002``
+# ``search``          clicks 検索 (POST; 35 rows = 2 pages)
+# ``page2``           clicks the pager link 2 = ``javascript:__doPostBack('gvResult','Page$2')`` (POST)
+# ``excel``           clicks Excel出力 (POST answered with the .xlsx) and cancels the engine's
+#                     「ファイルのダウンロード」 dialog with キャンセル
+# ``news``            clicks お知らせ in the menu tab (``target=_blank`` GET in a new tab)
+# ``close``           closes the browser window (WM_CLOSE, exit code 0)
+# ==================  ==========================================================================
+#
+# Nothing is asserted here: the function only raises when a step cannot be performed in time
+# (:class:`ScenarioError` / :class:`IEDriverError`).  The caller judges the run from the site log
+# (:func:`read_log`), the recording JSON and the returned timings.  The search filter is
+# :data:`SCENARIO_FILTER`; :func:`expected_rows(*SCENARIO_FILTER) <expected_rows>` gives the rows of the grid
+# and of the Excel file.
+#
+# Requirements: Windows, the inbox C# compiler (for ``IEDriver.exe``), mitmproxy, a compiled
+# ``RecBrowser.exe`` (``reqrec.iehost.ensure_built``) and DNS for ``127.0.0.1.nip.io`` (WinINet never
+# proxies literal loopback addresses; without that name the site is addressed as ``127.0.0.1`` with the
+# ``<-loopback>`` bypass override).  RecBrowser's windows appear on screen while the scenario runs.
+#
+# Usage::
+#
+#     scenario = <import tests/ie_support.py by path>
+#     result = scenario.run_factory_recording(workdir, out_json, site_port=0, proxy_port=0,
+#                                             recbrowser_exe=reqrec.iehost.ensure_built(workdir))
+#     result["timings"]      # {"start": 1.9, "login": 1.2, ...} seconds per step
+#     result["site_log"]     # factory_site JSON-lines log of this run
+#
+# Importing this module has no side effects (nothing is compiled, started or written).
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ADDON_PATH = os.path.join(ROOT, "reqrec.py")
+
+#: :func:`expected_rows` arguments of the search the scenario performs
+#: (plant, line, shift, date_from, date_to, item); the dates are the page's defaults.
+SCENARIO_FILTER = ("01", "L11", "D", "2026/09/01", "2026/10/10", "A-1002")
+
+#: Step names, in order (keys of the returned ``timings``).
+STEPS = ("start", "login", "open_search", "plant", "line_shift", "item_picker", "search", "page2",
+         "excel", "news", "close")
+
+#: Title / button of the engine's download dialog (Japanese Windows).
+DOWNLOAD_DIALOG_TITLE = "ファイルのダウンロード"
+DOWNLOAD_CANCEL = "キャンセル"
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+class ScenarioError(RuntimeError):
+    """A step could not be completed (timeout or a process that died)."""
+
+
+# --------------------------------------------------------------------------- small helpers
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def site_host() -> tuple:
+    """``(host, proxy_bypass)``: ``127.0.0.1.nip.io`` when it resolves to 127.0.0.1, else the literal
+    address with WinINet's ``<-loopback>`` override (WinINet never proxies loopback addresses)."""
+    try:
+        infos = socket.getaddrinfo("127.0.0.1.nip.io", None, socket.AF_INET)
+        if any(info[4][0] == "127.0.0.1" for info in infos):
+            return "127.0.0.1.nip.io", ""
+    except OSError:
+        pass
+    return "127.0.0.1", "<-loopback>"
+
+
+def _wait_port(port: int, timeout: float, proc: Optional[subprocess.Popen] = None, what: str = "port") -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        if proc is not None and proc.poll() is not None:
+            raise ScenarioError(f"{what} exited early with code {proc.returncode}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise ScenarioError(f"{what} did not listen on port {port} within {timeout:.0f}s") from None
+            time.sleep(0.2)
+
+
+def _kill(proc: Optional[subprocess.Popen]) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+
+
+def _mitmdump_command(out_json: str, proxy_port: int) -> List[str]:
+    """``mitmdump -s <addon> --set reqrec_out=<file> -p <port> --listen-host 127.0.0.1 --set flow_detail=0``
+    plus the GUI's ``HTTPS_PASSTHROUGH_ARGS`` (HTTPS on every port passes through unrecorded, as in the
+    recording browser started by the GUI); the venv's mitmdump next to this interpreter when present."""
+    from reqrec import HTTPS_PASSTHROUGH_ARGS
+
+    scripts = os.path.dirname(os.path.abspath(sys.executable))
+    exe = os.path.join(scripts, "mitmdump.exe" if os.name == "nt" else "mitmdump")
+    if os.path.isfile(exe):
+        launcher = [exe]
+    elif shutil.which("mitmdump"):
+        launcher = [str(shutil.which("mitmdump"))]
+    else:
+        launcher = [sys.executable, "-c", "import sys; from mitmproxy.tools.main import mitmdump; sys.exit(mitmdump())"]
+    return launcher + [
+        "-s", ADDON_PATH, "--set", f"reqrec_out={os.path.abspath(out_json)}", "-p", str(int(proxy_port)),
+        "--listen-host", "127.0.0.1", "--set", "flow_detail=0", *HTTPS_PASSTHROUGH_ARGS,
+    ]
+
+
+def _poll(what: str, probe: Callable[[], Any], timeout: float, interval: float = 0.2) -> Any:
+    """Call ``probe`` until it returns something truthy; driver errors count as "not yet"."""
+    deadline = time.monotonic() + timeout
+    last: Any = None
+    while True:
+        try:
+            value = probe()
+        except Exception as exc:  # IEDriverError while a page is being replaced
+            value, last = None, exc
+        if value:
+            return value
+        if time.monotonic() >= deadline:
+            raise ScenarioError(f"timeout ({timeout:.0f}s) waiting for {what}" + (f": {last}" if last else ""))
+        time.sleep(interval)
+
+
+# --------------------------------------------------------------------------- the scenario
+
+def _operate(drv: Any, browser: subprocess.Popen, step: Callable[[str], Any], pending: List[subprocess.Popen],
+             info: Dict[str, Any], timeout: float) -> None:
+    user, password = info["credentials"]
+    search = "/Search.aspx?key="
+
+    def alive() -> None:
+        if browser.poll() is not None:
+            raise ScenarioError(f"RecBrowser exited unexpectedly (code {browser.returncode})")
+
+    with step("start"):
+        drv.wait("/Login.aspx", text="ログイン", kind="tab", timeout=max(timeout, 60.0))
+
+    with step("login"):
+        drv.value("/Login.aspx", id="txtUserId", value=user, kind="tab")
+        drv.value("/Login.aspx", id="txtPassword", value=password, kind="tab")
+        drv.click("/Login.aspx", id="btnLogin", kind="tab")
+        drv.wait("/Menu.aspx", text="ようこそ", kind="tab", timeout=timeout)
+
+    with step("open_search"):
+        drv.click("/Menu.aspx", id="lnkSearch", kind="tab")   # window.open -> a new tab
+        drv.wait(search, text="生産実績照会", kind="tab", timeout=timeout)
+
+    with step("plant"):
+        drv.select(search, id="ddlPlant", text="本社工場", kind="tab")   # onchange -> __doPostBack
+        # same URL after the postback: wait until the NEW document has the line options
+        _poll("the plant postback (ddlLine filled)",
+              lambda: int(drv.attr(search, id="ddlLine", name="length", kind="tab", timeout=2)["value"] or 0) > 0,
+              timeout)
+        drv.wait(search, text="生産実績照会", kind="tab", timeout=timeout)
+
+    with step("line_shift"):
+        drv.select(search, id="ddlLine", text="組立1ライン", kind="tab")
+        drv.select(search, id="ddlShift", text="日勤", kind="tab")
+
+    with step("item_picker"):
+        clicking = drv.click_async(search, id="btnPick", kind="tab")   # blocks until the modal closes
+        pending.append(clicking)
+        drv.wait("/ItemPicker.aspx", text="A-1002", kind="dialog", timeout=timeout)
+        drv.click("/ItemPicker.aspx", id="item_A-1002", kind="dialog")   # returnValue + window.close()
+        drv.finish(clicking, timeout=timeout)
+        pending.remove(clicking)
+        _poll("txtItem = A-1002",
+              lambda: drv.attr(search, id="txtItem", name="value", kind="tab", timeout=2)["value"] == "A-1002",
+              timeout)
+
+    with step("search"):
+        drv.click(search, id="btnSearch", kind="tab")
+        drv.wait(search, text="1/2 ページ", kind="tab", timeout=timeout)
+
+    with step("page2"):
+        drv.click(search, link_text="2", kind="tab")   # javascript:__doPostBack('gvResult','Page$2')
+        drv.wait(search, text="2/2 ページ", kind="tab", timeout=timeout)
+
+    with step("excel"):
+        drv.click(search, id="btnExcel", kind="tab")
+        info["download_dialog"] = drv.dialog(title=DOWNLOAD_DIALOG_TITLE, button=DOWNLOAD_CANCEL,
+                                             timeout=max(timeout, 20.0))
+        alive()
+
+    with step("news"):
+        drv.click("/Menu.aspx", id="lnkNews", kind="tab")   # target=_blank -> a new tab
+        drv.wait("/News.aspx", text="システムメンテナンス", kind="tab", timeout=timeout)
+
+    with step("close"):
+        info["close"] = drv.close(timeout=max(timeout, 20.0))
+        try:
+            info["browser_exit_code"] = browser.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            raise ScenarioError("RecBrowser did not exit after WM_CLOSE") from None
+
+
+class _Steps:
+    """``with step("name"):`` records the duration of each step (also of a failing one)."""
+
+    def __init__(self) -> None:
+        self.timings: "OrderedDict[str, float]" = OrderedDict()
+        self.current: Optional[str] = None
+        self._name = ""
+        self._t0 = 0.0
+
+    def __call__(self, name: str) -> "_Steps":
+        self._name = name
+        return self
+
+    def __enter__(self) -> "_Steps":
+        self.current = self._name
+        self._t0 = time.monotonic()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.timings[self._name] = round(time.monotonic() - self._t0, 3)
+        if exc_type is None:
+            self.current = None
+
+
+def run_factory_recording(
+    workdir: str,
+    out_json: str,
+    site_port: int,
+    proxy_port: int,
+    recbrowser_exe: str,
+    *,
+    driver_exe: Optional[str] = None,
+    timeout: float = 30.0,
+    keep_site: bool = False,
+    title: str = "生産管理 記録",
+) -> Dict[str, Any]:
+    """Run the recording scenario of the module docstring and return what happened.
+
+    ``workdir`` receives the site log (``factory_site.log``), ``recbrowser.log``, ``mitmdump.out`` and
+    (unless ``driver_exe`` is given) the compiled driver in ``iedriver_bin/``.  ``out_json`` is the
+    recording the reqrec addon writes (deleted first).  ``site_port`` / ``proxy_port`` 0 = a free port.
+    ``timeout`` bounds each wait of the scenario (the first page and the download dialog get at least
+    60 s / 20 s).  With ``keep_site`` the mock site keeps running after the browser is closed and the
+    result carries it as ``site_server`` (call ``.stop()``); otherwise it is stopped.
+
+    Returns ``{"timings": {step: seconds}, "setup_seconds", "total_seconds", "site_log", "out_json",
+    "recbrowser_log", "mitmdump_log", "base_url", "start_url", "host", "bypass", "site_port",
+    "proxy_port", "browser_pid", "browser_exit_code", "close", "download_dialog", "driver_exe",
+    "scenario_filter", "credentials", "site_events"}`` (+ ``"site_server"`` with ``keep_site``).
+    Raises :class:`ScenarioError` / ``IEDriverError`` (with the timings so far in ``exc.timings`` and
+    the step in ``exc.step``) when a step does not complete.
+    """
+    workdir = os.path.abspath(workdir)
+    os.makedirs(workdir, exist_ok=True)
+    out_json = os.path.abspath(out_json)
+    if os.path.exists(out_json):
+        os.remove(out_json)
+    site_log = os.path.join(workdir, "factory_site.log")
+    host_log = os.path.join(workdir, "recbrowser.log")
+    mitm_log = os.path.join(workdir, "mitmdump.out")
+    if driver_exe is None:
+        driver_exe = build_driver(os.path.join(workdir, "iedriver_bin"))
+    host, bypass = site_host()
+    proxy_port = int(proxy_port) or free_port()
+
+    info: Dict[str, Any] = {
+        "credentials": CREDENTIALS, "scenario_filter": SCENARIO_FILTER, "driver_exe": driver_exe,
+        "site_log": site_log, "out_json": out_json, "recbrowser_log": host_log, "mitmdump_log": mitm_log,
+        "host": host, "bypass": bypass, "proxy_port": proxy_port, "browser_exit_code": None,
+        "close": None, "download_dialog": None,
+    }
+    steps = _Steps()
+    started = time.monotonic()
+    server = recorder = browser = None
+    pending: List[subprocess.Popen] = []
+    ok = False
+    try:
+        server = make_server(site_log, int(site_port)).start()
+        info["site_port"] = server.port
+        base = f"http://{host}:{server.port}"
+        info["base_url"] = base + "/"
+        info["start_url"] = base + "/Login.aspx"
+        env = dict(os.environ, PYTHONUNBUFFERED="1")  # mitmdump is killed at the end: keep its log complete
+        with open(mitm_log, "w", encoding="utf-8") as out:
+            recorder = subprocess.Popen(_mitmdump_command(out_json, proxy_port), stdout=out, stderr=subprocess.STDOUT,
+                                        stdin=subprocess.DEVNULL, env=env, creationflags=_NO_WINDOW)
+        _wait_port(proxy_port, 60.0, recorder, "mitmdump")
+        browser = subprocess.Popen(
+            [recbrowser_exe, "--proxy", f"127.0.0.1:{proxy_port}", "--bypass", bypass, "--url", info["start_url"],
+             "--title", title, "--log", host_log],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        info["browser_pid"] = browser.pid
+        info["setup_seconds"] = round(time.monotonic() - started, 3)
+        drv = IEDriver(driver_exe, browser.pid, timeout=timeout)
+        _operate(drv, browser, steps, pending, info, timeout)
+        ok = True
+    except BaseException as exc:
+        try:
+            exc.timings = dict(steps.timings)  # type: ignore[attr-defined]
+            exc.step = steps.current  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        raise
+    finally:
+        for proc in pending:
+            _kill(proc)
+        _kill(browser)       # only when the scenario failed before "close"
+        _kill(recorder)      # the addon rewrites the recording after every response: nothing is lost
+        if server is not None and not (ok and keep_site):
+            server.stop()
+    info["timings"] = dict(steps.timings)
+    info["total_seconds"] = round(time.monotonic() - started, 3)
+    info["site_events"] = [entry.get("event") for entry in read_log(site_log)]
+    if keep_site:
+        info["site_server"] = server
+    return info
+
+
+# ===== former tests/iehost_fixtures/iedriver.py: Python wrapper for IEDriver.exe =====
+# Python wrapper for ``IEDriver.exe`` (source: ``IEDriver.cs`` next to this file) - TEST ONLY.
+#
+# The driver operates the pages inside a running recording browser (``RecBrowser.exe``) the way a
+# user would: it finds the IE engine's documents by window handle (WM_HTML_GETOBJECT) and calls DOM
+# methods on them, so every navigation, popup, POST and dialog is performed by the engine itself and
+# the recorder sees the real browser's HTTP.
+#
+# Usage::
+#
+#     iedriver = <import tests/ie_support.py by path, as tests/test_real_engine.py does>
+#     exe = iedriver.build_driver(str(tmp_path / "bin"))  # compiles once per source hash
+#     drv = iedriver.IEDriver(exe, browser_pid)
+#     drv.wait("/index.html", text="index page")
+#     drv.click("/index.html", id="lnk")                  # target=_blank -> new tab
+#     drv.wait("/settings.html")
+#     proc = drv.click_async("/driver.html", id="modalBtn")   # that click blocks until the modal closes
+#     drv.wait("/drv_modal.html", kind="dialog")
+#     drv.click("/drv_modal.html", id="closeBtn", kind="dialog")
+#     drv.finish(proc)                                    # result of the async click
+#     drv.dialog(title="ファイルのダウンロード", button="キャンセル")
+#     drv.close()                                         # -> {"exited": True, "exitCode": 0, ...}
+#
+# Every method runs the exe once (``subprocess.run`` with a timeout, no console window) and returns
+# the parsed JSON; a failure (exit code 1 or a timeout) raises :class:`IEDriverError` whose ``result``
+# holds the driver's JSON (``{"error": ..., "detail": [...documents or dialogs seen...]}``).
+#
+# Matching: ``url`` is a case-insensitive substring of ``document.URL`` (tabs, dialogs and frames);
+# ``kind="tab"|"dialog"|"frame"`` and ``hwnd=`` narrow it further.  Element commands retry (every
+# 200 ms) until ``timeout`` while the document or the element is not there yet, preferring documents
+# whose readyState is ``complete``.
+#
+# Pitfalls (measured on Windows 11 with the IE7-mode recording browser):
+#
+# * Cost: one call is about 0.2-0.4 s (process start + cross-process COM).  ``IEDriver.cs`` uses plain
+#   IDispatch late binding on purpose; C# ``dynamic`` made every call 3-8x slower (its COM binder
+#   reads the MSHTML type library through cross-process ITypeInfo calls in every new process).
+# * Navigation is asynchronous: ``click`` / ``select`` / ``navigate`` return before the new page is
+#   loaded, and the old document stays ``complete`` (and may still match a broad ``url``) until it
+#   is replaced.  Always ``wait`` for a url substring (or ``text``) that only the new page has, e.g.
+#   ``"kind=b"`` after an autopostback of ``/driver.html``.
+# * Popups: the new tab exists when the click returns (the host answers NewWindow3 synchronously);
+#   ``wait`` for its url.  ``navigate`` and real users type into the *selected* tab, which is the
+#   newest popup.  DOM clicks also work on background (hidden) tabs; the driver never switches tabs.
+# * Modal blocking: ``element.click()`` returns only when its handler returns, i.e. after an
+#   ``alert()`` / ``confirm()`` / ``showModalDialog`` it opened has been closed.  Use
+#   :meth:`IEDriver.click_async`, operate the dialog (``wait(kind="dialog")`` + DOM commands for an
+#   HTML dialog, :meth:`IEDriver.dialog` for a standard box), then :meth:`IEDriver.finish`.  A plain
+#   ``click`` on such a button hangs until the wrapper's timeout (``timeout`` + 15 s), and killing the
+#   driver then leaves the dialog open.  While a modal dialog is up the main window is disabled and
+#   ``navigate`` / ``close`` refuse (a user could not use them either).
+# * Standard dialogs (alert: title 「Web ページからのメッセージ」, button ``OK``; download:
+#   「ファイルのダウンロード」 with 開く(&O) / 保存(&S) / キャンセル) are matched by title / static text /
+#   button text with ``&`` removed; titles and captions follow the Windows display language.  The
+#   download dialog appears 0.3-1.5 s after the click (``dialog`` polls; give it ``timeout=20``).
+# * Focus: nothing needs the foreground.  DOM calls and WM_HTML_GETOBJECT work on background or
+#   hidden windows; ``dialog`` presses buttons with WM_COMMAND/BN_CLICKED posted to the dialog
+#   (``method="bmclick"`` posts BM_CLICK instead, which Windows may ignore for an inactive dialog).
+#   RecBrowser's windows still pop up on screen, and a person clicking in them can interfere.
+# * ``navigate`` sets the text of RecBrowser's address box (its only WinForms EDIT) and sends Enter;
+#   call it when the selected tab is idle (after a ``wait``).  The engine sends no Referer for it,
+#   like a typed address, while link clicks / form posts carry one.
+# * From Git Bash, run the exe with ``MSYS_NO_PATHCONV=1``: otherwise ``--url /index.html`` is
+#   rewritten to a Windows path.  The JSON output is pure ASCII (``\uXXXX``), so console code pages
+#   do not matter.
+#
+# Importing this module has no side effects.
+
+#: C# source of the driver.
+DRIVER_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "IEDriver.cs")
+
+#: Inbox C# 5 compiler (.NET Framework 4.x, 64-bit).
+CSC = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+
+EXE_NAME = "IEDriver.exe"
+HASH_NAME = "IEDriver.cs.sha256"
+
+#: Extra seconds the Python side waits on top of the driver's own ``--timeout`` before killing it.
+_MARGIN = 15.0
+
+
+class IEDriverError(RuntimeError):
+    """The driver reported a failure (or hung).  ``result`` is its JSON (may be ``None``)."""
+
+    def __init__(self, message: str, result: Any = None, argv: Optional[Sequence[str]] = None) -> None:
+        super().__init__(message)
+        self.result = result
+        self.argv = list(argv or [])
+
+
+def build_command(csc: str, source: str, exe: str) -> list[str]:
+    """csc argv: 64-bit console exe.  Microsoft.CSharp / System.Core are referenced so the source may use
+    ``dynamic``; it deliberately does not (too slow cross-process, see the module docstring)."""
+    return [
+        csc, "-nologo", "-target:exe", "-platform:x64", "-optimize+", f"-out:{exe}",
+        "-r:System.Windows.Forms.dll", "-r:Microsoft.CSharp.dll", "-r:System.Core.dll", source,
+    ]
+
+
+def _sha256(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def build_driver(out_dir: str, csc: str = CSC, source: str = DRIVER_SOURCE, force: bool = False) -> str:
+    """Compile ``IEDriver.cs`` into ``<out_dir>/IEDriver.exe`` unless the cached build matches the
+    source's SHA-256 (``<out_dir>/IEDriver.cs.sha256``).  Returns the exe path; raises
+    :class:`IEDriverError` with the compiler output on failure."""
+    os.makedirs(out_dir, exist_ok=True)
+    exe = os.path.join(out_dir, EXE_NAME)
+    hash_file = os.path.join(out_dir, HASH_NAME)
+    digest = _sha256(source)
+    if not force and os.path.isfile(exe) and os.path.isfile(hash_file):
+        with open(hash_file, encoding="utf-8") as fh:
+            if fh.read().strip() == digest:
+                return exe
+    if not os.path.isfile(csc):
+        raise IEDriverError(f"C# compiler not found: {csc}")
+    result = subprocess.run(
+        build_command(csc, source, exe), capture_output=True, text=True, errors="replace",
+        timeout=180, creationflags=_NO_WINDOW,
+    )
+    if result.returncode != 0 or not os.path.isfile(exe):
+        raise IEDriverError(f"IEDriver.cs failed to compile:\n{result.stdout}\n{result.stderr}")
+    with open(hash_file, "w", encoding="utf-8") as fh:
+        fh.write(digest + "\n")
+    return exe
+
+
+def _parse(stdout: str) -> Any:
+    lines = [line for line in (stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        return json.loads(lines[-1])
+    except ValueError:
+        return None
+
+
+def _opts(**kwargs: Any) -> list[str]:
+    """``foo_bar="x"`` -> ``["--foo-bar", "x"]``; ``None`` values are left out."""
+    argv: list[str] = []
+    for key, value in kwargs.items():
+        if value is None:
+            continue
+        argv += ["--" + key.replace("_", "-"), str(value)]
+    return argv
+
+
+class IEDriver:
+    """Drives the recording browser process ``pid`` through ``exe`` (see module docstring)."""
+
+    def __init__(self, exe: str, pid: int, timeout: float = 30.0) -> None:
+        self.exe = exe
+        self.pid = int(pid)
+        self.timeout = float(timeout)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<IEDriver pid={self.pid} exe={self.exe!r}>"
+
+    # ------------------------------------------------------------------ plumbing
+
+    def argv(self, command: str, *extra: str) -> list[str]:
+        return [self.exe, command, "--pid", str(self.pid), *extra]
+
+    def run(self, command: str, *extra: str, timeout: Optional[float] = None, check: bool = True) -> Any:
+        """Run one driver command; returns the parsed JSON (raises :class:`IEDriverError` if ``check``)."""
+        argv = self.argv(command, *extra)
+        limit = (timeout if timeout is not None else self.timeout) + _MARGIN
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, encoding="ascii", errors="replace",
+                timeout=limit, creationflags=_NO_WINDOW, stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            raise IEDriverError(f"IEDriver {command} did not finish within {limit:.0f}s", None, argv) from None
+        result = _parse(proc.stdout)
+        if check and (proc.returncode != 0 or result is None):
+            message = result.get("error") if isinstance(result, dict) else (proc.stdout + proc.stderr).strip()
+            raise IEDriverError(f"IEDriver {command}: {message}", result, argv)
+        return result
+
+    def start(self, command: str, *extra: str) -> subprocess.Popen:
+        """Start a driver command without waiting (see :meth:`click_async` / :meth:`finish`)."""
+        return subprocess.Popen(
+            self.argv(command, *extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, creationflags=_NO_WINDOW,
+        )
+
+    def finish(self, proc: subprocess.Popen, timeout: float = 30.0, check: bool = True) -> Any:
+        """Wait for a command started with :meth:`start` / :meth:`click_async` and return its JSON."""
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise IEDriverError(f"async IEDriver command did not finish within {timeout:.0f}s", None, proc.args) from None
+        stdout = out.decode("ascii", "replace")
+        result = _parse(stdout)
+        if check and (proc.returncode != 0 or result is None):
+            message = result.get("error") if isinstance(result, dict) else (stdout + err.decode("ascii", "replace")).strip()
+            raise IEDriverError(f"IEDriver (async): {message}", result, proc.args)
+        return result
+
+    @staticmethod
+    def _filters(kind: Optional[str], hwnd: Optional[int]) -> list[str]:
+        return _opts(kind=kind, hwnd=hwnd)
+
+    # ------------------------------------------------------------------ commands
+
+    def list(self, url: Optional[str] = None, kind: Optional[str] = None) -> list[dict]:
+        """Every document: ``[{hwnd, kind: tab|dialog|frame, url, title, readyState, visible, ...}]``."""
+        return self.run("list", *_opts(url=url, kind=kind))
+
+    def wait(self, url: str = "", text: Optional[str] = None, timeout: float = 30.0,
+             kind: Optional[str] = None, hwnd: Optional[int] = None) -> dict:
+        """Wait until a document whose url contains ``url`` is complete (and its body contains ``text``)."""
+        return self.run("wait", *_opts(url=url, text=text, timeout=timeout), *self._filters(kind, hwnd), timeout=timeout)
+
+    def value(self, url: str, id: str, value: str, fire: Optional[str] = None,
+              kind: Optional[str] = None, hwnd: Optional[int] = None, timeout: float = 10.0) -> dict:
+        """``element.value = value`` (plain; ``fire="onchange"`` additionally fires that event)."""
+        return self.run("value", *_opts(url=url, id=id, value=value, fire=fire, timeout=timeout),
+                        *self._filters(kind, hwnd), timeout=timeout)
+
+    def select(self, url: str, id: str, text: Optional[str] = None, value: Optional[str] = None,
+               kind: Optional[str] = None, hwnd: Optional[int] = None, timeout: float = 10.0) -> dict:
+        """Select the option with ``text`` (exact, then substring) or ``value`` and fire ``onchange``."""
+        return self.run("select", *_opts(url=url, id=id, text=text, value=value, timeout=timeout),
+                        *self._filters(kind, hwnd), timeout=timeout)
+
+    def _click_args(self, url: str, id: Optional[str], link_text: Optional[str], button_text: Optional[str],
+                    kind: Optional[str], hwnd: Optional[int], timeout: float) -> list[str]:
+        return [*_opts(url=url, id=id, link_text=link_text, button_text=button_text, timeout=timeout),
+                *self._filters(kind, hwnd)]
+
+    def click(self, url: str, id: Optional[str] = None, link_text: Optional[str] = None,
+              button_text: Optional[str] = None, kind: Optional[str] = None, hwnd: Optional[int] = None,
+              timeout: float = 10.0) -> dict:
+        """``element.click()``.  Blocks while the click's handler runs, i.e. until an ``alert`` /
+        ``showModalDialog`` it opens is closed - use :meth:`click_async` for those."""
+        return self.run("click", *self._click_args(url, id, link_text, button_text, kind, hwnd, timeout), timeout=timeout)
+
+    def click_async(self, url: str, id: Optional[str] = None, link_text: Optional[str] = None,
+                    button_text: Optional[str] = None, kind: Optional[str] = None, hwnd: Optional[int] = None,
+                    timeout: float = 10.0) -> subprocess.Popen:
+        """Start a click without waiting; returns the ``Popen`` (collect it with :meth:`finish`)."""
+        return self.start("click", *self._click_args(url, id, link_text, button_text, kind, hwnd, timeout))
+
+    def text(self, url: str = "", id: Optional[str] = None, kind: Optional[str] = None,
+             hwnd: Optional[int] = None, timeout: float = 10.0) -> dict:
+        """``{"text": innerText of the element (or of the body), "doc": {...}}``."""
+        return self.run("text", *_opts(url=url, id=id, timeout=timeout), *self._filters(kind, hwnd), timeout=timeout)
+
+    def attr(self, url: str, id: str, name: str, kind: Optional[str] = None,
+             hwnd: Optional[int] = None, timeout: float = 10.0) -> dict:
+        """``{"name", "value", "source": property|attribute|missing, "element", "doc"}``."""
+        return self.run("attr", *_opts(url=url, id=id, name=name, timeout=timeout),
+                        *self._filters(kind, hwnd), timeout=timeout)
+
+    def dialog(self, title: str = "", button: Optional[str] = None, text: Optional[str] = None,
+               timeout: float = 10.0, method: Optional[str] = None) -> dict:
+        """Find a standard dialog (#32770) of the browser and, with ``button``, press that button."""
+        return self.run("dialog", *_opts(title=title, button=button, text=text, timeout=timeout, method=method),
+                        timeout=timeout)
+
+    def navigate(self, to: str) -> dict:
+        """Type ``to`` into the address box of the selected tab and press Enter (no Referer, like a user)."""
+        return self.run("navigate", *_opts(to=to))
+
+    def close(self, timeout: float = 15.0) -> dict:
+        """WM_CLOSE to the main window; ``{"posted", "exited", "exitCode"}``."""
+        return self.run("close", *_opts(timeout=timeout), timeout=timeout)
+
+
+# ===== command line (the former stand-alone scripts) =====
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    """Command line of the former stand-alone scripts::
+
+        python -I tests/ie_support.py testsite [LOGFILE [PORT]]              # testsite_main
+        python -I tests/ie_support.py factory-site [LOGFILE [PORT [HOST]]]   # factory_site_main
+        python -I tests/ie_support.py iedriver [OUT_DIR]                     # build IEDriver.exe, print its path
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    command = args.pop(0) if args else ""
+    if command == "testsite":
+        testsite_main(args)
+    elif command == "factory-site":
+        factory_site_main(args)
+    elif command == "iedriver":  # pragma: no cover - manual use
+        print(build_driver(args[0] if args else os.path.join(os.getcwd(), "iedriver_bin")))
+    else:
+        print("usage: python -I ie_support.py testsite|factory-site|iedriver [ARGS...]", file=sys.stderr)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

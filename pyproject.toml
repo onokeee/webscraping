@@ -32,14 +32,12 @@ sspi = ["requests-negotiate-sspi>=0.5; sys_platform == 'win32'"]
 dev = ["pytest>=7", "mitmproxy>=10", "lxml>=4.9", "playwright>=1.40", "requests_ntlm>=1.2"]
 
 [project.scripts]
-reqrec = "reqrec.cli:main"
+reqrec = "reqrec:main"
 
-[tool.setuptools.packages.find]
-include = ["reqrec*"]
-
-[tool.setuptools.package-data]
-"reqrec.webapp" = ["templates/*.html", "static/*"]
-"reqrec.iehost" = ["*.cs", "RecBrowser.exe", "RecBrowser.exe.sha256"]
+[tool.setuptools]
+# The whole application is the single module reqrec.py (the GUI page and the recording browser's
+# C# source are embedded in it).
+py-modules = ["reqrec"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

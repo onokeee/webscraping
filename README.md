@@ -96,6 +96,7 @@ GUI を起動しました: http://127.0.0.1:8765  (Ctrl+C で終了)
 - [Edge IE モードで記録する](#edge-ie-モードで記録する)
 - [使い方: inspect → generate → 実行](#使い方-inspect--generate--実行)
 - [ステップの手動選択と「結果にするステップ」](#ステップの手動選択と結果にするステップ)
+- [同梱のサンプルで試す](#同梱のサンプルで試す)
 - [生成コードの読み方](#生成コードの読み方)
 - [依存関係検出の仕組み](#依存関係検出の仕組み)
 - [検出できないケースと対処](#検出できないケースと対処)
@@ -186,7 +187,7 @@ $ pip install "reqrec[sspi]"   # Windows: 今ログインしているユーザ�
 $ pip install "reqrec[ntlm]"   # 他の OS、または別のユーザー名/パスワードで認証する（requests_ntlm）
 ```
 
-インストールすると `reqrec` コマンドが使えるようになります（`python -m reqrec.cli` でも同じです）。
+インストールすると `reqrec` コマンドが使えるようになります（`python -m reqrec` でも同じです）。
 
 ```console
 $ reqrec --version
@@ -195,7 +196,11 @@ $ reqrec -h
 ```
 
 > Windows で `reqrec` が見つからない場合は、Python のインストール時に「Add python.exe to PATH」を付けていないか、
-> `Scripts` フォルダが PATH にありません。`python -m reqrec.cli gui` のように起動すれば PATH に関係なく動きます。
+> `Scripts` フォルダが PATH にありません。`python -m reqrec gui` のように起動すれば PATH に関係なく動きます。
+
+reqrec の本体は `reqrec.py` 1 ファイルなので、pip でインストールせずに、必要なライブラリ（`requests` /
+`beautifulsoup4` / `flask`、記録には `mitmproxy`）を入れた Python のフォルダ（`python.exe` のあるフォルダ）に
+`reqrec.py` を置いて `python -m reqrec gui` で使うこともできます（[Windows での配布と exe 化](#windows-での配布と-exe-化)）。
 
 ## 記録方法（3 通り）
 
@@ -408,7 +413,7 @@ Windows の設定や証明書は変更しません。裏側では次のことを
 ### 記録用ブラウザ（IE エンジン）
 
 かんたん画面と、詳細設定の「1 記録」で記録方式に「アプリ内の記録用ブラウザで開く」を選んだときに使われる、
-reqrec 専用の小さなブラウザです（`reqrec/iehost/RecBrowser.cs`。初回起動時に Windows 標準の
+reqrec 専用の小さなブラウザです（C# のソースは `reqrec.py` に埋め込み済み。初回起動時に Windows 標準の
 `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe` で作業フォルダの `bin\RecBrowser.exe` にコンパイルされ、
 reqrec を更新したときだけ作り直されます）。
 
@@ -689,7 +694,7 @@ WebForms のページは、ボタンを押すたびに同じ URL に `__VIEWSTAT
 `<a href>` から抽出されます。
 
 同梱のサンプル `tests/fixtures/legacy_webforms_ntlm.har`（NTLM + Shift_JIS + WebForms）で動きを確認できます
-（[examples/README.md](examples/README.md)）。
+（[同梱のサンプルで試す](#同梱のサンプルで試す)）。
 
 ## 使い方: inspect → generate → 実行
 
@@ -790,7 +795,8 @@ $ REQREC_PASSWORD='本物のパスワード' python scrape.py
 PS> $env:REQREC_PASSWORD='本物のパスワード'; python scrape.py
 
 # Windows (cmd)
-> set REQREC_PASSWORD=本物のパスワード && python scrape.py
+> set "REQREC_PASSWORD=本物のパスワード" && python scrape.py
+（cmd では `set X=値 && …` と書くと値の末尾に空白が入り、ログインに失敗します。上のように引用符で囲んでください）
 ```
 
 - パスワード・API キーなど「秘密情報らしい名前」のパラメータは、`REQREC_<大文字の名前>` という環境変数から読まれます。
@@ -824,10 +830,52 @@ PS> $env:REQREC_PASSWORD='本物のパスワード'; python scrape.py
   最後のステップが使われます。
 - GUI では表を変更すると即座に再計算され、「解析結果 → 結果にするステップ」に反映されます。
 
+## 同梱のサンプルで試す
+
+`tests/fixtures/` には、実際のブラウザが出力する形に合わせて手書きした HAR が入っています。サイトに一切アクセスせずに、
+GUI（「2 読み込み」でファイルを選ぶ）でも CLI でも同じファイルで reqrec の動きを確認できます。
+
+| ファイル | 内容 |
+|---|---|
+| `tests/fixtures/login_flow_chrome.har` | Chrome 風。ログインページ → CSRF トークン付き POST → リダイレクト → Bearer トークン付き JSON API → ページ送り（page=1..3）→ CSV ダウンロード。静的ファイル・トラッカー・CORS preflight などのノイズ入り |
+| `tests/fixtures/api_firefox.har` | Firefox 風。JSON でログインしてアクセストークンを受け取り、API を呼ぶ SPA |
+| `tests/fixtures/legacy_webforms_ntlm.har` | **Edge IE モード風**の社内サイト（`http://intra.example.local/`）。統合 Windows 認証（NTLM の 401 → 401 → 200）、charset なしの Shift_JIS な ASP.NET WebForms ページ（`__VIEWSTATE` / `__EVENTVALIDATION`）、Shift_JIS で URL エンコードされた検索 POST、`Report.aspx?id=1234`、CSV エクスポート、捨てられる `WebResource.axd` |
+
+**`login_flow_chrome.har`** — `reqrec inspect` の結果は[「使い方」の例](#使い方-inspect--generate--実行)と同じです
+（フロー 14 件 → ステップ 5 件 / 除外 6 件）。GUI の「3 ステップ」の表では、`/static/logo.png`・`ads.tracker.example.test`・
+`OPTIONS` の行が灰色（除外）になり、`/login` → `/dashboard` のリダイレクトは同じステップ番号 2 にまとまります。
+`https://api.example.test/v1/me` の行の「採用」を外すとステップが 4 件になり、`/v1/orgs/77/items?page=1` の行の「結果」を
+選ぶと、生成コードが最後に表示するものがその一覧 JSON（ループなので 3 ページ分）に変わります。CLI では次のとおりです。
+
+```console
+$ reqrec inspect  tests/fixtures/login_flow_chrome.har --exclude-step 3       # /v1/me を外す（"excluded by user"）
+$ reqrec inspect  tests/fixtures/login_flow_chrome.har --include-flow f0002   # 除外された静的ファイル 1 件を採用する
+$ reqrec generate tests/fixtures/login_flow_chrome.har -o scrape_example.py --final-step 4   # 一覧 JSON を結果にする
+```
+
+**`legacy_webforms_ntlm.har`** — `reqrec inspect` と `reqrec generate … -o legacy_example.py --legacy-tls` で確かめられること:
+
+- `Default.aspx` への 3 回の `GET`（401, 401, 200）が 1 ステップ（FLOW `f0001+f0002+f0003`、STATUS `401→401→200`）に
+  まとまり、`認証: NTLM (記録時のユーザー: EXAMPLE\taro) → 生成コードは session.auth を設定します…` と表示される。
+  ステップのヘッダに `Authorization` は残らない。
+- ステップは 4 件（`GET Default.aspx` → 検索の `POST Default.aspx` → `GET Report.aspx?id=1234` → CSV エクスポート）。
+  `__VIEWSTATE` / `__VIEWSTATEGENERATOR` / `__EVENTVALIDATION` は直前のページの `html_input` から、`Report.aspx` の `id` は
+  検索結果の `<a href>` から抽出される。`WebResource.axd`（JavaScript）は静的ファイルとして除外される。
+- Shift_JIS で URL エンコードされた検索語（`ctl00$txtKeyword=%93%FA%96%7B`）は警告が出て、生成コードでは
+  `b'\x93\xfa\x96{'  # cp932 で「日本」` のようにバイト列のまま残る。
+- 生成コードの `main()` 冒頭に `requests_negotiate_sspi` / `requests_ntlm` を使う `session.auth` の設定が入り、
+  `--legacy-tls`（GUI ではフィルタ設定のチェック）を付けると `_LegacyTLSAdapter` も加わる。
+
+サンプルのホスト（`shop.example.test` / `api.example.test` / `intra.example.local`）は架空なので、生成したスクリプトを
+実行しても接続エラー（`ConnectionError`）で終わります（GUI の「5 実行」では「エラー終了」になります）。生成コードを
+手で直すときの参考には、`login_flow_chrome.har` から生成されるものと同じ構成で**手書き**した
+[`tests/fixtures/example_scrape.py`](tests/fixtures/example_scrape.py) があります（コメントや細部の文言は実際の出力と
+異なります。読み方は次の「生成コードの読み方」）。
+
 ## 生成コードの読み方
 
-生成されるスクリプトの構成はいつも同じです（下は[同梱サンプル](examples/README.md)から生成したものを短くした**例**。
-完全版は [`examples/example_scrape.py`](examples/example_scrape.py)）。
+生成されるスクリプトの構成はいつも同じです（下は[同梱サンプル](#同梱のサンプルで試す)から生成したものを短くした**例**。
+同じ構成で手書きした完全版は [`tests/fixtures/example_scrape.py`](tests/fixtures/example_scrape.py)）。
 
 ```python
 """reqrec が HTTP 通信の記録から自動生成したスクレイピングスクリプト
@@ -1107,6 +1155,16 @@ HTML・JSON・XML・テキスト・リダイレクト・ダウンロード（CSV
 | `--workdir DIR` | 作業フォルダ（`recordings/` `uploads/` `scripts/` `outputs/` が作られる） | `./reqrec_work` |
 | `--no-browser` | ブラウザを自動で開かない | 開く |
 
+### `browser`
+
+記録用ブラウザ（`RecBrowser.exe`、Windows）を `reqrec.py` と同じフォルダ（配布フォルダ）に事前に作成します
+（[Windows での配布と exe 化](#windows-での配布と-exe-化)を参照）。
+
+| コマンド | 意味 |
+|---|---|
+| `reqrec browser build` | 記録用ブラウザ（32 ビット版）と `RecBrowser.exe.sha256` を `reqrec.py` と同じフォルダに作成する（csc.exe が必要） |
+| `reqrec browser status` | このバージョン用の記録用ブラウザが作成済みか表示する |
+
 ### 終了コード
 
 `0` 正常終了 / `1` 実行時エラー（ファイルがない、形式が未対応、mitmproxy 未インストール、GUI のポートが使用中など。`エラー: …` を表示）/
@@ -1114,28 +1172,47 @@ HTML・JSON・XML・テキスト・リダイレクト・ダウンロード（CSV
 
 ## Windows での配布と exe 化
 
-**記録用ブラウザの事前ビルド（IT 担当向け・推奨）**
+配るものは **`reqrec.py` 1 ファイル**だけです（GUI の画面と記録用ブラウザのソースもこの中に入っています）。
+必要なライブラリ（`requests` / `beautifulsoup4` / `flask`、記録には `mitmproxy`）を入れた Python で動かします。
+置き方は次の 2 通りです。
 
-記録用ブラウザ（`RecBrowser.exe`）は、何もしなければ各 PC の作業フォルダ（ユーザーのフォルダの下）で初回に
-コンパイルされます。工場の PC では、ユーザーのフォルダにある実行ファイルの起動がセキュリティ設定（AppLocker
-など）で禁止されていることがあるため、配布フォルダを作るときに一度だけ次を実行してください。
+**ポータブル Python のフォルダに置く（pip install 不要）**
 
-```bat
-python -m reqrec.iehost build
-```
+フォルダごとコピーして使う Python（ポータブル Python。python.org のインストーラで入れた Python 3.10 以上の
+フォルダをコピーしたものなど）を、各 PC や共有フォルダに配る場合です。
 
-reqrec のフォルダ（`reqrec\iehost\`）に `RecBrowser.exe` と `RecBrowser.exe.sha256` ができ、各 PC はそれを
-その場所から直接起動します（ユーザーのフォルダには何も作りません）。セキュリティ設定では、この配布フォルダの
-実行だけを許可すれば足ります。reqrec を更新したら同じコマンドで作り直してください（古いままだと、各 PC の
-作業フォルダでのコンパイルに戻ります）。`python -m reqrec.iehost status` で作成済みか確認できます。
-記録用ブラウザは常に 32 ビット版で作られます（IE モードと同じく、古い社内サイトの 32 ビット ActiveX 部品を読み込めるように）。
+1. ポータブル Python に必要なライブラリを入れます（インターネットにつながる PC で一度だけ。`python.exe` のある
+   フォルダで実行します）。
+   ```bat
+   .\python.exe -m pip install requests beautifulsoup4 flask mitmproxy
+   ```
+   統合 Windows 認証のサイトを再現するスクリプトもこの Python で動かすなら、`requests-negotiate-sspi` も加えます。
+2. `reqrec.py` を **`python.exe` と同じフォルダ**に置きます。このフォルダは Python がモジュールを探す場所に
+   入っているので、どのフォルダからでも次のように起動できます（`reqrec` コマンドは作られないので、ほかのコマンドも
+   `python.exe -m reqrec inspect rec.har` のように書きます）。
+   ```bat
+   C:\tools\python\python.exe -m reqrec gui
+   ```
+   デスクトップにショートカットを作り、リンク先をこのコマンドにしておくと、ダブルクリックで GUI が起動します。
+3. 記録用ブラウザを事前に作成する（下の「記録用ブラウザの事前ビルド」）なら、`python.exe -m reqrec browser build`
+   を実行します。`RecBrowser.exe` は `reqrec.py` と同じこのフォルダにできます。
+4. 利用者がこのフォルダに書き込めない場合（共有フォルダや `C:\Program Files` の下に置くときなど）は、`reqrec.py` を
+   置いたあとに `python.exe` のあるフォルダで一度だけ次を実行します。`reqrec.py` を Python が読み込める形に変換した
+   ファイルが `__pycache__` フォルダにでき、起動と記録の開始がそれぞれ約 0.5 秒速くなります（書き込めるフォルダなら、
+   初回の起動で自動的にできるので不要です）。
+   ```bat
+   .\python.exe -m compileall reqrec.py
+   ```
 
+reqrec を更新するときは `reqrec.py` を置き換え、記録用ブラウザを作成していたら `browser build` も、
+手順 4 を行っていたら `compileall` もやり直します。
 
-**Python を入れて使う（推奨）**
+**pip でインストールする**
 
 1. [python.org](https://www.python.org/downloads/windows/) のインストーラで Python 3.10 以上を入れる
    （「Add python.exe to PATH」にチェック）。
-2. reqrec のフォルダ（または wheel ファイル）をコピーし、コマンド プロンプトで
+2. reqrec のフォルダ（`reqrec.py`・`pyproject.toml`・`README.md` があるフォルダ）または wheel ファイルをコピーし、
+   コマンド プロンプトで
    ```bat
    cd reqrec
    pip install ".[record]"
@@ -1145,6 +1222,29 @@ reqrec のフォルダ（`reqrec\iehost\`）に `RecBrowser.exe` と `RecBrowser
    `pip install reqrec-0.1.0-py3-none-any.whl mitmproxy` としてもらう方法もあります。
 3. 統合 Windows 認証のサイトを再現するスクリプトを動かす PC には `pip install "reqrec[sspi]"` も入れます。
 
+`reqrec.py` は Python の `site-packages` フォルダに入ります（`pip install -e .` のときは元のフォルダのまま）。
+wheel（`pip install .` も中で wheel を作ります）には記録用ブラウザ（exe）を入れられないので、事前に作成するなら、
+インストールした PC で `reqrec browser build` を実行します。
+
+**記録用ブラウザの事前ビルド（IT 担当向け・推奨）**
+
+記録用ブラウザ（`RecBrowser.exe`）は、何もしなければ各 PC の作業フォルダ（ユーザーのフォルダの下）で初回に
+コンパイルされます。工場の PC では、ユーザーのフォルダにある実行ファイルの起動がセキュリティ設定（AppLocker
+など）で禁止されていることがあるため、配布フォルダを作るときに一度だけ次を実行してください
+（`reqrec` コマンドがないとき — ポータブル Python や、PATH にないとき — は `python -m reqrec browser build`）。
+
+```bat
+reqrec browser build
+```
+
+`reqrec.py` と同じフォルダ（ポータブル Python なら `python.exe` のフォルダ、pip でインストールしたなら `site-packages`。
+作成した場所は実行結果に表示されます）に `RecBrowser.exe` と `RecBrowser.exe.sha256` ができ、各 PC はそれを
+その場所から直接起動します（ユーザーのフォルダには何も作りません）。セキュリティ設定では、この配布フォルダの
+実行だけを許可すれば足ります。reqrec を更新したら同じコマンドで作り直してください（古いままだと、各 PC の
+作業フォルダでのコンパイルに戻ります）。`reqrec browser status`（`python -m reqrec browser status`）で
+作成済みか確認できます。
+記録用ブラウザは常に 32 ビット版で作られます（IE モードと同じく、古い社内サイトの 32 ビット ActiveX 部品を読み込めるように）。
+
 **exe 化（PyInstaller）— 未検証**
 
 Python を入れられない PC に配りたい場合は PyInstaller で単一の exe にする方法が考えられます。
@@ -1153,12 +1253,11 @@ hidden import の追加や exe サイズ（数百 MB）、ウイルス対策ソ�
 
 ```bat
 pip install pyinstaller
-pyinstaller --onefile --name reqrec --collect-all reqrec --collect-all mitmproxy -m reqrec.cli
+pyinstaller --onefile --name reqrec --collect-all mitmproxy reqrec.py
 ```
 
-（`-m` が使えない PyInstaller のバージョンでは、`from reqrec.cli import main; raise SystemExit(main())` と書いた
-`reqrec_launcher.py` を作り、それを `pyinstaller --onefile --name reqrec --collect-all reqrec --collect-all mitmproxy reqrec_launcher.py`
-のように渡します。こちらも未検証です。）出来上がった `reqrec.exe gui` で GUI が起動するか、記録（mitmproxy の起動）が
+（`reqrec.py` はそのままスクリプトとして実行でき、GUI の画面と記録用ブラウザのソースも埋め込まれているので、
+追加のデータファイルはありません。）出来上がった `reqrec.exe gui` で GUI が起動するか、記録（mitmproxy の起動）が
 できるかを、配布前に必ず確認してください。
 
 ## 法的・倫理的な注意
@@ -1284,9 +1383,12 @@ Firefox は OS とは別に証明書をインポートします。証明書フ�
 **Q. かんたん画面に「記録用ブラウザ (IE エンジン): 準備できていません」と出る / 記録用ブラウザが開かない。**
 
 - 「コンパイラ (csc.exe) が見つかりません」→ Windows 標準の .NET Framework 4.x（`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`）
-  がない PC です。管理者に「.NET Framework 4.8 の機能を有効にしてほしい」と伝えるか、別の PC で作られた
-  `RecBrowser.exe` を `reqrec/iehost/` フォルダ（ソースの隣）に置くと、コンパイルせずに使えます。
-  それまでは、かんたん画面が自動で切り替わる従来の Edge + システムプロキシの方法で記録できます。
+  がない PC です。管理者に「.NET Framework 4.8 の機能を有効にしてほしい」と伝えるか、別の PC で
+  `reqrec browser build` を実行してできた `RecBrowser.exe` と `RecBrowser.exe.sha256` を、この PC の
+  `reqrec.py` と同じフォルダに置くと、コンパイルせずに使えます。
+  それまでは、かんたん画面からは記録できません（Windows の設定を勝手に変えないため）。どうしても必要なときは、
+  [詳細設定を表示] → 1 記録 で記録方式「自分でブラウザを設定する (システムプロキシ / Edge)」を選んでください
+  （記録中だけプロキシ設定を変更し、https のサイトには証明書の登録が必要です）。
 - 「記録用ブラウザの作成 (コンパイル) に失敗しました」→ メッセージにコンパイラの出力が続きます。古い記録用ブラウザが
   開いたままだと上書きできないので、閉じてからもう一度 [記録をはじめる] を押してください。
 - 記録用ブラウザは開いたが件数が増えない → `https://` のページは記録されません（`http://` のページだけ）。
@@ -1315,34 +1417,113 @@ reqrec では対処できません。アプリ内の Web ページや、同じ�
 
 ```console
 $ pip install -e ".[dev]"
-$ python -m playwright install chromium   # GUI のブラウザテスト用（任意。無ければそのテストはスキップされる）
-$ python3 -m pytest                       # すべてのテスト
-$ python3 -m pytest tests/test_cli.py -q
-$ python3 -m pytest tests/test_webapp.py tests/test_webapp_browser.py -q
 ```
 
-- **モジュール構成と各モジュールの契約は [`DESIGN.md`](DESIGN.md)** にまとまっています（§1〜§12 が v0.1 の CLI パイプライン、
-  **§13 が GUI / IE モード / 複数記録の結合**）。`reqrec/model.py`（データ型）と `reqrec/util.py`（共通ヘルパー）がすべての基盤です。
-- パイプライン: `importers/`（HAR・mitmproxy → `Recording`、`load_recordings` で複数ファイルを結合）→ `filters.py`
-  （ノイズ除去・手動の採用/除外・認証ハンドシェイク統合・リダイレクト統合・Cookie 分類）→ `loops.py`（ループ検出）→
-  `deps.py`（依存関係検出）→ `plan.py`（`Plan` 構築、「結果にするステップ」）→ `codegen.py`（コード生成、`session.auth` /
-  `VERIFY_TLS` / レガシー TLS / 文字コード）→ `cli.py`。
-- GUI: `webapp/`（`create_app` / `run_gui`、`routes.py` の JSON API、`state.py` のプロセス内状態、`templates/index.html` と
-  `static/app.js` / `app.css`。外部 CDN を使わないのでオフラインで動く）、`recorder/manager.py`（mitmdump 子プロセスの管理）、
-  `winsupport.py`（Windows のシステムプロキシ・`certutil`。`winreg` / `subprocess` を注入してテストする）。
-- テスト: `tests/fixtures/*.har` は手書きの現実的な HAR（`legacy_webforms_ntlm.har` は NTLM + Shift_JIS + WebForms の
-  IE モード風記録）、`tests/e2e/` はローカル HTTP サーバーに対して「記録 → 生成 → 生成コードをサブプロセスで実行」まで通す
-  エンドツーエンドテスト、`tests/test_webapp.py` は Flask のテストクライアントで全エンドポイントとトークン / Host / Origin /
-  パストラバーサルの拒否を検証、`tests/test_webapp_browser.py` は **Playwright（Chromium）で実際に GUI を操作**する
-  テストです（HAR をアップロード → 表を待つ → チェックを外して再計算 → 結果を選ぶ → 生成 → 保存。Chromium が無い
-  環境では自動でスキップ。バイナリの場所は環境変数 `REQREC_CHROMIUM` で指定可）。`tests/e2e/test_gui_recording.py` は
-  **本物の `mitmdump`** を GUI の記録機能から起動し、ローカルサイトをプロキシ経由で操作して「記録停止して読み込む →
-  ステップ表 → 生成 → 実行」まで通します（mitmproxy が無い環境ではスキップ）。`tests/test_integration.py` は同梱 HAR
-  （IE モード風の `legacy_webforms_ntlm.har`、複数ファイルの結合、手動の取捨選択）を解析・生成し、生成コードを偽サイトに
-  対して実行します。
+リポジトリにあるのは `reqrec.py`（アプリ本体）、`pyproject.toml`、`README.md`、`DESIGN.md`、`.gitignore` と
+`tests/` だけです。
+
+### `reqrec.py` の構成（アプリ本体は 1 ファイル）
+
+アプリ本体は **`reqrec.py` 1 ファイルだけ**です（GUI の画面 `GUI_HTML` と、記録用ブラウザの C# ソース
+`RECBROWSER_CS` も文字列としてこの中に入っています）。ほかにできるのは、実行時の `__pycache__` と、
+`reqrec browser build` で作る `RecBrowser.exe` / `RecBrowser.exe.sha256`（`reqrec.py` の隣）だけで、どちらも git には入れません。
+
+- `reqrec ...` / `python -m reqrec ...` / `python reqrec.py ...` … コマンド（`record` / `import` / `inspect` / `generate` / `gui` / `browser build|status`）
+- `mitmdump -s reqrec.py` … 記録用プロキシは**このファイル自体**をアドオンとして読み込みます（`reqrec record` / GUI が起動）
+- `import reqrec` … ライブラリとして使う（`load_recording` / `build_plan` / `generate` / `create_app` など）
+
+中は元のモジュールごとの区切り（見出し `# ===== former reqrec/xxx.py: … =====`。エディタでこの見出しを検索すると
+目的の部分に移動できます）が、次の順に並んでいます。
+
+| 区切り（見出し） | 中身 |
+|---|---|
+| 先頭（最初の見出しより前） | docstring、import、`__version__`、公開する名前の一覧 `__all__`（区切りごと）、`mitmdump -s` で読み込まれたとき用の `_register_script_module()` |
+| `core`（`former reqrec/core.py`） | データ型（`Recording` / `Flow` / `Plan` / `PlanOptions` など）と共通ヘルパー。すべての基盤 |
+| `importers`（`former reqrec/importers.py`） | HAR・mitmproxy ファイル → `Recording`。`load_recordings` で複数ファイルを時刻順に結合 |
+| `analysis`（`former reqrec/analysis.py`） | 解析: ノイズ除去・手動の採用/除外・認証ハンドシェイク統合・リダイレクト統合・Cookie 分類 → 依存関係検出 → ループ検出 → `Plan` の構築（`build_plan`、「結果にするステップ」） |
+| `codegen`（`former reqrec/codegen.py`） | `Plan` → Python スクリプト（`session.auth` / `VERIFY_TLS` / レガシー TLS / 文字コード / ダウンロードの保存） |
+| `recorder`（`former reqrec/recorder.py`） | プロキシ記録: mitmproxy アドオン（`addons`）、`mitmdump` の起動（`reqrec record`）、GUI 用の子プロセス管理 |
+| `iehost`（`former reqrec/iehost.py`） | 記録用ブラウザのビルド・起動・表示モード（名前空間 `iehost`: `iehost.launch(...)` など） |
+| `RECBROWSER_CS`（`former reqrec/RecBrowser.cs`） | 記録用ブラウザ本体の C# ソース（文字列。コンパイルするときだけ作業フォルダの `bin\RecBrowser.cs` に書き出す） |
+| `gui`（`former reqrec/gui.py`） | GUI（Flask）: `create_app` / `run_gui`、JSON API、プロセス内の状態、ブラウザ / フォルダを開く処理、Windows のシステムプロキシ・`certutil`（`winreg` / `subprocess` を注入してテストする） |
+| `GUI_HTML`（`former reqrec/gui.html`） | GUI の画面。CSS と JavaScript を埋め込んだ Jinja テンプレートの文字列（外部 CDN を使わないのでオフラインで動く） |
+| `cli`（`former reqrec/cli.py`） | `reqrec` コマンド（argparse。`record` / `import` / `inspect` / `generate` / `gui` / `browser`） |
+| 最後（`entry point: main()`） | `main()` と、`python -m reqrec` / `python reqrec.py` で動かすときの `if __name__ == "__main__":` |
+
+- 1 つのファイルなので、どの名前も 1 回しか定義されていません。元のモジュール同士で名前がぶつかったものは
+  区切りの名前を付けて区別しています（例: CLI 用の `cli_normalise_flow_id`、GUI 用の `_gui_to_int`）。一覧は
+  [`DESIGN.md`](DESIGN.md) 先頭の「Module layout」にあります。
+- **各部分の契約と設計の経緯は [`DESIGN.md`](DESIGN.md)** にまとまっています（§1〜§12 が v0.1 の CLI パイプライン、
+  **§13 が GUI / IE モード / 複数記録の結合**）。DESIGN.md の経緯の部分は統合前のモジュール名（`filters.py`、
+  `webapp/routes.py` など）で書かれていて、先頭の「Module layout」の表で今の区切りとの対応が分かります。
 - 生成コードに記録由来の文字列を埋め込むときは**必ず `repr()` / `json.dumps()`** を通します
   （記録内容は攻撃者が制御し得る入力なので、文字列連結でソースに混ぜてはいけません）。GUI も同じ理由で、記録内容は
   `textContent` でのみ描画します。
+
+### 埋め込みの HTML / C# を直す（`GUI_HTML` / `RECBROWSER_CS`）
+
+GUI の画面と記録用ブラウザの C# ソースは、別のファイルではなく `reqrec.py` の中の文字列です。`reqrec.py` で
+`GUI_HTML = r'''` または `RECBROWSER_CS = r'''` を検索し、次の `'''` までをそのまま書き換えます。
+
+- どちらも raw 文字列（`r'''…'''`）なので、元のファイルと同じ書き方のままで構いません（`\n` や `\\` は書いたとおりに
+  HTML / C# に渡ります）。書いてはいけないのは `'''`（シングルクォート 3 つ。そこで文字列が終わってしまいます）と、
+  最後の `'''` の直前の `\` だけです。
+- **`GUI_HTML`** は Jinja テンプレートです。CSS と JavaScript は `{% raw %}` 〜 `{% endraw %}` の中にあるので、
+  `{{ }}` を気にせずに書けます（サーバーから値を渡すのは raw の外にある `{{ token }}` などだけです）。変更は
+  `reqrec gui` を起動し直してからページを再読み込みすると反映されます。
+- **`RECBROWSER_CS`** は C# 5 で書きます（Windows 標準の .NET Framework 4.x の `csc.exe` でコンパイルするため）。
+  `reqrec gui` を起動し直すと、次に記録用ブラウザを開いたときにソースの変更を検出して、作業フォルダの
+  `bin\RecBrowser.exe` を自動で作り直します（コンパイルに失敗したときはコンパイラの出力が画面に表示されます）。
+  `reqrec browser build` で作成した exe はソースと合わなくなって使われなくなるので、作り直してください。
+- 直したら次のテストで確かめます。
+
+  ```console
+  $ python -m pytest tests/test_gui.py tests/test_gui_browser.py   # GUI_HTML（後者は Chromium が必要。REQREC_CHROMIUM で指定可）
+  $ python -m pytest tests/test_iehost.py                          # 記録用ブラウザのビルド・起動のロジック
+  > set REQREC_IEHOST_TESTS=1
+  > python -m pytest tests/test_real_engine.py                     # Windows: RECBROWSER_CS を実際にコンパイルして動かす
+  ```
+
+### テスト
+
+```console
+$ python -m playwright install chromium   # GUI のブラウザテスト用（任意。無ければそのテストはスキップされる）
+$ python -m pytest                        # tests/ にまとめたテストをすべて実行
+$ python -m pytest -k "<キーワード>"       # テスト名で絞り込んで実行
+```
+
+テストは `tests/` にまとめてあります。`reqrec.py` の区切り（元のモジュール）ごとの単体テストのほか、手書きの HAR（`tests/fixtures/`）を解析・生成して
+偽サイトに対して実行する結合テスト、ローカル HTTP サーバーに対して「記録 → 生成 → 生成コードをサブプロセスで実行」まで
+通すエンドツーエンドテスト、Flask のテストクライアントで全エンドポイントとトークン / Host / Origin / パストラバーサルの
+拒否を確かめるテストがあります。環境によっては次のテストが自動でスキップされます。
+
+- **本物の `mitmdump`** を使うテスト — mitmproxy が無いとき（GUI の記録機能から起動してローカルサイトを記録するテストは
+  Windows でもスキップされます）。
+- **Playwright で実際に GUI を操作する**テスト — Chromium が無いとき。ブラウザの場所は環境変数 `REQREC_CHROMIUM` で
+  指定できます（Windows なら Edge の `msedge.exe` でも動きます）。
+- **本物の記録用ブラウザ（IE エンジン）**を使うテスト — Windows で環境変数 `REQREC_IEHOST_TESTS=1` を設定したときだけ
+  動きます（小さなブラウザの窓が短時間開きます）。
+
+`tests/` のファイル（サブフォルダは HAR などのデータを置く `tests/fixtures/` だけ。複数をまとめたファイルは
+`# ===== former tests/xxx.py` の見出しで元のファイルごとに区切ってあります）:
+
+| ファイル | 中身 |
+|---|---|
+| `test_core.py` | 取り込み（HAR / mitmproxy）と複数記録の結合 |
+| `test_analysis.py` | 解析（ノイズ除去・依存関係・ループ・`Plan`・手動の採用/除外・認証ハンドシェイク） |
+| `test_codegen.py` | コード生成（生成コードをモックの通信で実際に実行する） |
+| `test_cli.py` / `test_recorder.py` / `test_iehost.py` | CLI / プロキシ記録 / 記録用ブラウザのビルド・起動（偽物を注入したロジック） |
+| `test_gui.py` | GUI の全エンドポイント・かんたんモード・Windows のプロキシ / 証明書処理 |
+| `test_gui_browser.py` | Playwright で GUI を実際に操作する |
+| `test_integration.py` | 結合・エンドツーエンド（ローカル HTTP サーバーで記録 → 生成 → 実行） |
+| `test_real_engine.py` | 本物の記録用ブラウザ・IE ドライバーを使うテスト（大半は `REQREC_IEHOST_TESTS=1` のときだけ） |
+| `support.py` / `ie_support.py` / `IEDriver.cs` | テスト用の部品（モックの通信・ローカルサーバー・テストサイト・外部ドライバー） |
+
+```console
+$ python -m pytest --ignore=tests/test_gui_browser.py   # GUI をブラウザで操作するテストを除いて速く回す
+> set REQREC_IEHOST_TESTS=1
+> python -m pytest tests/test_real_engine.py            # Windows: 本物の記録用ブラウザのテストも動かす
+```
 
 ## ライセンス
 

@@ -14,6 +14,6 @@ venv/
 .claude/
 /reqrec_work/
 
-# 記録用ブラウザの事前ビルド（python -m reqrec.iehost build）
-reqrec/iehost/RecBrowser.exe
-reqrec/iehost/RecBrowser.exe.sha256
+# 記録用ブラウザの事前ビルド（reqrec browser build。reqrec.py と同じフォルダにできる）
+/RecBrowser.exe
+/RecBrowser.exe.sha256

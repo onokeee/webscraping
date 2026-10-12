@@ -1,5 +1,6 @@
-"""Tests for reqrec.iehost with fake csc / popen / taskkill / winreg (pure logic, runs on every OS).
-Contract: DESIGN.md §13.12.  Nothing here compiles, starts a process or touches the registry."""
+"""Tests for the iehost section of reqrec.py (namespace ``reqrec.iehost``) with fake csc / popen /
+taskkill / winreg (pure logic, runs on every OS).  Contract: DESIGN.md §13.12.  Nothing here compiles,
+starts a process or touches the registry."""
 
 from __future__ import annotations
 
@@ -12,26 +13,25 @@ from types import SimpleNamespace
 
 import pytest
 
-from reqrec import iehost
-from reqrec.iehost import (
-    EMULATION_LEVELS,
-    EXE_NAME,
-    FEATURE_BROWSER_EMULATION_KEY,
-    HASH_NAME,
-    SOURCE_PATH,
-    BrowserProcess,
-    IEHostError,
-    availability,
-    build_command,
-    csc_path,
-    ensure_built,
-    exe_path,
-    get_emulation,
-    is_available,
-    launch,
-    resolve_emulation,
-    set_emulation,
-)
+import reqrec
+from reqrec import BrowserProcess, IEHostError, iehost
+
+# the former module's names, taken from the ``iehost`` namespace (the functions look each other up
+# through ``iehost.``, so monkeypatching ``iehost.<name>`` still reaches them)
+EMULATION_LEVELS = iehost.EMULATION_LEVELS
+EXE_NAME = iehost.EXE_NAME
+FEATURE_BROWSER_EMULATION_KEY = iehost.FEATURE_BROWSER_EMULATION_KEY
+HASH_NAME = iehost.HASH_NAME
+availability = iehost.availability
+build_command = iehost.build_command
+csc_path = iehost.csc_path
+ensure_built = iehost.ensure_built
+exe_path = iehost.exe_path
+get_emulation = iehost.get_emulation
+is_available = iehost.is_available
+launch = iehost.launch
+resolve_emulation = iehost.resolve_emulation
+set_emulation = iehost.set_emulation
 
 CSC64 = os.path.join(r"C:\Windows", "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe")
 CSC32 = os.path.join(r"C:\Windows", "Microsoft.NET", "Framework", "v4.0.30319", "csc.exe")
@@ -201,13 +201,14 @@ class FakeWinreg:
 
 
 @pytest.fixture
-def fake_source(tmp_path):
-    """A temporary stand-in for RecBrowser.cs (the real one may not exist yet / must not be compiled)."""
+def fake_source(tmp_path, monkeypatch):
+    """A stand-in for the embedded C# source ``RECBROWSER_CS`` (the real one must not be compiled here),
+    as text.  The distribution folder of a prebuilt exe (``iehost.SHIPPED_DIR``, next to reqrec.py) is
+    redirected to an empty temporary folder, so a real prebuilt exe never takes part."""
     src_dir = tmp_path / "pkg"
     src_dir.mkdir()
-    src = src_dir / "RecBrowser.cs"
-    src.write_text("// fake C# source v1\nclass P { static void Main() {} }\n", encoding="utf-8")
-    return str(src)
+    monkeypatch.setattr(iehost, "SHIPPED_DIR", str(src_dir))
+    return "// fake C# source v1\nclass P { static void Main() {} }\n"
 
 
 @pytest.fixture
@@ -226,8 +227,9 @@ def sha256(path):
 
 def test_constants():
     assert EXE_NAME == "RecBrowser.exe"
-    assert os.path.basename(SOURCE_PATH) == "RecBrowser.cs"
-    assert os.path.basename(os.path.dirname(SOURCE_PATH)) == "iehost"
+    assert iehost.SOURCE_NAME == "RecBrowser.cs"  # RECBROWSER_CS is written under this name for csc
+    assert iehost.SHIPPED_DIR == os.path.dirname(os.path.abspath(reqrec.__file__))  # prebuilt exe: next to reqrec.py
+    assert reqrec.RECBROWSER_CS.startswith("// RecBrowser.cs") and "\r" not in reqrec.RECBROWSER_CS
     assert HASH_NAME == "RecBrowser.cs.sha256"
     assert EMULATION_LEVELS == {"default": None, "ie8": 8000, "ie11": 11000, "ie11_force": 11001}
     assert set(iehost.EMULATION_LABELS) == set(EMULATION_LEVELS)
@@ -236,10 +238,11 @@ def test_constants():
 
 
 def test_module_does_not_depend_on_source_or_winreg_at_import():
-    """The package must import even before RecBrowser.cs exists (another agent writes it) and on any OS."""
+    """reqrec imports on any OS without any RecBrowser.cs file (the source is a string constant)."""
     assert iehost.EXE_NAME == "RecBrowser.exe"
-    assert "winreg" not in iehost.__dict__  # imported lazily inside _winreg()
-    assert all(callable(getattr(iehost, name)) or name.isupper() for name in iehost.__all__)
+    assert "winreg" not in iehost.__dict__ and "winreg" not in vars(reqrec)  # imported lazily inside _winreg()
+    public = [name for name in vars(iehost) if not name.startswith("_")]
+    assert all(callable(getattr(iehost, name)) or name.isupper() for name in public)
 
 
 def test_exe_path_is_under_bin(workdir):
@@ -283,7 +286,7 @@ class TestAvailability:
         assert is_available(platform="darwin", exists=lambda p: True) is False
 
     def test_windows_with_csc_and_source(self, workdir, fake_source):
-        info = availability(workdir, platform="win32", exists=exists_for(CSC64, fake_source), env=ENV, source=fake_source)
+        info = availability(workdir, platform="win32", exists=exists_for(CSC64), env=ENV, source=fake_source)
         assert info["available"] is True
         assert info["reason"] is None
         assert info["exe"] == exe_path(workdir)
@@ -294,33 +297,34 @@ class TestAvailability:
 
     def test_built_exe_reported(self, workdir, fake_source):
         exe = exe_path(workdir)
-        info = availability(workdir, platform="win32", exists=exists_for(CSC64, fake_source, exe), env=ENV, source=fake_source)
+        info = availability(workdir, platform="win32", exists=exists_for(CSC64, exe), env=ENV, source=fake_source)
         assert info["available"] is True
         assert info["built"] is True
         assert info["exe"] == exe
 
     def test_no_csc_but_prebuilt_next_to_source(self, workdir, fake_source):
-        prebuilt = os.path.join(os.path.dirname(fake_source), EXE_NAME)
-        info = availability(workdir, platform="win32", exists=exists_for(fake_source, prebuilt), env=ENV, source=fake_source)
+        prebuilt = os.path.join(iehost.SHIPPED_DIR, EXE_NAME)
+        info = availability(workdir, platform="win32", exists=exists_for(prebuilt), env=ENV, source=fake_source)
         assert info["available"] is True
         assert info["csc"] is None
         assert info["prebuilt"] == prebuilt
-        assert is_available(platform="win32", exists=exists_for(prebuilt), env=ENV, source=fake_source) is True
+        assert is_available(platform="win32", exists=exists_for(prebuilt), env=ENV) is True
 
     def test_no_csc_no_prebuilt(self, workdir, fake_source):
-        info = availability(workdir, platform="win32", exists=exists_for(fake_source), env=ENV, source=fake_source)
+        info = availability(workdir, platform="win32", exists=exists_for(), env=ENV, source=fake_source)
         assert info["available"] is False
         assert info["exe"] is None
         assert "csc.exe" in info["reason"]
         assert any(ord(ch) > 0x7F for ch in info["reason"])
-        assert is_available(platform="win32", exists=lambda p: False, env=ENV, source=fake_source) is False
+        assert is_available(platform="win32", exists=lambda p: False, env=ENV) is False
 
     def test_csc_but_source_missing(self, workdir, tmp_path):
-        missing = str(tmp_path / "nowhere" / "RecBrowser.cs")
-        info = availability(workdir, platform="win32", exists=exists_for(CSC64), env=ENV, source=missing)
-        assert info["available"] is False
-        assert "RecBrowser.cs" in info["reason"]
-        assert any(ord(ch) > 0x7F for ch in info["reason"])
+        # no RecBrowser.cs file exists anywhere: the C# source is part of reqrec.py (RECBROWSER_CS), so
+        # csc alone is enough; ``source`` reports where it will be written for the compiler
+        info = availability(workdir, platform="win32", exists=exists_for(CSC64), env=ENV, folder=str(tmp_path / "nowhere"))
+        assert info["available"] is True
+        assert info["reason"] is None and info["exe"] == exe_path(workdir)
+        assert info["source"] == os.path.join(workdir, "bin", "RecBrowser.cs")
 
     def test_default_platform_is_sys_platform(self, workdir):
         info = availability(workdir, exists=lambda p: False, env=ENV)
@@ -362,11 +366,13 @@ class TestEnsureBuilt:
         assert os.path.isfile(exe)
         assert len(run.calls) == 1
         cmd, kwargs = run.calls[0]
-        assert cmd == build_command(CSC64, fake_source, exe)
+        written = os.path.join(workdir, "bin", "RecBrowser.cs")  # the source as csc reads it
+        assert cmd == build_command(CSC64, written, exe)
+        assert open(written, "rb").read() == fake_source.encode("utf-8")
         assert kwargs["capture_output"] is True and kwargs["text"] is True
         assert kwargs["timeout"] > 0
         hash_file = os.path.join(workdir, "bin", HASH_NAME)
-        assert open(hash_file, encoding="utf-8").read().strip() == iehost._build_digest(str(fake_source))
+        assert open(hash_file, encoding="utf-8").read().strip() == iehost._build_digest(fake_source)
 
     def test_second_call_does_not_rebuild(self, workdir, fake_source):
         run = FakeRun()
@@ -377,12 +383,11 @@ class TestEnsureBuilt:
     def test_changed_source_rebuilds(self, workdir, fake_source):
         run = FakeRun()
         ensure_built(workdir, run=run, csc=CSC64, source=fake_source)
-        with open(fake_source, "a", encoding="utf-8") as fh:
-            fh.write("// v2\n")
-        ensure_built(workdir, run=run, csc=CSC64, source=fake_source)
+        changed = fake_source + "// v2\n"  # a new reqrec version
+        ensure_built(workdir, run=run, csc=CSC64, source=changed)
         assert len(run.calls) == 2
         hash_file = os.path.join(workdir, "bin", HASH_NAME)
-        assert open(hash_file, encoding="utf-8").read().strip() == iehost._build_digest(str(fake_source))
+        assert open(hash_file, encoding="utf-8").read().strip() == iehost._build_digest(changed)
 
     def test_missing_hash_file_rebuilds(self, workdir, fake_source):
         run = FakeRun()
@@ -413,11 +418,9 @@ class TestEnsureBuilt:
 
     def test_failure_on_rebuild_hints_at_open_browser(self, workdir, fake_source):
         ensure_built(workdir, run=FakeRun(), csc=CSC64, source=fake_source)
-        with open(fake_source, "a", encoding="utf-8") as fh:
-            fh.write("// v2\n")
         run = FakeRun(returncode=1, stderr="error CS2012: Cannot open RecBrowser.exe for writing", write_exe=False)
         with pytest.raises(IEHostError) as info:
-            ensure_built(workdir, run=run, csc=CSC64, source=fake_source)
+            ensure_built(workdir, run=run, csc=CSC64, source=fake_source + "// v2\n")
         assert "閉じて" in str(info.value)
         assert "CS2012" in str(info.value)
 
@@ -443,7 +446,7 @@ class TestEnsureBuilt:
 
     def test_no_csc_copies_prebuilt(self, workdir, fake_source, monkeypatch):
         monkeypatch.setattr(iehost, "csc_path", lambda *a, **k: None)
-        prebuilt = os.path.join(os.path.dirname(fake_source), EXE_NAME)
+        prebuilt = os.path.join(iehost.SHIPPED_DIR, EXE_NAME)
         with open(prebuilt, "wb") as fh:
             fh.write(b"MZ prebuilt")
         run = FakeRun()
@@ -451,29 +454,34 @@ class TestEnsureBuilt:
         assert run.calls == []
         assert open(exe, "rb").read() == b"MZ prebuilt"
         hash_file = os.path.join(workdir, "bin", HASH_NAME)
-        assert open(hash_file, encoding="utf-8").read().strip() == iehost._build_digest(str(fake_source))
+        assert open(hash_file, encoding="utf-8").read().strip() == iehost._build_digest(fake_source)
         # cached afterwards
         assert ensure_built(workdir, run=run, source=fake_source) == exe
 
     def test_source_missing_raises(self, workdir, tmp_path):
+        # the source file csc needs cannot be put in place (a folder is in the way of
+        # <workdir>/bin/RecBrowser.cs): Japanese error naming the file, nothing compiled
+        os.makedirs(os.path.join(workdir, "bin", "RecBrowser.cs"))
         run = FakeRun()
         with pytest.raises(IEHostError) as info:
-            ensure_built(workdir, run=run, csc=CSC64, source=str(tmp_path / "missing.cs"))
-        assert "RecBrowser" in str(info.value) or "missing.cs" in str(info.value)
+            ensure_built(workdir, run=run, csc=CSC64, source="class A {}", folder=str(tmp_path / "nowhere"))
+        assert "RecBrowser.cs" in str(info.value) and str(info.value).startswith("記録用ブラウザ")
         assert run.calls == []
 
     def test_source_missing_but_exe_present_is_kept(self, workdir, fake_source):
         run = FakeRun()
         exe = ensure_built(workdir, run=run, csc=CSC64, source=fake_source)
-        os.remove(fake_source)
+        os.remove(os.path.join(workdir, "bin", "RecBrowser.cs"))  # the copy written for csc was cleaned up
         assert ensure_built(workdir, run=run, csc=CSC64, source=fake_source) == exe
         assert len(run.calls) == 1
 
     def test_default_source_is_module_constant(self, workdir, fake_source, monkeypatch):
-        monkeypatch.setattr(iehost, "SOURCE_PATH", fake_source)
+        monkeypatch.setattr(reqrec, "RECBROWSER_CS", fake_source)
         run = FakeRun()
         ensure_built(workdir, run=run, csc=CSC64)
-        assert run.calls[0][0][-1] == fake_source
+        written = os.path.join(workdir, "bin", "RecBrowser.cs")
+        assert run.calls[0][0][-1] == written
+        assert open(written, "rb").read() == fake_source.encode("utf-8")
 
     def test_never_prints(self, workdir, fake_source, capsys):
         ensure_built(workdir, run=FakeRun(), csc=CSC64, source=fake_source)
@@ -491,7 +499,7 @@ class TestLaunch:
         ensure_built(workdir, run=FakeRun(), csc=CSC64, source=fake_source)
 
     def test_argv_and_popen_kwargs(self, workdir, fake_source, monkeypatch):
-        monkeypatch.setattr(iehost, "SOURCE_PATH", fake_source)
+        monkeypatch.setattr(reqrec, "RECBROWSER_CS", fake_source)
         self._prebuild(workdir, fake_source)
         popen = FakePopen(pid=777)
         run = FakeRun()
@@ -518,7 +526,7 @@ class TestLaunch:
         assert re.fullmatch(r"recbrowser_\d{8}_\d{6}(_\d+)?\.log", os.path.basename(bp.log_path))
 
     def test_without_url_and_title(self, workdir, fake_source, monkeypatch):
-        monkeypatch.setattr(iehost, "SOURCE_PATH", fake_source)
+        monkeypatch.setattr(reqrec, "RECBROWSER_CS", fake_source)
         self._prebuild(workdir, fake_source)
         popen = FakePopen()
         launch(workdir, "127.0.0.1:8098", popen=popen, run=FakeRun())
@@ -527,7 +535,7 @@ class TestLaunch:
         assert argv[1:5] == ["--proxy", "127.0.0.1:8098", "--bypass", ""]
 
     def test_builds_first_when_needed(self, workdir, fake_source, monkeypatch):
-        monkeypatch.setattr(iehost, "SOURCE_PATH", fake_source)
+        monkeypatch.setattr(reqrec, "RECBROWSER_CS", fake_source)
         monkeypatch.setattr(iehost, "csc_path", lambda *a, **k: CSC64)
         popen = FakePopen()
         run = FakeRun()
@@ -537,7 +545,7 @@ class TestLaunch:
         assert popen.calls[0][0][0] == bp.exe
 
     def test_custom_log_dir(self, workdir, fake_source, tmp_path, monkeypatch):
-        monkeypatch.setattr(iehost, "SOURCE_PATH", fake_source)
+        monkeypatch.setattr(reqrec, "RECBROWSER_CS", fake_source)
         self._prebuild(workdir, fake_source)
         logs = str(tmp_path / "elsewhere" / "logs")
         bp = launch(workdir, "127.0.0.1:8098", popen=FakePopen(), run=FakeRun(), log_dir=logs)
@@ -545,7 +553,7 @@ class TestLaunch:
         assert os.path.isdir(logs)
 
     def test_two_launches_in_one_second_get_distinct_logs(self, workdir, fake_source, monkeypatch):
-        monkeypatch.setattr(iehost, "SOURCE_PATH", fake_source)
+        monkeypatch.setattr(reqrec, "RECBROWSER_CS", fake_source)
         self._prebuild(workdir, fake_source)
         a = launch(workdir, "127.0.0.1:8098", popen=FakePopen(), run=FakeRun())
         open(a.log_path, "w").close()  # the browser would create it
@@ -553,14 +561,14 @@ class TestLaunch:
         assert a.log_path != b.log_path
 
     def test_popen_failure_raises_iehosterror(self, workdir, fake_source, monkeypatch):
-        monkeypatch.setattr(iehost, "SOURCE_PATH", fake_source)
+        monkeypatch.setattr(reqrec, "RECBROWSER_CS", fake_source)
         self._prebuild(workdir, fake_source)
         with pytest.raises(IEHostError) as info:
             launch(workdir, "127.0.0.1:8098", popen=FakePopen(raises=OSError(5, "access denied")), run=FakeRun())
         assert "起動できません" in str(info.value)
 
     def test_build_failure_propagates(self, workdir, fake_source, monkeypatch):
-        monkeypatch.setattr(iehost, "SOURCE_PATH", fake_source)
+        monkeypatch.setattr(reqrec, "RECBROWSER_CS", fake_source)
         monkeypatch.setattr(iehost, "csc_path", lambda *a, **k: CSC64)
         popen = FakePopen()
         with pytest.raises(IEHostError):
@@ -576,7 +584,7 @@ class TestLaunch:
         assert popen.calls == []
 
     def test_close_uses_injected_run_for_taskkill(self, workdir, fake_source, monkeypatch):
-        monkeypatch.setattr(iehost, "SOURCE_PATH", fake_source)
+        monkeypatch.setattr(reqrec, "RECBROWSER_CS", fake_source)
         self._prebuild(workdir, fake_source)
         popen = FakePopen(pid=4242)
         calls = []
@@ -766,42 +774,42 @@ class TestPlatformAndShippedExe:
         assert iehost.BUILD_PLATFORM == "x86"
 
     def _ship(self, tmp_path, source_text="class A {}", matching=True):
-        src = tmp_path / "pkg" / "RecBrowser.cs"
-        src.parent.mkdir(parents=True)
-        src.write_text(source_text, encoding="utf-8")
-        exe = src.parent / iehost.EXE_NAME
+        folder = tmp_path / "pkg"  # the distribution folder (normally the folder of reqrec.py)
+        folder.mkdir(parents=True)
+        exe = folder / iehost.EXE_NAME
         exe.write_bytes(b"MZ shipped")
-        import hashlib
-        digest = iehost._build_digest(str(src)) if matching else "0" * 64
-        (src.parent / (iehost.EXE_NAME + ".sha256")).write_text(digest, encoding="utf-8")
-        return src, exe
+        digest = iehost._build_digest(source_text) if matching else "0" * 64
+        (folder / (iehost.EXE_NAME + ".sha256")).write_text(digest, encoding="utf-8")
+        return folder, exe
 
     def test_shipped_exe_is_run_in_place_when_built_from_this_source(self, tmp_path):
-        src, exe = self._ship(tmp_path)
-        assert iehost.shipped_exe(str(src)) == str(exe)
+        folder, exe = self._ship(tmp_path)
+        assert iehost.shipped_exe(str(folder), source="class A {}") == str(exe)
         calls = []
-        got = iehost.ensure_built(str(tmp_path / "work"), run=lambda *a, **k: calls.append(a), source=str(src))
+        got = iehost.ensure_built(str(tmp_path / "work"), run=lambda *a, **k: calls.append(a), folder=str(folder),
+                                  source="class A {}")
         assert got == str(exe) and calls == []  # no compile, nothing under the work folder
         assert not (tmp_path / "work" / "bin").exists()
 
     def test_stale_shipped_exe_is_not_used_in_place(self, tmp_path):
-        src, exe = self._ship(tmp_path, matching=False)
-        assert iehost.shipped_exe(str(src)) is None
+        folder, exe = self._ship(tmp_path, matching=False)
+        assert iehost.shipped_exe(str(folder), source="class A {}") is None
 
     def test_availability_reports_the_shipped_exe(self, tmp_path):
-        src, exe = self._ship(tmp_path)
-        info = iehost.availability(str(tmp_path / "work"), platform="win32", source=str(src),
+        folder, exe = self._ship(tmp_path)
+        info = iehost.availability(str(tmp_path / "work"), platform="win32", folder=str(folder), source="class A {}",
                                    exists=lambda p: os.path.isfile(p))
         assert info["available"] is True and info["exe"] == str(exe) and info["shipped"] is True
 
     def test_build_shipped_writes_exe_and_hash(self, tmp_path):
-        src = tmp_path / "pkg" / "RecBrowser.cs"
-        src.parent.mkdir(parents=True)
-        src.write_text("class A {}", encoding="utf-8")
+        folder = tmp_path / "pkg"
+        folder.mkdir(parents=True)
         seen = []
+        compiled = []
 
         def fake_run(cmd, **kw):
             seen.append(cmd)
+            compiled.append(open(cmd[-1], encoding="utf-8").read())  # the source csc gets (a temporary file)
             out = [a for a in cmd if a.startswith("-out:")][0][5:]
             with open(out, "wb") as fh:
                 fh.write(b"MZ")
@@ -812,22 +820,24 @@ class TestPlatformAndShippedExe:
                 stderr = ""
             return R()
 
-        exe = iehost.build_shipped(run=fake_run, csc=r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe", source=str(src))
-        assert exe == str(src.parent / iehost.EXE_NAME)
-        assert iehost.shipped_exe(str(src)) == exe and "-platform:x86" in seen[0]
+        exe = iehost.build_shipped(run=fake_run, csc=r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
+                                   folder=str(folder), source="class A {}")
+        assert exe == str(folder / iehost.EXE_NAME)
+        assert iehost.shipped_exe(str(folder), source="class A {}") == exe and "-platform:x86" in seen[0]
+        assert compiled == ["class A {}"] and not os.path.exists(seen[0][-1])  # temporary source removed
 
     def test_cli(self, monkeypatch, capsys):
-        from reqrec.iehost import __main__ as cli
-
-        monkeypatch.setattr(cli, "build_shipped", lambda: r"X:\reqrec\iehost\RecBrowser.exe")
-        assert cli.main(["build"]) == 0 and "RecBrowser.exe" in capsys.readouterr().out
-        monkeypatch.setattr(cli, "shipped_exe", lambda: None)
-        assert cli.main(["status"]) == 0 and "なし" in capsys.readouterr().out
-        assert cli.main([]) == 2
+        # ``reqrec browser build | status`` (former ``python -m reqrec.iehost build | status``)
+        monkeypatch.setattr(iehost, "build_shipped", lambda: r"X:\reqrec\RecBrowser.exe")
+        assert reqrec.main(["browser", "build"]) == 0 and "RecBrowser.exe" in capsys.readouterr().out
+        monkeypatch.setattr(iehost, "shipped_exe", lambda: None)
+        assert reqrec.main(["browser", "status"]) == 0 and "なし" in capsys.readouterr().out
+        assert reqrec.main(["browser"]) == 2
 
     def test_launch_passes_https_flag(self, tmp_path, monkeypatch):
-        src, exe = self._ship(tmp_path)
-        monkeypatch.setattr(iehost, "SOURCE_PATH", str(src))
+        folder, exe = self._ship(tmp_path)
+        monkeypatch.setattr(iehost, "SHIPPED_DIR", str(folder))
+        monkeypatch.setattr(reqrec, "RECBROWSER_CS", "class A {}")
         argv = []
 
         class P:
@@ -861,19 +871,17 @@ class TestKillOnCloseJob:
 
 class TestBuildDigest:
     def test_build_settings_are_part_of_the_digest(self, tmp_path, monkeypatch):
-        src = tmp_path / "RecBrowser.cs"
-        src.write_text("class A {}", encoding="utf-8")
-        x86 = iehost._build_digest(str(src))
+        x86 = iehost._build_digest("class A {}")
         monkeypatch.setattr(iehost, "BUILD_PLATFORM", "x64")
-        assert iehost._build_digest(str(src)) != x86  # an exe built for x64 is rebuilt once as x86
+        assert iehost._build_digest("class A {}") != x86  # an exe built for x64 is rebuilt once as x86
 
     def test_old_source_only_hash_triggers_one_rebuild(self, tmp_path):
-        src = tmp_path / "RecBrowser.cs"
-        src.write_text("class A {}", encoding="utf-8")
+        source = "class A {}"
+        nowhere = str(tmp_path / "nowhere")  # no distribution folder
         work = tmp_path / "w"
         (work / "bin").mkdir(parents=True)
         (work / "bin" / iehost.EXE_NAME).write_bytes(b"MZ old x64")
-        (work / "bin" / iehost.HASH_NAME).write_text(hashlib.sha256(src.read_bytes()).hexdigest(), encoding="utf-8")
+        (work / "bin" / iehost.HASH_NAME).write_text(hashlib.sha256(source.encode("utf-8")).hexdigest(), encoding="utf-8")
         calls = []
 
         def fake_run(cmd, **kw):
@@ -882,7 +890,7 @@ class TestBuildDigest:
             open(out, "wb").write(b"MZ new x86")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        exe = iehost.ensure_built(str(work), run=fake_run, csc=r"C:\csc.exe", source=str(src))
+        exe = iehost.ensure_built(str(work), run=fake_run, csc=r"C:\csc.exe", folder=nowhere, source=source)
         assert calls and "-platform:x86" in calls[0]
         assert open(exe, "rb").read() == b"MZ new x86"
-        assert iehost.ensure_built(str(work), run=fake_run, csc=r"C:\csc.exe", source=str(src)) == exe and len(calls) == 1
+        assert iehost.ensure_built(str(work), run=fake_run, csc=r"C:\csc.exe", folder=nowhere, source=source) == exe and len(calls) == 1
