@@ -1,10 +1,13 @@
 """reqrec - record a website's HTTP traffic and generate a standalone Python scraping script from it.
 
-Pipeline:  record/import  ->  Recording  ->  build_plan  ->  Plan  ->  generate  ->  script.py
+Pipeline:  record (GUI) / import  ->  Recording  ->  build_plan  ->  Plan  ->  generate  ->  script.py
+
+Target: legacy intranet sites used in Edge's IE mode, over plain ``http://``.  Recording is done
+only through the GUI's own IE-engine recording browser (no Windows proxy change, no certificate).
 
 The whole application is this one file (DESIGN.md "Module layout"):
 
-* ``reqrec ...`` / ``python -m reqrec ...`` - the command line (:func:`main`): ``record`` / ``import`` /
+* ``reqrec ...`` / ``python -m reqrec ...`` - the command line (:func:`main`): ``import`` /
   ``inspect`` / ``generate`` / ``gui`` / ``browser build|status``;
 * ``mitmdump -s reqrec.py`` - the recording proxy loads this very file as its addon (:data:`addons`,
   :data:`ADDON_PATH`);
@@ -58,7 +61,7 @@ import typing
 import unicodedata
 import webbrowser
 from collections import OrderedDict, deque
-from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from email.utils import formatdate
 from typing import Any, Callable, Iterable, Iterator, Literal, Optional, Sequence, Union
@@ -101,8 +104,8 @@ __all__ = [
     "Loop", "Step", "Constant", "InitialCookie", "Dropped", "AuthInfo", "Plan", "PlanOptions", "GenOptions",
     "BodyKind", "ResponseKind", "to_plain", "NOT_WINDOWS_MESSAGE", "is_windows",
     # importers
-    "load_recording", "load_recordings", "load_har", "recording_from_har", "load_mitm", "HAR_EXTENSIONS",
-    "MITM_EXTENSIONS", "parse_har_timestamp", "MITMPROXY_INSTALL_HINT", "flow_from_mitm",
+    "load_recording", "load_recordings", "load_har", "recording_from_har", "HAR_EXTENSIONS",
+    "parse_har_timestamp", "flow_from_mitm",
     "decode_header_fields", "infer_resource_type",
     # analysis
     "TRACKER_HOSTS", "STATIC_EXTENSIONS", "STATIC_RESOURCE_TYPES", "DROP_REQUEST_HEADERS",
@@ -116,22 +119,18 @@ __all__ = [
     "request_params", "split_auth_header", "is_session_auth_header", "header_candidates",
     "is_candidate_value", "is_numeric_path_id", "is_route_like", "is_structural_path_segment",
     "find_candidates", "looks_random_letters", "is_dynamic_looking", "build_pattern", "locate_value",
-    "locate_value_kinds", "find_cookie", "locate_in_cookies", "clear_cache", "LoopGroup", "detect_loops",
+    "locate_value_kinds", "find_cookie", "clear_cache", "LoopGroup", "detect_loops",
     "build_plan",
     # codegen
     "generate", "CodegenError", "MAX_INLINE_BODY",
     # recorder
     "ReqRecAddon", "addons", "parse_hosts", "write_recording_atomic", "OPT_OUT", "OPT_HOSTS", "DEFAULT_OUT",
-    "ADDON_PATH", "MITMDUMP_PYTHON_STUB", "mitmproxy_available", "mitmdump_launcher", "build_command",
-    "format_instructions", "run_record", "stop_child", "RecorderError", "RecorderManager",
-    "count_flows_in_file",
+    "ADDON_PATH", "MITMDUMP_PYTHON_STUB", "RECORD_LISTEN_HOST", "mitmproxy_available", "mitmdump_launcher",
+    "build_command", "RecorderError", "RecorderManager", "count_flows_in_file",
     # iehost
     "iehost", "IEHostError", "BrowserProcess", "RECBROWSER_CS",
     # gui
-    "INTERNET_SETTINGS_KEY", "DEFAULT_PROXY_OVERRIDE", "get_system_proxy", "set_system_proxy",
-    "restore_system_proxy", "refresh_proxy_settings", "mitmproxy_ca_cert_path", "cert_installed",
-    "install_ca_cert", "proxy_server_for", "status_summary", "find_edge", "open_url", "open_folder",
-    "validate_url", "DEFAULT_START_URL", "ApiError", "AppState", "ScriptRunner", "SUBDIRS", "safe_name",
+    "open_folder", "validate_url", "ApiError", "AppState", "ScriptRunner", "SUBDIRS", "safe_name",
     "plan_options_from_json", "gen_options_from_json", "options_to_plain", "load_sources", "exclude_netlocs",
     "normalise_netloc", "RECORDING_EXTENSIONS", "bp", "get_state", "create_app", "run_gui", "TOKEN_HEADER",
     "GUI_HTML",
@@ -312,10 +311,6 @@ class RecordedResponse:
             return None
         return decode_body(self.body, self.header("content-type"))
 
-    @property
-    def is_textual(self) -> bool:
-        return is_textual_mime(self.mime_type)
-
 
 @dataclass
 class Flow:
@@ -400,17 +395,10 @@ class Recording:
     def from_json(cls, s: str) -> "Recording":
         return cls.from_dict(json.loads(s))
 
-    def save(self, path: str, atomic: bool = True) -> None:
-        """Write the recording as JSON.  ``atomic`` writes a temp file in the same directory and
-        ``os.replace``s it so a crash never leaves a half-written file."""
+    def save(self, path: str) -> None:
+        """Write the recording as JSON: a temp file in the same directory is ``os.replace``d onto
+        ``path`` so a crash never leaves a half-written file."""
         data = self.to_json(indent=1)
-        if not atomic:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(data)
-            return
-        import os
-        import tempfile
-
         directory = os.path.dirname(os.path.abspath(path)) or "."
         fd, tmp = tempfile.mkstemp(prefix=".reqrec-", suffix=".tmp", dir=directory)
         try:
@@ -716,7 +704,6 @@ class GenOptions:
     timeout: float = 30.0
     print_final: bool = True  # print the final step's result in main() (Plan.final_step_index or last)
     strict_status: bool = False  # assert resp.status_code == expected_status (else raise_for_status)
-    legacy_tls: bool = False  # mount an HTTPS adapter that accepts TLS 1.0/1.1 and SECLEVEL=1 ciphers (old intranet servers)
 
 
 # --------------------------------------------------------------------------- generic (de)serialisation for debugging
@@ -1068,7 +1055,7 @@ def download_filename(content_disposition: Optional[str]) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- platform
-# (formerly in reqrec/winsupport.py; used by the iehost and gui sections)
+# (formerly in reqrec/winsupport.py; used by the iehost section)
 
 NOT_WINDOWS_MESSAGE = "Windows 以外では使えません"
 
@@ -1078,48 +1065,44 @@ def is_windows() -> bool:
     return sys.platform == "win32" or os.name == "nt"
 
 
-# ===== former reqrec/importers.py: HAR / mitmproxy / reqrec JSON -> Recording =====
-# Load a Recording from a HAR file, a mitmproxy flow file, or a reqrec JSON recording.  Contract: DESIGN.md §2.
+# ===== former reqrec/importers.py: HAR / reqrec JSON -> Recording =====
+# Load a Recording from a HAR file or a reqrec JSON recording.  Contract: DESIGN.md §2.
 #
 # Sections (each one a former module):
 #
 # * dispatcher (former ``reqrec/importers/__init__.py``) - ``load_recording`` / ``load_recordings``;
 # * HAR importer (former ``reqrec/importers/har.py``) - ``load_har`` / ``recording_from_har``;
-# * mitmproxy importer (former ``reqrec/importers/mitm.py``) - ``load_mitm`` / ``flow_from_mitm``.
+# * mitmproxy -> Flow conversion (former ``reqrec/importers/mitm.py``) - ``flow_from_mitm`` (used by
+#   the recorder addon).
 
 
 # ===== former reqrec/importers/__init__.py: dispatcher (load_recording / load_recordings) =====
-# Load a Recording from a HAR file, a mitmproxy flow file, or a reqrec JSON recording.
+# Load a Recording from a HAR file or a reqrec JSON recording.
 #
 # Contract: see DESIGN.md §2.
 #
-# Dispatch is by extension: ``.har`` -> HAR importer, ``.mitm`` / ``.flows`` / ``.flow`` ->
-# mitmproxy importer, ``.json`` -> sniffed (a HAR document has a top-level ``"log"``; a reqrec
-# recording has ``"flows"``).  Anything else raises ``ValueError``.
+# Dispatch is by extension: ``.har`` -> HAR importer, ``.json`` -> sniffed (a HAR document has a
+# top-level ``"log"``; a reqrec recording has ``"flows"``).  Anything else raises ``ValueError``.
 
 _importers_log = logging.getLogger("reqrec.importers")
 
 HAR_EXTENSIONS = frozenset({".har"})
-MITM_EXTENSIONS = frozenset({".mitm", ".flows", ".flow"})
 JSON_EXTENSIONS = frozenset({".json"})
 
 
 def load_recording(path: str) -> Recording:
     """Dispatch on extension / content (see DESIGN.md §2).
 
-    Raises ``ValueError`` for unsupported extensions or unrecognised JSON, ``ImportError`` (with an
-    install hint) for a mitmproxy file when mitmproxy is not installed, and the usual ``OSError``
+    Raises ``ValueError`` for unsupported extensions or unrecognised JSON and the usual ``OSError``
     family when the file cannot be read.
     """
     path = os.fspath(path)
     ext = os.path.splitext(path)[1].lower()
     if ext in HAR_EXTENSIONS:
         return load_har(path)
-    if ext in MITM_EXTENSIONS:
-        return load_mitm(path)
     if ext in JSON_EXTENSIONS:
         return _load_json_sniffed(path)
-    supported = ", ".join(sorted(HAR_EXTENSIONS | MITM_EXTENSIONS | JSON_EXTENSIONS))
+    supported = ", ".join(sorted(HAR_EXTENSIONS | JSON_EXTENSIONS))
     raise ValueError(
         f"{path}: 対応していないファイル形式です ({ext or '拡張子なし'})。対応形式: {supported}\n"
         f"unsupported input file type {ext or '(no extension)'}; supported: {supported}"
@@ -1661,21 +1644,16 @@ def _trim_fraction(s: str) -> str:
     return f"{head}.{digits[:6] or '0'}{rest}"
 
 
-# ===== former reqrec/importers/mitm.py: mitmproxy flow-file importer =====
-# mitmproxy flow-file importer and mitmproxy<->Flow conversion.  Contract: DESIGN.md §2.
+# ===== former reqrec/importers/mitm.py: mitmproxy HTTPFlow -> Flow conversion (recorder addon) =====
+# mitmproxy -> Flow conversion.  Contract: DESIGN.md §2.
 #
-# ``flow_from_mitm`` is shared with the live recorder addon (recorder section).  It only
-# touches public attributes of ``mitmproxy.http.HTTPFlow`` so it also works on duck-typed objects
-# and does not itself need mitmproxy importable; ``load_mitm`` does (``mitmproxy.io.FlowReader``).
+# ``flow_from_mitm`` is used by the live recorder addon (recorder section).  It only touches public
+# attributes of ``mitmproxy.http.HTTPFlow`` so it also works on duck-typed objects and does not
+# itself need mitmproxy importable.
 
-MITMPROXY_INSTALL_HINT = (
-    "mitmproxy がインストールされていません。次のコマンドでインストールしてください:\n"
-    '    pip install "reqrec[record]"\n'
-    'mitmproxy is not installed. Install it with: pip install "reqrec[record]"'
-)
-
-# ``Sec-Fetch-Dest`` request header -> HAR-style resource type.  Browsers send this on every
-# request, so a mitmproxy capture can be classified almost as precisely as a DevTools HAR.
+# ``Sec-Fetch-Dest`` request header -> HAR-style resource type, used when present (Chromium / Firefox
+# HARs).  The IE-engine recording browser never sends it: its flows get no resource type and are
+# classified by URL extension and MIME type instead.
 _SEC_FETCH_DEST_TO_RESOURCE_TYPE = {
     "document": "document",
     "iframe": "document",
@@ -1699,80 +1677,6 @@ _SEC_FETCH_DEST_TO_RESOURCE_TYPE = {
     "xslt": "other",
     "websocket": "websocket",
 }
-
-
-# --------------------------------------------------------------------------- file loading
-
-def _import_mitmproxy():
-    """Import the mitmproxy pieces we need, with a friendly hint when it is missing."""
-    try:
-        from mitmproxy import http as mhttp
-        from mitmproxy import io as mio
-        from mitmproxy.exceptions import FlowReadException
-    except ImportError as exc:
-        raise ImportError(MITMPROXY_INSTALL_HINT) from exc
-    return mio, mhttp, FlowReadException
-
-
-def load_mitm(path: str) -> Recording:
-    """Load a mitmproxy flow file (``mitmdump -w flows.mitm``) into a :class:`Recording`.
-
-    Only ``HTTPFlow`` objects are imported (TCP/UDP/DNS flows are counted and skipped).  A file
-    truncated by a killed mitmdump yields the flows read up to the corruption point and records the
-    error in ``meta["read_error"]``.  Flows are sorted by ``timestamp_start`` and numbered
-    ``f0001``, ``f0002``, ...
-    """
-    mio, mhttp, FlowReadException = _import_mitmproxy()
-    http_flows: list[Any] = []
-    skipped = 0
-    read_error: Optional[str] = None
-    with open(path, "rb") as fh:
-        reader = mio.FlowReader(fh)
-        try:
-            for mflow in reader.stream():
-                if isinstance(mflow, mhttp.HTTPFlow):
-                    http_flows.append(mflow)
-                else:
-                    skipped += 1
-        except FlowReadException as exc:
-            read_error = str(exc)
-            _importers_log.warning("%s: flow file truncated or corrupt, keeping %d flows (%s)", path, len(http_flows), exc)
-
-    flows = _flows_in_order(http_flows)
-    meta: dict[str, Any] = {
-        "source": "mitmproxy",
-        "file": os.fspath(path),
-        "imported_at": now_iso(),
-        "flows_total": len(http_flows) + skipped,
-        "skipped_flows": skipped,
-    }
-    if read_error:
-        meta["read_error"] = read_error
-    return Recording(flows=flows, meta=meta)
-
-
-def _flows_in_order(mitm_flows: Iterable[Any]) -> list[Flow]:
-    """Sort by ``request.timestamp_start`` (stable; unknown timestamps stay in place) and assign ids."""
-    keyed: list[tuple[float, int, Any]] = []
-    last_ts = float("-inf")
-    for index, mflow in enumerate(mitm_flows):
-        ts = _timestamp(mflow)
-        if ts is None:
-            ts = last_ts
-        else:
-            last_ts = ts
-        keyed.append((ts, index, mflow))
-    keyed.sort(key=lambda t: (t[0], t[1]))
-    out: list[Flow] = []
-    for n, (_, _, mflow) in enumerate(keyed, start=1):
-        try:
-            out.append(flow_from_mitm(mflow, f"f{n:04d}"))
-        except Exception as exc:  # pragma: no cover - defensive: never lose a whole file for one flow
-            _importers_log.warning("mitmproxy flow %d could not be converted: %s", n, exc)
-    # Re-number in case a flow was dropped so ids stay contiguous.
-    for n, flow in enumerate(out, start=1):
-        flow.id = f"f{n:04d}"
-    return out
 
 
 def _timestamp(mflow: Any) -> Optional[float]:
@@ -2711,7 +2615,7 @@ def _infer_auth_from_headers(flows: list[Flow]) -> Optional[AuthInfo]:
 #   (``find_candidates``), plus the shared request-body parsers used by the loops / plan sections;
 # * **locators** - given a value and an earlier flow, build a stable ``Extractor`` that re-extracts
 #   the value from that flow's response on the next run (``locate_value``), or find the cookie that
-#   carries it (``locate_in_cookies``).
+#   carries it (``find_cookie``).
 #
 # Locators are never keyed on the dynamic value itself and every regex is verified against the
 # recorded text before it is returned.
@@ -3790,12 +3694,6 @@ def find_cookie(value: str, earlier: list[Flow]) -> Optional[tuple[str, str]]:
     return None
 
 
-def locate_in_cookies(value: str, earlier: list[Flow]) -> Optional[str]:
-    """Name of the cookie (from an earlier ``Set-Cookie``) carrying ``value``, else None."""
-    hit = find_cookie(value, earlier)
-    return hit[0] if hit else None
-
-
 # ===== former reqrec/loops.py: pagination / repetition detection =====
 # Pagination / repetition detection.  Contract: DESIGN.md §6.
 #
@@ -4263,7 +4161,6 @@ class _Builder:
         self.auth_credentials: Optional[tuple[str, str]] = None  # Basic: (user, password) behind Plan.auth
         self.auth_token_units: dict[str, set[int]] = {}  # session-auth tokens sent by several steps
         self.auth_header_warned: set[tuple[str, str]] = set()
-        self.legacy_form_steps: list[int] = []
 
     # ------------------------------------------------------------------ naming
 
@@ -4466,8 +4363,7 @@ class _Builder:
     # ------------------------------------------------------------------ legacy-charset forms (DESIGN.md §13.4)
 
     @staticmethod
-    def _legacy_form_hint(body: Optional[bytes], parsed: list[tuple[str, str]],
-                          form: list[tuple[str, Ref]]) -> list[tuple[str, Ref]]:
+    def _legacy_form_hint(body: Optional[bytes], form: list[tuple[str, Ref]]) -> list[tuple[str, Ref]]:
         """``form`` pairs for a body replayed as raw bytes: traced values keep their Ref, values
         that are not UTF-8 become bytes literals (``requests`` percent-encodes bytes verbatim)."""
         raw_pairs = form_pairs_bytes(body)
@@ -4720,10 +4616,9 @@ class _Builder:
                 # bytes literals for the legacy values, so codegen rebuilds the body with fresh
                 # dynamic values (``__VIEWSTATE`` ...) while the legacy bytes stay byte-exact.
                 dynamic = [name for name, ref in form if not ref.is_literal]
-                form = self._legacy_form_hint(req.body, parsed, form)
+                form = self._legacy_form_hint(req.body, form)
                 raw_body = req.body
                 body_kind = "raw"
-                self.legacy_form_steps.append(step_no)
                 note = ""
                 if dynamic:
                     listed = ", ".join(dynamic[:4]) + (" …" if len(dynamic) > 4 else "")
@@ -4960,8 +4855,6 @@ def build_plan(recording: Recording, opts: Optional[PlanOptions] = None) -> Plan
 # * ``Plan.auth`` becomes ``session.auth`` (Basic tuple, ``HTTPDigestAuth``, or the
 #   ``requests_negotiate_sspi`` -> ``requests_ntlm`` fallback for NTLM / Negotiate); recorded
 #   ``Authorization`` headers of that scheme are never emitted.
-# * ``VERIFY_TLS`` is always emitted and applied (``session.verify``); ``GenOptions.legacy_tls`` adds
-#   ``_LegacyTLSAdapter`` (TLS 1.0+, ``@SECLEVEL=1``) mounted on ``https://``.
 # * Responses are decoded from bytes: ``_soup`` parses ``resp.content`` and ``_text(resp)`` sniffs the
 #   charset (header -> ``<meta>`` / ``<?xml`` -> JSON = UTF-8 -> ``apparent_encoding``), so Shift_JIS
 #   pages served without a charset do not become mojibake.
@@ -5021,7 +4914,6 @@ _NTLM_USER_PLACEHOLDER = 'r"DOMAIN\\user"'
 _FORM_MIME = "application/x-www-form-urlencoded"
 _AUTH_EXPR_SCHEME_RE = re.compile(r"""^\s*(?:[bru]*)(["'])([A-Za-z][A-Za-z0-9._-]*)\s""")
 
-_Block = list  # list[str]: a rendered value; line 0 is placed after a prefix, the rest are relative
 
 
 class CodegenError(ValueError):
@@ -5304,10 +5196,10 @@ class _Generator:
         # unique function names (the plan should already guarantee this; be safe)
         reserved = set(self.constant_names) | {
             "main", "session", "resp", "soup", "data", "ctx", "results", "out", "requests", "re", "json",
-            "os", "sys", "time", "ssl", "warnings", "unquote", "urlencode", "urljoin", "BeautifulSoup",
-            "TIMEOUT", "DELAY", "VERIFY_TLS", "BASE_HEADERS", "INITIAL_COOKIES",
+            "os", "sys", "time", "unquote", "urlencode", "urljoin", "BeautifulSoup",
+            "TIMEOUT", "DELAY", "BASE_HEADERS", "INITIAL_COOKIES",
             "_soup", "_check", "_regex", "_json_path", "_select", "_attr", "_elem_text", "_text", "_charset",
-            "_normalise_charset", "final_resp", "final_results", "final_saved", "_LegacyTLSAdapter",
+            "_normalise_charset", "final_resp", "final_results", "final_saved",
             "HttpNegotiateAuth", "HttpNtlmAuth",
         } | _DOWNLOAD_HELPER_NAMES
         for step in self.plan.steps:
@@ -5629,7 +5521,7 @@ class _Generator:
         if not isinstance(src, dict):
             src = {"source": src} if src else {}
         kind = str(src.get("source") or "不明")
-        label = {"har": "HAR ファイル", "mitmproxy": "mitmproxy 録画", "mitm": "mitmproxy フローファイル"}.get(kind.lower(), kind)
+        label = {"har": "HAR ファイル", "mitmproxy": "mitmproxy 録画"}.get(kind.lower(), kind)
         parts = [label]
         if src.get("file"):
             parts.append(f"({src['file']})")
@@ -5715,12 +5607,8 @@ class _Generator:
         w.line("import json")
         w.line("import os")
         w.line("import re")
-        if self.opts.legacy_tls:
-            w.line("import ssl")
         w.line("import sys")
         w.line("import time")
-        if self.opts.legacy_tls:
-            w.line("import warnings")
         names = ["unquote", "urljoin"] + (["urlencode"] if self.needs_urlencode else [])
         w.line("from urllib.parse import " + ", ".join(sorted(names)))
         w.blank()
@@ -5738,7 +5626,6 @@ class _Generator:
         w.line(f"TIMEOUT = {timeout!r}" + (f"  # {c}" if c else ""))
         c = self._comment("ステップ間の待ち時間（秒）。サーバーに負荷をかけないための配慮")
         w.line(f"DELAY = {delay!r}" + (f"  # {c}" if c else ""))
-        self._cl("VERIFY_TLS = True", "自己署名証明書のサイトなら False か CA 証明書 (.pem) のパスに")
 
         constants = self._all_constants()
         if constants:
@@ -5889,9 +5776,6 @@ class _Generator:
             for ln in _DOWNLOAD_HELPERS_SRC.strip("\n").split("\n"):
                 w.line(ln)
 
-        if self.opts.legacy_tls:
-            self._emit_legacy_adapter()
-
     def _emit_encoding_helpers(self) -> None:
         """``_charset`` / ``_normalise_charset`` / ``_text`` (DESIGN.md §13.4)."""
         w = self.w
@@ -5956,69 +5840,6 @@ class _Generator:
             with w.indent():
                 w.line("resp.encoding = charset")
             w.line("return resp.text")
-
-    def _emit_legacy_adapter(self) -> None:
-        """``_LegacyTLSAdapter`` (DESIGN.md §13.3): TLS 1.0+ and ``@SECLEVEL=1`` ciphers, verification
-        still governed by ``VERIFY_TLS`` (requests sets ``verify_mode``; we only keep ``check_hostname``
-        consistent with it, which urllib3 requires before it can set ``CERT_NONE``)."""
-        w = self.w
-        w.blank(2)
-        self._c("===== 古い TLS しか使えないサーバー向けの接続設定（--legacy-tls） =====")
-        w.line("class _LegacyTLSAdapter(requests.adapters.HTTPAdapter):")
-        with w.indent():
-            w.line('"""TLS 1.0 / 1.1 や古い暗号スイートしか使えないサーバーに接続するための HTTPS アダプター。')
-            w.line("")
-            w.line("IE モードで使っている古い社内サーバー向け。新しい OpenSSL は既定で TLS 1.2 未満と弱い暗号を")
-            w.line("拒否するため、最低バージョンとセキュリティレベルを下げる。証明書の検証は VERIFY_TLS の設定に従う")
-            w.line("（このクラスでは無効化しない）。")
-            w.line('"""')
-            w.blank()
-            w.line("def _ssl_context(self):")
-            with w.indent():
-                w.line("ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)")
-                w.line("with warnings.catch_warnings():")
-                with w.indent():
-                    self._cl('warnings.simplefilter("ignore", DeprecationWarning)', "TLS 1.0 の指定は非推奨扱いだが意図したもの")
-                    w.line("try:")
-                    with w.indent():
-                        w.line("ctx.minimum_version = ssl.TLSVersion.TLSv1")
-                    w.line("except (AttributeError, ValueError):")
-                    with w.indent():
-                        self._cl("pass", "この Python / OpenSSL では TLS 1.0 を有効にできない")
-                w.line("try:")
-                with w.indent():
-                    self._cl('ctx.set_ciphers("DEFAULT:@SECLEVEL=1")',
-                             "それでも接続できなければ @SECLEVEL=0 に（OpenSSL 3 系で TLS 1.0/1.1 を使う場合）")
-                w.line("except ssl.SSLError:")
-                with w.indent():
-                    w.line("pass")
-                self._cl('ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0)',
-                         "安全でない再ネゴシエーションしかできないサーバー向け")
-                w.line("try:")
-                with w.indent():
-                    self._cl("ctx.load_default_certs()", "OS の証明書ストア（社内 CA など）も信頼する")
-                w.line("except Exception:")
-                with w.indent():
-                    w.line("pass")
-                w.line("return ctx")
-            w.blank()
-            w.line("def init_poolmanager(self, *args, **kwargs):")
-            with w.indent():
-                w.line('kwargs["ssl_context"] = self._ssl_context()')
-                w.line("return super().init_poolmanager(*args, **kwargs)")
-            w.blank()
-            w.line("def proxy_manager_for(self, *args, **kwargs):")
-            with w.indent():
-                w.line('kwargs["ssl_context"] = self._ssl_context()')
-                w.line("return super().proxy_manager_for(*args, **kwargs)")
-            w.blank()
-            w.line("def cert_verify(self, conn, url, verify, cert):")
-            with w.indent():
-                w.line("super().cert_verify(conn, url, verify, cert)")
-                w.line('ctx = getattr(conn, "conn_kw", {}).get("ssl_context")')
-                w.line("if ctx is not None:")
-                with w.indent():
-                    self._cl("ctx.check_hostname = bool(verify)", "VERIFY_TLS = False のときはホスト名の検証も行わない")
 
     # ------------------------------------------------------------------ steps
 
@@ -6298,9 +6119,6 @@ class _Generator:
                     w.line('sys.exit("環境変数 " + ", ".join(missing) + " が設定されていません（パスワードなど、実行時に入力が必要な値です）")')
             w.line("session = requests.Session()")
             self._emit_session_auth()
-            self._cl("session.verify = VERIFY_TLS", "証明書の検証（設定ブロックの VERIFY_TLS を参照）")
-            if self.opts.legacy_tls:
-                self._cl('session.mount("https://", _LegacyTLSAdapter())', "古い TLS / 暗号しか使えないサーバー向けの接続設定")
             w.line("session.headers.update(BASE_HEADERS)")
             w.line("for c in INITIAL_COOKIES:")
             with w.indent():
@@ -6784,14 +6602,14 @@ def generate(plan: Plan, opts: Optional[GenOptions] = None) -> str:
 # Sections (each one a former module, in dependency order):
 #
 # * addon (former ``reqrec/recorder/addon.py``) - the mitmproxy addon ``ReqRecAddon`` / ``addons``;
-# * run (former ``reqrec/recorder/run.py``) - ``run_record`` / ``build_command``: spawn ``mitmdump``
-#   with this file as its addon;
+# * command line (former ``reqrec/recorder/run.py``) - ``build_command``: the ``mitmdump`` argument
+#   vector with this file as its addon;
 # * manager (former ``reqrec/recorder/manager.py``) - ``RecorderManager``: start / stop / watch a
-#   recording from the GUI.
+#   recording from the GUI (the only way reqrec records: the GUI's recording browser).
 
 
 # ===== former reqrec/recorder/addon.py: the mitmproxy addon (ReqRecAddon) =====
-# mitmproxy addon that writes a reqrec Recording.  Run via ``reqrec record`` or
+# mitmproxy addon that writes a reqrec Recording.  Run by the GUI's recorder as
 # ``mitmdump -s reqrec.py --set reqrec_out=rec.json``.  Contract: DESIGN.md §3.
 #
 # Options (declared in :meth:`ReqRecAddon.load`):
@@ -7065,13 +6883,10 @@ def _host_of(request: Any) -> str:
 addons = [ReqRecAddon()]
 
 
-# ===== former reqrec/recorder/run.py: spawn mitmdump with this file as its addon (reqrec record) =====
-# Spawn mitmdump with the reqrec addon.  Contract: DESIGN.md §3.
-#
-# ``run_record`` prints Japanese instructions (proxy address, CA certificate, Ctrl+C), starts
-# ``mitmdump -s reqrec.py --set reqrec_out=... [--set reqrec_hosts=...] -p PORT --listen-host HOST``
-# as a child process and turns the user's Ctrl+C into a graceful shutdown of the child (which gives
-# the addon the chance to run its final flush).
+# ===== former reqrec/recorder/run.py: the mitmdump command line =====
+# ``mitmdump -s reqrec.py --set reqrec_out=... [--set reqrec_hosts=...] -p PORT --listen-host 127.0.0.1``.
+# Contract: DESIGN.md §3.  The proxy only ever listens on this PC (:data:`RECORD_LISTEN_HOST`): its
+# only client is the recording browser started by the GUI.
 
 #: Absolute path of the addon file passed to ``mitmdump -s``: this very file (its addon section defines ``addons``).
 ADDON_PATH = os.path.abspath(__file__)
@@ -7080,9 +6895,8 @@ ADDON_PATH = os.path.abspath(__file__)
 #: nothing; the documented programmatic entry point is the ``mitmdump()`` function.
 MITMDUMP_PYTHON_STUB = "import sys; from mitmproxy.tools.main import mitmdump; sys.exit(mitmdump())"
 
-_GRACE_FIRST_WAIT = 1.5  # seconds: the child usually got the terminal's SIGINT as well
-_GRACE_AFTER_SIGINT = 10.0
-_GRACE_AFTER_TERMINATE = 5.0
+#: The recording proxy's listen address: this PC only.
+RECORD_LISTEN_HOST = "127.0.0.1"
 
 
 # --------------------------------------------------------------------------- discovery
@@ -7112,8 +6926,6 @@ def build_command(
     out: str,
     port: int = 8080,
     hosts: Union[None, str, Iterable[str]] = None,
-    listen_host: str = "127.0.0.1",
-    quiet: bool = True,
     extra_args: Sequence[str] = (),
 ) -> list[str]:
     """Full ``mitmdump`` argument vector for a recording session.
@@ -7121,161 +6933,28 @@ def build_command(
     * ``out`` is made absolute (mitmdump's cwd is ours, but absolute paths survive ``--set`` quoting).
     * ``hosts`` (list or comma-separated string) becomes ``--set reqrec_hosts=a,b``; omitted when empty
       (= record every host).
-    * ``quiet`` suppresses mitmdump's own per-flow dump (``flow_detail=0``) while keeping the addon's
-      one-line-per-recorded-flow log and mitmproxy warnings (e.g. TLS handshake failures when the CA
-      certificate is not installed yet) visible.
-    * ``extra_args`` are appended verbatim (e.g. ``["--ssl-insecure"]`` or ``["--mode", "upstream:..."]``).
+    * mitmdump's own per-flow dump is off (``flow_detail=0``); the addon's one-line-per-recorded-flow
+      log and mitmproxy warnings stay visible.
+    * ``extra_args`` are appended verbatim (the GUI passes :data:`HTTPS_PASSTHROUGH_ARGS`).
     """
     cmd = mitmdump_launcher()
     cmd += ["-s", ADDON_PATH, "--set", f"reqrec_out={os.path.abspath(out)}"]
     host_list = parse_hosts(hosts)
     if host_list:
         cmd += ["--set", "reqrec_hosts=" + ",".join(host_list)]
-    cmd += ["-p", str(int(port)), "--listen-host", str(listen_host)]
-    if quiet:
-        cmd += ["--set", "flow_detail=0"]
+    cmd += ["-p", str(int(port)), "--listen-host", RECORD_LISTEN_HOST]
+    cmd += ["--set", "flow_detail=0"]
     cmd += [str(a) for a in extra_args]
     return cmd
 
 
-def format_instructions(out: str, port: int, hosts: Sequence[str], listen_host: str) -> str:
-    """Japanese how-to shown before mitmdump starts."""
-    if listen_host in ("0.0.0.0", "::", "", "*"):
-        proxy_addr = f"http://<このPCのIPアドレス>:{port}  (全インターフェースで待ち受け中)"
-    else:
-        proxy_addr = f"http://{listen_host}:{port}"
-    scope = ", ".join(hosts) if hosts else "すべてのホスト (絞り込みなし)"
-    ca_path = os.path.join("~", ".mitmproxy", "mitmproxy-ca-cert.pem")
-    lines = [
-        "=" * 64,
-        " reqrec 記録モード (mitmproxy)",
-        "=" * 64,
-        f"プロキシのアドレス : {proxy_addr}",
-        f"記録対象ホスト     : {scope}",
-        f"出力ファイル       : {out}",
-        "",
-        "手順:",
-        "  1. ブラウザ (または OS) の HTTP/HTTPS プロキシを上記のアドレスに設定します。",
-        "     例 (Chrome を専用プロファイルで起動):",
-        f'       chrome --proxy-server="{listen_host or "127.0.0.1"}:{port}" --user-data-dir=/tmp/reqrec-profile',
-        "  2. 初回のみ mitmproxy の CA 証明書を信頼済みルート証明書として登録します。",
-        f"       - {ca_path}  (プロキシ初回起動時に自動生成されます)",
-        "       - または、プロキシ経由で http://mitm.it を開いてダウンロード",
-        "     ※ 登録しないと HTTPS サイトで証明書エラーになり記録できません。",
-        "  3. ブラウザで記録したい操作を行います。レスポンスを受け取るごとに自動保存されます。",
-        "  4. 終了するには Ctrl+C を押してください (保存してから終了します)。",
-        "-" * 64,
-    ]
-    return "\n".join(lines)
-
-
-# --------------------------------------------------------------------------- running
-
-def run_record(
-    out: str,
-    port: int = 8080,
-    hosts: Optional[list[str]] = None,
-    listen_host: str = "127.0.0.1",
-    quiet: bool = True,
-    extra_args: Sequence[str] = (),
-) -> int:
-    """Run a recording session; returns a process exit code.
-
-    * ``0`` when the session was stopped with Ctrl+C and the recording file exists.
-    * ``1`` when mitmproxy is not installed (an install hint is printed), the child could not be
-      started, or nothing was written.
-    * otherwise the child's own exit code.
-    """
-    host_list = parse_hosts(hosts)
-    if not mitmproxy_available():
-        print(MITMPROXY_INSTALL_HINT, file=sys.stderr)
-        return 1
-
-    out_abs = os.path.abspath(out)
-    try:
-        os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
-    except OSError as exc:
-        print(f"出力先ディレクトリを作成できません / cannot create output directory: {exc}", file=sys.stderr)
-        return 1
-
-    cmd = build_command(out_abs, port=port, hosts=host_list, listen_host=listen_host, quiet=quiet, extra_args=extra_args)
-    print(format_instructions(out_abs, port, host_list, listen_host), flush=True)
-
-    try:
-        proc = subprocess.Popen(cmd)
-    except OSError as exc:
-        print(f"mitmdump を起動できません / failed to start mitmdump: {exc}", file=sys.stderr)
-        print(MITMPROXY_INSTALL_HINT, file=sys.stderr)
-        return 1
-
-    interrupted = False
-    try:
-        returncode = proc.wait()
-    except KeyboardInterrupt:
-        interrupted = True
-        print("\n停止しています... (記録を保存中) / stopping...", flush=True)
-        returncode = stop_child(proc)
-
-    _print_summary(out_abs)
-    if interrupted:
-        if os.path.exists(out_abs):
-            return 0
-        print("記録ファイルが作成されませんでした / no recording file was written", file=sys.stderr)
-        return 1
-    return returncode
-
-
-def stop_child(proc: subprocess.Popen, grace: float = _GRACE_AFTER_SIGINT) -> int:
-    """Shut the mitmdump child down gracefully after Ctrl+C and return its exit code.
-
-    Order: wait briefly (the terminal normally delivered SIGINT to the child as well) -> SIGINT
-    (``terminate`` on Windows) -> ``terminate`` -> ``kill``.  A second Ctrl+C kills immediately.
-    """
-    try:
-        rc = _wait(proc, _GRACE_FIRST_WAIT)
-        if rc is not None:
-            return rc
-        if os.name == "nt":  # no reliable Ctrl+C delivery to a child on Windows
-            proc.terminate()
-        else:
-            try:
-                proc.send_signal(signal.SIGINT)
-            except (ProcessLookupError, OSError):
-                pass
-        rc = _wait(proc, grace)
-        if rc is not None:
-            return rc
-        proc.terminate()
-        rc = _wait(proc, _GRACE_AFTER_TERMINATE)
-        if rc is not None:
-            return rc
-        proc.kill()
-        return proc.wait()
-    except KeyboardInterrupt:
-        try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
-        return proc.wait()
-
+# --------------------------------------------------------------------------- waiting
 
 def _wait(proc: subprocess.Popen, timeout: float) -> Optional[int]:
     try:
         return proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         return None
-
-
-def _print_summary(out_abs: str) -> None:
-    if not os.path.exists(out_abs):
-        return
-    try:
-        count = len(Recording.load(out_abs).flows)
-    except Exception:
-        print(f"記録ファイル: {out_abs}", flush=True)
-        return
-    print(f"記録したフロー: {count} 件 -> {out_abs}", flush=True)
-    print("次のステップ: reqrec inspect <記録ファイル> / reqrec generate <記録ファイル> -o scrape.py", flush=True)
 
 
 # ===== former reqrec/recorder/manager.py: RecorderManager for the GUI =====
@@ -7288,8 +6967,8 @@ def _print_summary(out_abs: str) -> None:
 # lot can never block, and the addon's atomically flushed recording file is read to count flows while
 # the session runs.
 #
-# Stopping mirrors :func:`stop_child`: SIGINT (``CTRL_BREAK_EVENT`` on Windows,
-# where the child is started in its own process group) -> ``terminate()`` -> ``kill()``.
+# Stopping: SIGINT (``CTRL_BREAK_EVENT`` on Windows, where the child is started in its own process
+# group) -> ``terminate()`` -> ``kill()``.
 
 #: Reading a very large recording with ``json.loads`` every second would hurt; above this size a
 #: regular expression counts the flow ids instead.
@@ -7309,9 +6988,9 @@ class RecorderError(RuntimeError):
 def count_flows_in_file(path: str, default: int = 0) -> int:
     """Number of flows in a recording JSON file.
 
-    Tolerates a missing or half-written file (the addon writes atomically, but a plain
-    ``mitmdump`` run or a foreign tool may not): returns ``default`` whenever the file cannot be
-    parsed.  Large files are counted with a regular expression on the raw bytes.
+    Tolerates a missing or not yet written file (before the addon's first flush): returns
+    ``default`` whenever the file cannot be parsed.  Large files are counted with a regular
+    expression on the raw bytes.
     """
     try:
         size = os.path.getsize(path)
@@ -7332,17 +7011,13 @@ def count_flows_in_file(path: str, default: int = 0) -> int:
     flows = data.get("flows")
     if isinstance(flows, list):
         return len(flows)
-    # a mitmproxy ``-w`` file or a HAR has no "flows"; try the HAR shape before giving up
-    log = data.get("log")
-    if isinstance(log, dict) and isinstance(log.get("entries"), list):
-        return len(log["entries"])
     return default
 
 
 class RecorderManager:
     """Lifecycle of one recording child process (see module docstring).
 
-    ``command_builder(out, port=..., hosts=[...], listen_host=...)`` must return the argument
+    ``command_builder(out, port=..., hosts=[...])`` must return the argument
     vector to run; it is called with the absolute output path.  ``popen`` is injectable too.
     """
 
@@ -7363,13 +7038,11 @@ class RecorderManager:
         self._stdout: deque[str] = deque(maxlen=self.max_lines)
         self._stderr: deque[str] = deque(maxlen=self.max_lines)
         self._last_count = 0
-        self._error: Optional[str] = None
         self._stop_requested = False
         self.command: list[str] = []
         self.out: Optional[str] = None
         self.port: Optional[int] = None
         self.hosts: list[str] = []
-        self.listen_host: Optional[str] = None
         self.started_at: Optional[float] = None
         self.stopped_at: Optional[float] = None
         self.exit_code: Optional[int] = None
@@ -7381,11 +7054,6 @@ class RecorderManager:
         with self._lock:
             return self._proc is not None and self._proc.poll() is None
 
-    @property
-    def pid(self) -> Optional[int]:
-        with self._lock:
-            return self._proc.pid if self._proc is not None else None
-
     # ------------------------------------------------------------------ start
 
     def start(
@@ -7393,7 +7061,6 @@ class RecorderManager:
         out: str,
         port: int = 8080,
         hosts: Union[None, str, Iterable[str]] = None,
-        listen_host: str = "127.0.0.1",
         extra_args: Sequence[str] = (),
     ) -> dict[str, Any]:
         """Spawn the recording process; returns :meth:`status`.
@@ -7419,7 +7086,7 @@ class RecorderManager:
             kwargs: dict[str, Any] = {}
             if extra_args:
                 kwargs["extra_args"] = list(extra_args)
-            cmd = [str(c) for c in self.command_builder(out_abs, port=port_int, hosts=host_list, listen_host=listen_host, **kwargs)]
+            cmd = [str(c) for c in self.command_builder(out_abs, port=port_int, hosts=host_list, **kwargs)]
             popen_kwargs: dict[str, Any] = dict(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -7440,11 +7107,9 @@ class RecorderManager:
             self.out = out_abs
             self.port = port_int
             self.hosts = host_list
-            self.listen_host = listen_host
             self.started_at = time.time()
             self.stopped_at = None
             self.exit_code = None
-            self._error = None
             self._stop_requested = False
             self._last_count = 0
             self._stdout = deque(maxlen=self.max_lines)
@@ -7464,24 +7129,20 @@ class RecorderManager:
         connect: Optional[Callable[..., Any]] = None,
         interval: float = 0.2,
     ) -> bool:
-        """Block until the proxy accepts TCP connections on ``listen_host:port``.
+        """Block until the proxy accepts TCP connections on ``127.0.0.1:port``.
 
         mitmdump needs a second or two to import before it binds; a client that is pointed at the
         proxy earlier (the in-app recording browser, DESIGN.md §13.12) gets 「ページを表示できません」.
         Returns ``False`` when the child exits first or ``timeout`` passes.  Does not hold the lock
         while waiting.  ``connect`` is injectable (default :func:`socket.create_connection`).
         """
-        import socket
-
         dial = connect or socket.create_connection
         with self._lock:
             port = self.port
-            host = self.listen_host or "127.0.0.1"
             out = self.out
         if not port:
             return False
-        if host in ("0.0.0.0", "::", "", "*"):
-            host = "127.0.0.1"
+        host = RECORD_LISTEN_HOST
         deadline = time.time() + max(0.0, float(timeout))
         while True:
             if not self.running or self.out != out:
@@ -7608,7 +7269,7 @@ class RecorderManager:
 
     def status(self) -> dict[str, Any]:
         """Snapshot for the GUI: ``{running, flows, out, pid, exit_code, started_at, stopped_at,
-        port, listen_host, hosts, stdout_tail, stderr_tail, error, command}``."""
+        port, hosts, stdout_tail, stderr_tail, error, command}``."""
         with self._lock:
             proc = self._proc
             running = proc is not None and proc.poll() is None
@@ -7618,7 +7279,7 @@ class RecorderManager:
                 self.exit_code = exit_code
             stderr_tail = "\n".join(self._stderr)
             stdout_tail = "\n".join(self._stdout)
-            error = self._error
+            error: Optional[str] = None
             if (not running and not self._stop_requested and self.out is not None
                     and exit_code not in (None, 0) and self.started_at is not None):
                 # The child died on its own (port in use, missing dependency, ...): surface why.
@@ -7635,7 +7296,6 @@ class RecorderManager:
                 "started_at": self.started_at,
                 "stopped_at": self.stopped_at,
                 "port": self.port,
-                "listen_host": self.listen_host,
                 "hosts": list(self.hosts),
                 "stdout_tail": stdout_tail,
                 "stderr_tail": stderr_tail,
@@ -7649,8 +7309,8 @@ class RecorderManager:
             raise RecorderError("記録ファイルがありません。先に記録を開始してください。")
         if not os.path.exists(self.out):
             raise RecorderError(
-                "記録ファイルが作成されませんでした。ブラウザのプロキシ設定を確認し、"
-                "記録中にページを 1 つ以上開いてください。"
+                "記録ファイルが作成されませんでした。記録用ブラウザで http:// のページを"
+                " 1 つ以上開いてください。"
             )
         try:
             return Recording.load(self.out)
@@ -7666,8 +7326,8 @@ class RecorderManager:
 #
 # Why a separate process
 # ----------------------
-# Edge's IE mode only honours the *system* proxy (``set_system_proxy``) and HTTPS recording
-# needs the mitmproxy CA certificate.  Many factory PCs forbid both.  ``RecBrowser.exe`` (C# source:
+# Edge's IE mode can only be pointed at a proxy by changing the Windows (system) proxy, which many
+# factory PCs forbid.  ``RecBrowser.exe`` (C# source:
 # :data:`RECBROWSER_CS` right after this section, compiled on first use with the ``csc.exe`` that
 # ships with the inbox .NET Framework 4.x) hosts the very same Trident / MSHTML engine (``WebBrowser``
 # control) and sets the proxy **for its own process only**::
@@ -7707,11 +7367,11 @@ class RecorderManager:
 # ---------
 # The functions and constants live in the class ``iehost`` and are called as before
 # (``iehost.launch(...)``, ``iehost.availability(...)``, ``iehost.EXE_NAME``): several of their names
-# (``build_command``, ``_wait``, ``_winreg``, ``_write_text``, ``_GRACE_AFTER_TERMINATE``) exist in
+# (``build_command``, ``_wait``, ``_write_text``) exist in
 # other sections too.  Inside, they refer to each other through ``iehost.``, so replacing one attribute
 # (tests ``monkeypatch`` ``iehost.csc_path`` / ``iehost.launch``) affects every caller, exactly as
 # replacing an attribute of the former module did.  ``IEHostError`` and ``BrowserProcess`` are
-# top-level classes (also reachable as ``iehost.IEHostError`` / ``iehost.BrowserProcess``).
+# top-level classes (``BrowserProcess`` is also reachable as ``iehost.BrowserProcess``).
 
 
 class IEHostError(RuntimeError):
@@ -7816,7 +7476,6 @@ class iehost:  # noqa: N801 - a namespace, named like the former module its call
     Used as a namespace only (never instantiated): ``iehost.launch(...)``, ``iehost.EXE_NAME`` ...
     """
 
-    IEHostError = IEHostError
     BrowserProcess = BrowserProcess
     #: The platform check this section uses (replaceable on its own, as in the former module).
     is_windows = staticmethod(is_windows)
@@ -7842,14 +7501,6 @@ class iehost:  # noqa: N801 - a namespace, named like the former module its call
         "ie8": 8000,
         "ie11": 11000,
         "ie11_force": 11001,
-    }
-
-    #: Japanese labels for the GUI, keyed like :data:`EMULATION_LEVELS`.
-    EMULATION_LABELS: dict[str, str] = {
-        "default": "標準 (IE7 相当・IE モードの互換表示と同じ)",
-        "ie8": "IE8 相当",
-        "ie11": "IE11 相当 (ページの互換表示指定を尊重)",
-        "ie11_force": "IE11 相当 (常に IE11 として表示)",
     }
 
     #: ``%WINDIR%``-relative locations of the inbox C# compiler, preferred first (either one builds the
@@ -7943,18 +7594,6 @@ class iehost:  # noqa: N801 - a namespace, named like the former module its call
             raise IEHostError("記録用ブラウザの作成 (コンパイル) に失敗しました。" + ("\n" + output if output else ""))
         iehost._write_text(exe + ".sha256", iehost._build_digest(text))
         return exe
-
-    @staticmethod
-    def is_available(
-        platform: Optional[str] = None,
-        exists: Callable[[str], bool] = os.path.isfile,
-        env: Optional[dict] = None,
-        folder: Optional[str] = None,
-    ) -> bool:
-        """Windows **and** (csc.exe found **or** a prebuilt exe in the distribution folder)."""
-        if (platform or sys.platform) != "win32":
-            return False
-        return iehost.csc_path(exists=exists, env=env) is not None or bool(exists(iehost._prebuilt_exe(folder)))
 
     @staticmethod
     def exe_path(workdir: str) -> str:
@@ -8272,7 +7911,6 @@ class iehost:  # noqa: N801 - a namespace, named like the former module its call
         run: Callable[..., Any] = subprocess.run,
         log_dir: Optional[str] = None,
         job: Optional[Callable[[Any], Optional[int]]] = None,
-        https_recorded: bool = False,
     ) -> BrowserProcess:
         """Build if needed, then start the recording browser routed through ``proxy_address`` (``host:port``).
 
@@ -8297,8 +7935,6 @@ class iehost:  # noqa: N801 - a namespace, named like the former module its call
             argv += ["--url", str(url)]
         if title:
             argv += ["--title", str(title)]
-        if https_recorded:  # the recorder intercepts HTTPS (certificate installed): no "https is not recorded" notices
-            argv += ["--https"]
         try:
             proc = popen(
                 argv,
@@ -8400,8 +8036,9 @@ class iehost:  # noqa: N801 - a namespace, named like the former module its call
 
 # ===== former reqrec/RecBrowser.cs: C# source of the recording browser (RECBROWSER_CS) =====
 # Compiled by ``iehost.ensure_built`` (written to ``<workdir>/bin/RecBrowser.cs`` first) and by
-# ``reqrec browser build`` (written to a temporary file).  Byte for byte the former file: UTF-8
-# without BOM (csc reads it as UTF-8), LF line ends; the build hash is taken over these bytes.
+# ``reqrec browser build`` (written to a temporary file).  Started as the former file and was cut
+# down on 2026-10-12 for the http-only scope (no ``--https`` option, no ``Options.HttpsRecorded``).
+# UTF-8 without BOM (csc reads it as UTF-8), LF line ends; the build hash is taken over these bytes.
 
 #: C# source of ``RecBrowser.exe``, the recording browser (see the iehost section).
 RECBROWSER_CS = r'''// RecBrowser.cs -- reqrec "recording browser" for legacy intranet sites (DESIGN.md: IE host mode).
@@ -8736,7 +8373,6 @@ namespace Reqrec.IeHost
         public string Title = "reqrec 記録用ブラウザ";
         public string LogPath;
         public bool SelfTest;
-        public bool HttpsRecorded;
         public int Seconds = 20;
 
         public static Options Parse(string[] args)
@@ -8754,7 +8390,6 @@ namespace Reqrec.IeHost
                     case "--title": if (hasValue) o.Title = args[++i]; break;
                     case "--log": if (hasValue) o.LogPath = args[++i]; break;
                     case "--selftest": o.SelfTest = true; break;
-                    case "--https": o.HttpsRecorded = true; break;
                     case "--seconds":
                         if (hasValue)
                         {
@@ -8895,9 +8530,8 @@ namespace Reqrec.IeHost
         {
             StatusStrip strip = new StatusStrip();
             strip.SizingGrip = false;
-            ToolStripStatusLabel recording = new ToolStripStatusLabel(opt.HttpsRecorded
-                ? "● 記録中 — このウィンドウで行った操作の通信を記録しています"
-                : "● 記録中 — このウィンドウで開いた http:// のページの通信を記録しています（https:// は記録されません）");
+            ToolStripStatusLabel recording = new ToolStripStatusLabel(
+                "● 記録中 — このウィンドウで開いた http:// のページの通信を記録しています（https:// は記録されません）");
             recording.Spring = true;
             recording.TextAlign = ContentAlignment.MiddleLeft;
             recording.ForeColor = Color.FromArgb(170, 0, 0);
@@ -9043,9 +8677,9 @@ namespace Reqrec.IeHost
             forwardButton.Enabled = forward;
         }
 
-        bool IsUnrecordedHttps(Uri url)
+        static bool IsUnrecordedHttps(Uri url)
         {
-            return !opt.HttpsRecorded && url != null && url.Scheme == Uri.UriSchemeHttps;
+            return url != null && url.Scheme == Uri.UriSchemeHttps;
         }
 
         void SetStatus(string text)
@@ -9190,7 +8824,7 @@ namespace Reqrec.IeHost
 
 
 # ===== former reqrec/gui.py: Flask GUI (reqrec gui) =====
-# Flask based no-code GUI for reqrec (``reqrec gui``).  Contract: DESIGN.md §13.6, §13.7, §13.11, §13.12.
+# Flask based no-code GUI for reqrec (``reqrec gui``).  Contract: DESIGN.md §13.6, §13.11, §13.12.
 #
 # ``create_app(workdir)`` builds the Flask application; ``run_gui`` starts it (and opens a browser).
 # The page is ``GUI_HTML`` (right after this section): one Jinja template with the CSS and the
@@ -9198,416 +8832,42 @@ namespace Reqrec.IeHost
 #
 # Sections (each one a former module, in dependency order):
 #
-# * Windows support (former ``reqrec/winsupport.py``) - system proxy, mitmproxy CA certificate;
-# * launchers (former ``reqrec/webapp/launch.py``) - open Edge / the default browser / a folder;
+# * launchers (former ``reqrec/webapp/launch.py``) - check the recording browser's first address,
+#   open a folder;
 # * state (former ``reqrec/webapp/state.py``) - ``AppState`` and the helpers the routes build on;
 # * routes (former ``reqrec/webapp/routes.py``) - the JSON API and the page (blueprint ``bp``);
 # * app (former ``reqrec/webapp/__init__.py``) - ``create_app`` / ``run_gui`` and the security hook.
 
 
-# ===== former reqrec/winsupport.py: Windows support (system proxy, mitmproxy CA certificate) =====
-# Windows helpers for proxy recording with Edge / IE mode (system proxy, mitmproxy CA cert).
-# Contract: DESIGN.md §13.7.  Every function must be importable and safe to call on non-Windows
-# (returning ``None`` / raising ``RuntimeError`` with a Japanese message).
-#
-# Edge's IE mode (and every other WinINet / WinHTTP based client) honours the per-user proxy stored
-# under ``HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings``:
-#
-# ``ProxyEnable``   REG_DWORD  1 = use ``ProxyServer``
-# ``ProxyServer``   REG_SZ     ``host:port`` (or ``http=host:port;https=host:port``)
-# ``ProxyOverride`` REG_SZ     ``;``-separated hosts that bypass the proxy (``<local>`` = no dot in name)
-#
-# Writing the registry alone is not enough: running browsers only pick the change up after
-# ``InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED)`` / ``INTERNET_OPTION_REFRESH``.
-#
-# The mitmproxy CA certificate (``~/.mitmproxy/mitmproxy-ca-cert.cer``) must be in the user's
-# *Trusted Root Certification Authorities* store (``certutil -user -addstore Root``) before HTTPS
-# sites can be recorded.
-#
-# Every function takes injectable ``winreg`` / ``run`` / ``set_option`` callables so the logic is unit
-# tested on any OS; without them, a call on a non-Windows OS raises
-# ``RuntimeError("Windows 以外では使えません")`` (``is_windows`` and ``mitmproxy_ca_cert_path`` excepted).
+# ===== former reqrec/webapp/launch.py: the recording browser's first address / open a folder =====
+# Contract: DESIGN.md §13.11.  The only browser reqrec opens for recording is its own IE-engine
+# recording browser (iehost section); this section checks the address it starts with and opens the
+# 保存先フォルダ.  Every function takes injectable callables so the logic is unit tested on any OS
+# without launching anything.
 
-#: Registry path (under HKEY_CURRENT_USER) holding the WinINet proxy configuration.
-INTERNET_SETTINGS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-
-#: Hosts that bypass the proxy by default: the GUI itself and anything on this machine.
-DEFAULT_PROXY_OVERRIDE = "<local>;localhost;127.0.0.1"
-
-# WinINet option ids (wininet.h)
-INTERNET_OPTION_REFRESH = 37
-INTERNET_OPTION_SETTINGS_CHANGED = 39
-
-#: Registry value names managed by this section, in the order they appear in a backup.
-_PROXY_VALUES = ("ProxyEnable", "ProxyServer", "ProxyOverride")
-
-#: Substring certutil prints for the mitmproxy certificate (its CN is "mitmproxy").
-_CERT_MARKER = "mitmproxy"
-
-_CERTUTIL_TIMEOUT = 60.0
-
-
-# --------------------------------------------------------------------------- platform
-
-
-def _require_windows(injected: Any) -> None:
-    """Raise unless we are on Windows or a test double was injected."""
-    if injected is None and not is_windows():
-        raise RuntimeError(NOT_WINDOWS_MESSAGE)
-
-
-def _winreg(injected: Any) -> Any:
-    """The injected fake or the real ``winreg`` module (imported lazily: it only exists on Windows)."""
-    if injected is not None:
-        return injected
-    _require_windows(None)
-    import winreg  # noqa: WPS433 - Windows only
-
-    return winreg
-
-
-def _default_run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=_CERTUTIL_TIMEOUT)
-
-
-# --------------------------------------------------------------------------- proxy (registry)
-
-def _read_value(winreg: Any, key: Any, name: str) -> Any:
-    """Registry value or None when it does not exist."""
-    try:
-        value, _type = winreg.QueryValueEx(key, name)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:  # pragma: no cover - other registry errors
-        if getattr(exc, "winerror", None) == 2:  # ERROR_FILE_NOT_FOUND
-            return None
-        raise
-    return value
-
-
-def _open_key(winreg: Any, write: bool) -> Any:
-    access = winreg.KEY_READ | (winreg.KEY_SET_VALUE if write else 0)
-    return winreg.OpenKey(winreg.HKEY_CURRENT_USER, INTERNET_SETTINGS_KEY, 0, access)
-
-
-def _raw_proxy_values(winreg: Any) -> dict[str, Any]:
-    with _open_key(winreg, write=False) as key:
-        return {name: _read_value(winreg, key, name) for name in _PROXY_VALUES}
-
-
-def get_system_proxy(winreg: Any = None) -> dict:
-    """Current WinINet proxy settings: ``{"enabled": bool, "server": str, "override": str}``."""
-    reg = _winreg(winreg)
-    raw = _raw_proxy_values(reg)
-    enabled_raw = raw.get("ProxyEnable")
-    try:
-        enabled = bool(int(enabled_raw)) if enabled_raw is not None else False
-    except (TypeError, ValueError):
-        enabled = False
-    return {
-        "enabled": enabled,
-        "server": str(raw.get("ProxyServer") or ""),
-        "override": str(raw.get("ProxyOverride") or ""),
-    }
-
-
-def proxy_server_for(listen_host: str, port: int) -> str:
-    """``host:port`` string browsers understand for a proxy bound to ``listen_host``.
-
-    A wildcard bind (``0.0.0.0`` / ``::``) is reachable locally as ``127.0.0.1``.
-    """
-    host = (listen_host or "").strip()
-    if host in ("", "0.0.0.0", "::", "*", "[::]"):
-        host = "127.0.0.1"
-    if ":" in host and not host.startswith("["):  # bare IPv6 literal
-        host = f"[{host}]"
-    return f"{host}:{int(port)}"
-
-
-def set_system_proxy(
-    server: str,
-    enable: bool = True,
-    override: str = DEFAULT_PROXY_OVERRIDE,
-    winreg: Any = None,
-    refresh: Optional[Callable[[], None]] = None,
-) -> dict:
-    """Point the system (WinINet) proxy at ``server`` and return a backup of the previous values.
-
-    The backup (``{"ProxyEnable": int|None, "ProxyServer": str|None, "ProxyOverride": str|None}``)
-    is what :func:`restore_system_proxy` expects; ``None`` means the value did not exist.
-    ``refresh`` (default :func:`refresh_proxy_settings`) tells running browsers about the change.
-    """
-    server = (server or "").strip()
-    if enable and not server:
-        raise ValueError("プロキシのアドレス (host:port) を指定してください")
-    reg = _winreg(winreg)
-    backup = _raw_proxy_values(reg)
-    with _open_key(reg, write=True) as key:
-        reg.SetValueEx(key, "ProxyEnable", 0, reg.REG_DWORD, 1 if enable else 0)
-        if server:
-            reg.SetValueEx(key, "ProxyServer", 0, reg.REG_SZ, server)
-        if enable:
-            reg.SetValueEx(key, "ProxyOverride", 0, reg.REG_SZ, override or "")
-    _call_refresh(refresh, winreg)
-    return backup
-
-
-def restore_system_proxy(backup: dict, winreg: Any = None, refresh: Optional[Callable[[], None]] = None) -> None:
-    """Undo :func:`set_system_proxy`: write every backed-up value back (delete values that did not exist)."""
-    if not isinstance(backup, dict):
-        raise ValueError("プロキシ設定のバックアップが不正です")
-    reg = _winreg(winreg)
-    with _open_key(reg, write=True) as key:
-        for name in _PROXY_VALUES:
-            if name not in backup:
-                continue
-            value = backup[name]
-            if value is None:
-                try:
-                    reg.DeleteValue(key, name)
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:  # pragma: no cover - other registry errors
-                    if getattr(exc, "winerror", None) != 2:
-                        raise
-                continue
-            if name == "ProxyEnable":
-                reg.SetValueEx(key, name, 0, reg.REG_DWORD, int(value))
-            else:
-                reg.SetValueEx(key, name, 0, reg.REG_SZ, str(value))
-    _call_refresh(refresh, winreg)
-
-
-def _call_refresh(refresh: Optional[Callable[[], None]], winreg: Any) -> None:
-    if refresh is not None:
-        refresh()
-        return
-    if winreg is not None:  # test double in use: never touch wininet
-        return
-    try:
-        refresh_proxy_settings()
-    except Exception:  # pragma: no cover - browsers simply pick the change up later
-        pass
-
-
-def refresh_proxy_settings(set_option: Optional[Callable[[Any, int, Any, int], Any]] = None) -> None:
-    """Notify WinINet (and thus IE mode / Edge / Windows apps) that the proxy settings changed.
-
-    ``set_option`` defaults to ``ctypes.windll.wininet.InternetSetOptionW``.
-    """
-    if set_option is None:
-        _require_windows(None)
-        import ctypes  # noqa: WPS433
-
-        set_option = ctypes.windll.wininet.InternetSetOptionW  # type: ignore[attr-defined]
-    set_option(None, INTERNET_OPTION_SETTINGS_CHANGED, None, 0)
-    set_option(None, INTERNET_OPTION_REFRESH, None, 0)
-
-
-# --------------------------------------------------------------------------- CA certificate
-
-def mitmproxy_ca_cert_path(home: Optional[str] = None) -> Optional[str]:
-    """``~/.mitmproxy/mitmproxy-ca-cert.cer`` (preferred by certutil) or ``.pem``, whichever exists."""
-    base = os.path.join(home or os.path.expanduser("~"), ".mitmproxy")
-    for name in ("mitmproxy-ca-cert.cer", "mitmproxy-ca-cert.pem"):
-        path = os.path.join(base, name)
-        if os.path.isfile(path):
-            return path
-    return None
-
-
-def cert_installed(run: Optional[Callable[[list[str]], Any]] = None) -> Optional[bool]:
-    """Is the mitmproxy CA in the current user's Root store?  ``None`` when certutil is unavailable."""
-    _require_windows(run)
-    runner = run or _default_run
-    try:
-        result = runner(["certutil", "-user", "-store", "Root"])
-    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired):
-        return None
-    except OSError:
-        return None
-    output = f"{getattr(result, 'stdout', '') or ''}\n{getattr(result, 'stderr', '') or ''}"
-    if getattr(result, "returncode", 1) != 0 and _CERT_MARKER not in output.lower():
-        return None if not output.strip() else False
-    return _CERT_MARKER in output.lower()
-
-
-def install_ca_cert(path: Optional[str] = None, run: Optional[Callable[[list[str]], Any]] = None) -> tuple[bool, str]:
-    """``certutil -user -addstore Root <cert>``; returns ``(success, output)``.
-
-    Installing into the *user* store needs no administrator rights.  Edge / IE mode trust the user
-    store, so this is enough for recording.
-    """
-    _require_windows(run)
-    cert = path or mitmproxy_ca_cert_path()
-    if not cert:
-        return False, (
-            "mitmproxy の CA 証明書が見つかりません。先に一度「記録開始」でプロキシを起動すると "
-            "~/.mitmproxy/mitmproxy-ca-cert.cer が作成されます。"
-        )
-    if not os.path.isfile(cert):
-        return False, f"証明書ファイルがありません: {cert}"
-    runner = run or _default_run
-    try:
-        result = runner(["certutil", "-user", "-addstore", "Root", cert])
-    except FileNotFoundError:
-        return False, "certutil が見つかりません (Windows 標準のコマンドです。PATH を確認してください)"
-    except subprocess.TimeoutExpired:
-        return False, "certutil が応答しません (タイムアウト)"
-    except OSError as exc:
-        return False, f"certutil を実行できません: {exc}"
-    output = f"{getattr(result, 'stdout', '') or ''}{getattr(result, 'stderr', '') or ''}".strip()
-    ok = getattr(result, "returncode", 1) == 0
-    if ok:
-        output = (output + "\n" if output else "") + f"CA 証明書を登録しました: {cert}"
-    return ok, output
-
-
-# --------------------------------------------------------------------------- aggregated status
-
-def status_summary(winreg: Any = None, run: Optional[Callable[[list[str]], Any]] = None) -> dict:
-    """``{"is_windows", "proxy": {...}|None, "cert": {"installed", "path"}}`` for the GUI.
-
-    Never raises: on other OSes ``proxy`` is ``None`` and ``cert.installed`` is ``None``; registry /
-    certutil errors are reported in ``error``.
-    """
-    windows = is_windows() or winreg is not None or run is not None
-    info: dict[str, Any] = {
-        "is_windows": windows,
-        "proxy": None,
-        "cert": {"installed": None, "path": mitmproxy_ca_cert_path()},
-        "error": None,
-    }
-    if not windows:
-        return info
-    try:
-        info["proxy"] = get_system_proxy(winreg=winreg)
-    except Exception as exc:  # registry access problems should not break the GUI
-        info["error"] = f"プロキシ設定を読み取れません: {exc}"
-    try:
-        info["cert"]["installed"] = cert_installed(run=run)
-    except Exception as exc:
-        info["error"] = (info["error"] + " / " if info["error"] else "") + f"証明書の確認に失敗しました: {exc}"
-    return info
-
-
-# ===== former reqrec/webapp/launch.py: open a browser / a folder (easy mode) =====
-# Open a browser / a folder from the GUI (かんたんモード).  Contract: DESIGN.md §13.11.
-#
-# The easy mode never asks the user to configure a proxy by hand: after the recording proxy is up
-# (and, on Windows, the system proxy is set) the GUI opens **Microsoft Edge** itself so the user only
-# has to operate the site.  Edge is preferred because Edge's IE mode is the main target; when Edge
-# is not found the OS default browser is used.
-#
-# Every function takes injectable callables so the logic is unit tested on any OS without launching
-# anything.
-
-#: What Edge opens when the user did not type a site address.
-DEFAULT_START_URL = "edge://newtab"
-
-_EDGE_CANDIDATES = (
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-)
-_EDGE_APP_PATHS_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"
 #: ``scheme:`` prefix (RFC 3986); anything with one that is not http(s) is rejected, never patched.
 _GUI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
 #: ``host:port[/...]`` typed without a scheme (``kanri:8080/app``): the part before ``:`` is a host, not a scheme.
 _HOST_PORT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]*:\d{1,5}(?:[/?#]|$)")
 
 
-def _is_windows() -> bool:
-    return sys.platform == "win32" or os.name == "nt"
-
-
-def find_edge(exists: Callable[[str], bool] = os.path.isfile, winreg: Any = None, env: Optional[dict] = None) -> Optional[str]:
-    """Path of ``msedge.exe`` (known install folders, then the registry *App Paths*), else None."""
-    environ = os.environ if env is None else env
-    candidates = list(_EDGE_CANDIDATES)
-    for var in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
-        base = environ.get(var)
-        if base:
-            candidates.append(os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"))
-    for path in candidates:
-        if exists(path):
-            return path
-    reg = winreg
-    if reg is None:
-        if not _is_windows():
-            return None
-        try:
-            import winreg as reg  # type: ignore[no-redef]
-        except ImportError:  # pragma: no cover
-            return None
-    for hive_name in ("HKEY_LOCAL_MACHINE", "HKEY_CURRENT_USER"):
-        hive = getattr(reg, hive_name, None)
-        if hive is None:
-            continue
-        try:
-            with reg.OpenKey(hive, _EDGE_APP_PATHS_KEY) as key:
-                value, _ = reg.QueryValueEx(key, None)
-        except OSError:
-            continue
-        value = str(value or "").strip().strip('"')
-        if value and exists(value):
-            return value
-    return None
-
-
 def validate_url(url: Any) -> str:
-    """``http(s)://...`` or ``edge://...``; an address without a scheme gets ``http://``.
+    """``http(s)://...``; an address without a scheme gets ``http://``.
 
-    Raises ``ValueError`` with a Japanese message for anything else (``javascript:`` and friends
-    must never reach the browser from an API call).
+    Raises ``ValueError`` with a Japanese message for an empty address and for anything else
+    (``javascript:``, ``edge://`` and friends must never reach the browser from an API call).
     """
     text = str(url or "").strip()
     if not text:
-        return DEFAULT_START_URL
-    if text.startswith("edge://"):
-        return text
+        raise ValueError("サイトのアドレスを入力してください (例: http://kanri/)")
     if not _GUI_SCHEME_RE.match(text) or _HOST_PORT_RE.match(text):  # "kanri/top", "kanri:8080/top" -> http://...
         text = "http://" + text
     parts = urlsplit(text)
     if parts.scheme not in ("http", "https") or not parts.netloc:
-        raise ValueError("サイトのアドレスは http:// または https:// で始まる形で入力してください (例: https://intra.example.co.jp/)")
+        raise ValueError("サイトのアドレスは http:// で始まる形で入力してください (例: http://kanri/)")
     if any(ch in text for ch in "\r\n\x00"):
         raise ValueError("サイトのアドレスに使えない文字が含まれています")
     return text
-
-
-def open_url(
-    url: Any,
-    prefer_edge: bool = True,
-    popen: Optional[Callable[..., Any]] = None,
-    browser_open: Optional[Callable[[str], bool]] = None,
-    edge_path: Optional[str] = None,
-) -> dict[str, Any]:
-    """Open ``url`` in Edge when available (else the default browser).
-
-    Returns ``{"url", "browser": "edge"|"default", "path"}``.  Raises ``ValueError`` for an
-    invalid URL and ``RuntimeError`` when nothing could be started.
-    """
-    target = validate_url(url)
-    spawn = popen or subprocess.Popen
-    opener = browser_open or webbrowser.open
-    edge = edge_path if edge_path is not None else (find_edge() if prefer_edge else None)
-    if edge:
-        try:
-            spawn([edge, target], close_fds=True)
-            return {"url": target, "browser": "edge", "path": edge}
-        except OSError as exc:  # fall back to the default browser
-            last_error = str(exc)
-    else:
-        last_error = "Edge が見つかりません"
-    if target.startswith("edge://"):
-        target = "about:blank"
-    try:
-        ok = opener(target)
-    except Exception as exc:  # pragma: no cover - webbrowser rarely raises
-        raise RuntimeError(f"ブラウザを開けませんでした: {exc} ({last_error})") from exc
-    if not ok:
-        raise RuntimeError(f"ブラウザを開けませんでした ({last_error})。手でブラウザを開いてサイトにアクセスしてください。")
-    return {"url": target, "browser": "default", "path": None}
 
 
 def open_folder(
@@ -9643,7 +8903,7 @@ def open_folder(
 # Per-process state of the GUI and the helpers the routes build on.  Contract: DESIGN.md §13.6.
 #
 # * :class:`AppState` - the loaded recording, the current plan / options, the recorder, the script
-#   runner and the Windows proxy backup, guarded by one re-entrant lock.
+#   runner and the recording browser, guarded by one re-entrant lock.
 # * :func:`safe_name` / :meth:`AppState.path_in` - the **only** way a client-supplied name becomes a
 #   path (always inside the right ``workdir`` sub-folder).
 # * :func:`plan_options_from_json` / :func:`gen_options_from_json` - whitelist + coerce the option
@@ -9657,7 +8917,7 @@ def open_folder(
 SUBDIRS = ("recordings", "uploads", "scripts", "outputs")
 
 #: What the upload / open endpoints accept (``importers.load_recording`` dispatches on these).
-RECORDING_EXTENSIONS = frozenset({".har", ".json", ".mitm", ".flows", ".flow"})
+RECORDING_EXTENSIONS = frozenset({".har", ".json"})
 
 #: File names coming from the browser must match this after basename reduction.
 _NAME_RE = re.compile(r"^[\w.\-]+$", re.UNICODE)
@@ -9813,7 +9073,7 @@ def _is_empty(value: Any) -> bool:
     return value is None or (isinstance(value, str) and not value.strip()) or (isinstance(value, (list, tuple)) and not value)
 
 
-def _coerce_field(cls: type, field: dataclasses.Field, value: Any, hints: dict[str, Any]) -> Any:
+def _coerce_field(field: dataclasses.Field, value: Any, hints: dict[str, Any]) -> Any:
     name = field.name
     hint = hints.get(name)
     origin = typing.get_origin(hint)
@@ -9853,7 +9113,7 @@ def _options_from_json(cls: type, data: Any, what: str):
     kwargs: dict[str, Any] = {}
     for field in dataclasses.fields(cls):
         if field.name in data:
-            kwargs[field.name] = _coerce_field(cls, field, data[field.name], hints)
+            kwargs[field.name] = _coerce_field(field, data[field.name], hints)
     return cls(**kwargs)
 
 
@@ -9933,8 +9193,6 @@ def load_sources(paths: list[str]) -> Recording:
         raise ApiError("読み込むファイルが指定されていません")
     try:
         return _load_recordings(paths)
-    except ImportError as exc:  # .mitm without mitmproxy
-        raise ApiError(str(exc)) from exc
     except (ValueError, KeyError, TypeError) as exc:
         raise ApiError(f"記録ファイルを読み込めません: {exc}") from exc
     except OSError as exc:
@@ -9963,7 +9221,6 @@ class ScriptRunner:
         self._stdout_full: list[str] = []
         self._stdout_bytes = 0
         self._stdout_truncated = False
-        self.script_path: Optional[str] = None
         self.name: Optional[str] = None
         self.started_at: Optional[float] = None
         self.finished_at: Optional[float] = None
@@ -10007,7 +9264,6 @@ class ScriptRunner:
             except OSError as exc:
                 raise ApiError(f"スクリプトを起動できません: {exc}", status=500) from exc
             self._proc = proc
-            self.script_path = script_path
             self.name = os.path.basename(script_path)
             self.started_at = time.time()
             self.finished_at = None
@@ -10169,12 +9425,7 @@ class AppState:
         self.last_script_name: Optional[str] = None
         self.recorder = recorder or RecorderManager()
         self.runner = runner or ScriptRunner()
-        self.proxy_backup: Optional[dict] = None
-        self.proxy_server: Optional[str] = None
         self.record_append = False
-        #: ``browser`` of the running recording (``"iehost"`` / ``"none"``), ``None`` when idle.
-        self.record_browser_kind: Optional[str] = None
-        self.record_https_passthrough = True
         #: Screen that started the running recording: ``"easy"`` (かんたん画面) or ``"advanced"``
         #: (詳細設定); ``None`` when idle.  Only an easy-started recording may be stopped automatically
         #: by the easy screen when its recording browser is closed (survives a page reload).
@@ -10182,10 +9433,8 @@ class AppState:
         #: Last ``iehost.launch`` failure of this session (e.g. the exe blocked by AppLocker), for the page.
         self.iehost_error: Optional[str] = None
         #: The in-app recording browser (``iehost.BrowserProcess``) of the current / last
-        #: recording started with ``browser: "iehost"`` (DESIGN.md §13.12); ``None`` otherwise.
+        #: recording (DESIGN.md §13.12); ``None`` when none was started.
         self.browser: Optional[Any] = None
-        self.last_message: Optional[str] = None
-        self._atexit_registered = False
         self.ensure_dirs()
 
     # ------------------------------------------------------------------ folders & paths
@@ -10281,27 +9530,6 @@ class AppState:
                 "excluded_self_flows": int(rec.meta.get("excluded_self_flows", 0)) if rec is not None else 0,
             }
 
-    # ------------------------------------------------------------------ Windows proxy
-
-    def register_proxy_restore(self, restore: Callable[[dict], None]) -> None:
-        """Make sure the system proxy is put back even if the process dies with Ctrl+C."""
-        if self._atexit_registered:
-            return
-        import atexit
-
-        def _restore_at_exit() -> None:
-            backup = self.proxy_backup
-            if backup is None:
-                return
-            try:
-                restore(backup)
-            except Exception:
-                pass
-            self.proxy_backup = None
-
-        atexit.register(_restore_at_exit)
-        self._atexit_registered = True
-
     # ------------------------------------------------------------------ recording browser
 
     def close_browser(self, timeout: float = 5.0) -> Optional[int]:
@@ -10342,30 +9570,26 @@ def _plain_meta(meta: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-# --------------------------------------------------------------------------- free port (かんたんモード)
+# --------------------------------------------------------------------------- free port (recording proxy)
 
 def find_free_port(host: str = "127.0.0.1", preferred: int = 8080, avoid: Iterable[int] = (), attempts: int = 40) -> int:
     """A TCP port the recording proxy can bind: ``preferred`` first, then the following ports,
     finally one chosen by the OS.  Ports in ``avoid`` (the GUI's own) are skipped.
 
-    The easy mode uses this so the user never has to know what a port is.
+    Every recording uses this so the user never has to know what a port is.
     """
-    import socket
-
     skip = {int(p) for p in avoid}
-    bind_host = "127.0.0.1" if host in ("0.0.0.0", "", "*") else host
-    family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
     for port in range(int(preferred), int(preferred) + max(1, int(attempts))):
         if port in skip or not 1 <= port <= 65535:
             continue
-        with socket.socket(family, socket.SOCK_STREAM) as sock:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             try:
-                sock.bind((bind_host, port))
+                sock.bind((host, port))
             except OSError:
                 continue
             return port
-    with socket.socket(family, socket.SOCK_STREAM) as sock:
-        sock.bind((bind_host, 0))
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
         return int(sock.getsockname()[1])
 
 
@@ -10387,16 +9611,12 @@ bp = Blueprint("reqrec", __name__, root_path=os.path.dirname(os.path.abspath(__f
 BODY_LIMIT = 200 * 1024
 #: Flow count is only computed for listed files up to this size (it means parsing the file).
 CHEAP_COUNT_MAX_BYTES = 3 * 1024 * 1024
-#: Shape of a generated / saved script name (``.py`` optional).
-_SCRIPT_NAME_RE = re.compile(r"^[\w.\-]+$", re.UNICODE)
 _GUI_FLOW_ID_RE = re.compile(r"^f\d{4,}$")
-
-#: Default proxy bypass list for the Windows system proxy (the GUI itself must not be proxied).
-_PROXY_OVERRIDE = DEFAULT_PROXY_OVERRIDE
 
 #: Window title of the in-app recording browser (DESIGN.md §13.12); the host appends 「— 記録中」.
 BROWSER_TITLE = "reqrec 記録用ブラウザ"
 #: Extra mitmdump arguments that tunnel HTTPS untouched (no CA certificate needed; only http:// is recorded).
+#: Every recording is started with them.
 #: A catch-all pattern: ``:443$`` matched port 443 only, so ``https://kanri:8443/`` was intercepted with
 #: the untrusted mitmproxy CA (certificate error) although the status line says HTTPS is not recorded.
 #: In regular (explicit proxy) mode mitmproxy applies ``ignore_hosts`` only when deciding the layer of a
@@ -10407,8 +9627,6 @@ BROWSER_TITLE = "reqrec 記録用ブラウザ"
 HTTPS_PASSTHROUGH_ARGS = ("--ignore-hosts", ".*")
 #: Seconds ``record_start`` waits for mitmdump to accept connections before opening the recording browser.
 PROXY_READY_TIMEOUT = 20.0
-#: Accepted values of ``browser`` on ``POST /api/record/start``.
-_BROWSER_KINDS = ("none", "iehost")
 #: Accepted values of ``origin`` on ``POST /api/record/start``: the screen that started the recording.
 _ORIGINS = ("advanced", "easy")
 
@@ -10453,11 +9671,6 @@ def _bool(value: Any, default: bool = False) -> bool:
 def _ok(**data: Any) -> Response:
     data.setdefault("ok", True)
     return jsonify(data)
-
-
-def _windows_only() -> None:
-    if not is_windows():
-        raise ApiError(NOT_WINDOWS_MESSAGE, status=400, is_windows=False)
 
 
 def _options_from_body(body: dict[str, Any]) -> tuple[PlanOptions, GenOptions]:
@@ -10653,8 +9866,7 @@ def _script_name(raw: Any) -> str:
 def _file_entry_with_flows(entry: dict[str, Any]) -> dict[str, Any]:
     out = {k: v for k, v in entry.items() if k != "path"}
     out["flows"] = None
-    ext = os.path.splitext(entry["name"])[1].lower()
-    if entry["size"] <= CHEAP_COUNT_MAX_BYTES and ext in (".json", ".har"):
+    if entry["size"] <= CHEAP_COUNT_MAX_BYTES:  # list_files only returns .har / .json
         try:
             with open(entry["path"], "rb") as fh:
                 data = json.loads(fh.read().decode("utf-8-sig", errors="replace"))
@@ -10709,7 +9921,6 @@ def _iehost_info(state: AppState) -> dict[str, Any]:
 
 def _require_iehost(state: AppState) -> None:
     """400 unless the in-app recording browser can be used on this PC (Windows + csc.exe or a prebuilt exe)."""
-    _windows_only()
     info = iehost.availability(state.workdir)
     if not info.get("available"):
         raise ApiError(info.get("reason") or "記録用ブラウザ (IE エンジン) はこの PC では使えません。", status=400, iehost=info)
@@ -10721,8 +9932,6 @@ def _iehost_start_url(raw: Any) -> Optional[str]:
     text = str(raw or "").strip()
     if not text:
         return None
-    if text.lower().startswith("edge://"):
-        raise ApiError("記録用ブラウザで開けるのは http:// または https:// のアドレスだけです")
     try:
         return validate_url(text)
     except ValueError as exc:
@@ -10793,21 +10002,22 @@ def _abandon_start(state: AppState, out: str) -> None:
         state.recorder.stop()
         _remove_quietly(out)
         _forget_recording(state)
-        state.record_browser_kind = None
         state.record_origin = None
 
 
-def _launch_iehost(state: AppState, proxy_address: str, start_url: Optional[str], https_recorded: bool = False) -> Any:
+def _proxy_address(port: int) -> str:
+    """``127.0.0.1:PORT``: the recording proxy as the recording browser is told to use it."""
+    return f"{RECORD_LISTEN_HOST}:{int(port)}"
+
+
+def _launch_iehost(state: AppState, proxy_address: str, start_url: Optional[str]) -> Any:
     """Start ``RecBrowser.exe`` (building it first when needed) and remember it as ``state.browser``.
 
     Raises :class:`ApiError` 500 (``kind: "iehost"``) with a Japanese message; the compiler's output
     is part of the message when the build failed (``IEHostError`` carries it).
     """
     try:
-        kwargs: dict[str, Any] = {"url": start_url, "title": BROWSER_TITLE}
-        if https_recorded:
-            kwargs["https_recorded"] = True
-        proc = iehost.launch(state.workdir, proxy_address, **kwargs)
+        proc = iehost.launch(state.workdir, proxy_address, url=start_url, title=BROWSER_TITLE)
     except Exception as exc:
         current_app.logger.exception("iehost launch failed")
         state.iehost_error = str(exc)
@@ -10837,7 +10047,6 @@ def index() -> str:
         _GUI_TEMPLATE,
         token=state.token,
         version=__version__,
-        is_windows=is_windows(),
         gui_address=f"{flask_request.host}",
         workdir=state.workdir,
         mitmproxy_available=mitmproxy_available(),
@@ -10848,8 +10057,6 @@ def index() -> str:
 @bp.get("/api/state")
 def api_state() -> Response:
     state = get_state()
-    windows = status_summary() if is_windows() else {"is_windows": False, "proxy": None, "cert": {"installed": None, "path": None}, "error": None}
-    windows["proxy_backup_active"] = state.proxy_backup is not None
     return jsonify({
         "version": __version__,
         "workdir": state.workdir,
@@ -10861,10 +10068,8 @@ def api_state() -> Response:
         "plan_options": options_to_plain(state.plan_options),
         "gen_options": options_to_plain(state.gen_options),
         "run": state.runner.status(),
-        "windows": windows,
         "iehost": _iehost_info(state),
         "browser": _browser_status(state),
-        "record_browser_kind": state.record_browser_kind,
         "record_origin": state.record_origin,
         "last_script": state.last_script_name,
         "secrets": list(state.last_secrets),
@@ -10875,21 +10080,15 @@ def api_state() -> Response:
 
 @bp.post("/api/record/start")
 def record_start() -> Response:
+    """Start the recorder and open the recording browser through it (DESIGN.md §13.12).
+
+    The proxy listens on ``127.0.0.1`` on a free port and tunnels every HTTPS connection untouched
+    (:data:`HTTPS_PASSTHROUGH_ARGS`), so only ``http://`` is recorded and no certificate is needed.
+    Body (all optional): ``{"hosts": [...], "append": bool, "start_url": "...", "emulation": "keep" |
+    <preset>, "origin": "easy" | "advanced"}``.
+    """
     state = get_state()
     body = _json_body(required=False)
-    raw_port = body.get("port", 8080)
-    if raw_port is None or (isinstance(raw_port, str) and not raw_port.strip()):
-        raw_port = 8080
-    auto_port = isinstance(raw_port, str) and raw_port.strip().lower() == "auto"  # かんたんモード: 空きポートを自動選択
-    if auto_port:
-        port = 0  # resolved below, once listen_host is known
-    else:
-        try:
-            port = int(raw_port)
-        except (TypeError, ValueError):
-            raise ApiError("ポート番号は数値で指定してください") from None
-        if not 1 <= port <= 65535:
-            raise ApiError("ポート番号は 1〜65535 で指定してください")
     hosts_raw = body.get("hosts", [])
     if isinstance(hosts_raw, str):
         hosts = [h for h in re.split(r"[,\s;]+", hosts_raw) if h]
@@ -10897,18 +10096,8 @@ def record_start() -> Response:
         hosts = [str(h).strip() for h in hosts_raw if str(h).strip()]
     else:
         raise ApiError("対象ホストは配列か文字列で指定してください")
-    listen_host = str(body.get("listen_host") or "127.0.0.1").strip() or "127.0.0.1"
-    set_proxy = _bool(body.get("set_system_proxy"), False)
     append = _bool(body.get("append"), False)
-    # --- in-app recording browser (DESIGN.md §13.12) ---
-    browser_kind = str(body.get("browser") or "none").strip().lower()
-    if browser_kind not in _BROWSER_KINDS:
-        raise ApiError(f"記録方式 (browser) は {' / '.join(_BROWSER_KINDS)} のどちらかで指定してください")
-    use_iehost = browser_kind == "iehost"
-    # the first page only matters for the recording browser; a stale value from a hidden field must
-    # not make an Edge / manual recording fail
-    start_url = _iehost_start_url(body.get("start_url")) if use_iehost else None
-    https_passthrough = _bool(body.get("https_passthrough"), use_iehost)
+    start_url = _iehost_start_url(body.get("start_url"))
     emulation = str(body.get("emulation") or "keep").strip().lower()
     if emulation != "keep" and emulation not in iehost.EMULATION_LEVELS:
         raise ApiError(f"表示モード (emulation) は keep / {' / '.join(iehost.EMULATION_LEVELS)} のいずれかで指定してください")
@@ -10925,52 +10114,27 @@ def record_start() -> Response:
             "mitmproxy がインストールされていないため記録できません。コマンドプロンプトで "
             'pip install "reqrec[record]" を実行してから GUI を再起動してください。', status=400,
         )
-    if use_iehost:
-        _require_iehost(state)
-        if set_proxy:
-            raise ApiError("アプリ内の記録用ブラウザを使うときは、システムプロキシの自動設定は使えません (必要もありません)。")
-    if set_proxy:
-        _windows_only()
-    if auto_port:
-        try:
-            port = find_free_port(listen_host, preferred=8080, avoid=(state.port,))
-        except OSError as exc:
-            raise ApiError(f"記録用の空きポートが見つかりません: {exc}", status=500) from exc
-    if port == state.port and listen_host in ("127.0.0.1", "localhost", state.host, "0.0.0.0", "::"):
-        raise ApiError(f"ポート {port} はこの GUI が使用中です。別のポート (例: 8080) を指定してください。")
+    _require_iehost(state)
+    try:
+        port = find_free_port(RECORD_LISTEN_HOST, preferred=8080, avoid=(state.port,))
+    except OSError as exc:
+        raise ApiError(f"記録用の空きポートが見つかりません: {exc}", status=500) from exc
 
     out = os.path.join(state.subdir("recordings"), _timestamp_name("rec", ".json"))
-    start_kwargs: dict[str, Any] = {}
-    if https_passthrough:
-        start_kwargs["extra_args"] = list(HTTPS_PASSTHROUGH_ARGS)
+    proxy_address = _proxy_address(port)
     with state.lock:
         state.close_browser()  # a browser left over from an earlier session must not record into the new one
         try:
-            status = state.recorder.start(out, port=port, hosts=hosts, listen_host=listen_host, **start_kwargs)
+            status = state.recorder.start(out, port=port, hosts=hosts, extra_args=list(HTTPS_PASSTHROUGH_ARGS))
         except RecorderError as exc:
             raise ApiError(str(exc), status=400) from exc
         state.record_append = append
-        state.record_browser_kind = browser_kind
-        state.record_https_passthrough = https_passthrough
         state.record_origin = origin
-        proxy_address = proxy_server_for(listen_host, port)
-        proxy_result: Optional[dict[str, Any]] = None
-        if set_proxy:
-            try:
-                backup = set_system_proxy(proxy_address, enable=True, override=_PROXY_OVERRIDE)
-            except Exception as exc:
-                _abandon_start(state, out)
-                raise ApiError(f"システムプロキシを設定できませんでした: {exc}", status=500) from exc
-            if state.proxy_backup is None:  # keep the oldest backup when restarted without restore
-                state.proxy_backup = backup
-            state.proxy_server = proxy_address
-            state.register_proxy_restore(restore_system_proxy)
-            proxy_result = {"set": True, "server": proxy_address, "backup": backup}
     time.sleep(0.15)  # give an immediately failing child (port in use) the chance to report
     status = state.recorder.status()
     browser_result: Optional[dict[str, Any]] = None
     warnings: list[str] = []
-    if use_iehost and status.get("running"):
+    if status.get("running"):
         # mitmdump needs a second or two before it accepts connections; a browser pointed at it
         # earlier shows 「ページを表示できません」 for the first page.  Wait without the lock.
         wait = getattr(state.recorder, "wait_until_listening", None)
@@ -11004,23 +10168,18 @@ def record_start() -> Response:
                     raise ApiError(f"記録用ブラウザの表示モードを設定できませんでした: {exc}", status=500,
                                    kind=ERROR_KIND_EMULATION) from exc
             try:
-                proc = _launch_iehost(state, proxy_address, start_url, https_recorded=not https_passthrough)
+                proc = _launch_iehost(state, proxy_address, start_url)
             except ApiError:
                 _abandon_start(state, out)
                 raise
             browser_result = _browser_payload(proc)
     return _ok(
-        instructions=format_instructions(out, port, hosts, listen_host),
         out=os.path.basename(out),
         out_path=out,
         port=port,
-        auto_port=auto_port,
         proxy_address=proxy_address,
-        system_proxy=proxy_result,
         status=status,
         browser=browser_result,
-        browser_kind=browser_kind,
-        https_passthrough=https_passthrough,
         emulation=emulation,
         origin=origin,
         warnings=warnings,
@@ -11036,26 +10195,10 @@ def _default_command_builder():
 def record_status() -> Response:
     state = get_state()
     status = state.recorder.status()
-    status["proxy_backup_active"] = state.proxy_backup is not None
     status["mitmproxy_available"] = mitmproxy_available()
     status["browser"] = _browser_status(state)
-    status["browser_kind"] = state.record_browser_kind
     status["origin"] = state.record_origin
     return jsonify(status)
-
-
-def _restore_proxy(state: AppState) -> Optional[str]:
-    """Put the Windows proxy back if we changed it; returns an error message instead of raising."""
-    backup = state.proxy_backup
-    if backup is None:
-        return None
-    try:
-        restore_system_proxy(backup)
-    except Exception as exc:
-        return f"システムプロキシを元に戻せませんでした: {exc}"
-    state.proxy_backup = None
-    state.proxy_server = None
-    return None
 
 
 @bp.post("/api/record/stop")
@@ -11073,8 +10216,6 @@ def record_stop() -> Response:
         had_browser = state.browser is not None
         browser_exit_code = state.close_browser(timeout=5.0)
         exit_code = state.recorder.stop()
-        proxy_error = _restore_proxy(state)
-        state.record_browser_kind = None
         state.record_origin = None
         if discard:
             # [やめる]: nothing is loaded (the recording already loaded stays as it was) and the
@@ -11082,14 +10223,14 @@ def record_stop() -> Response:
             # recorder forgets it so 詳細設定 does not say 「記録は保存されました」 for a deleted file.
             removed = _remove_quietly(state.recorder.out)
             _forget_recording(state)
-            return _ok(discarded=True, removed=removed, exit_code=exit_code, proxy_error=proxy_error,
+            return _ok(discarded=True, removed=removed, exit_code=exit_code,
                        browser_exit_code=browser_exit_code, recording=state.recording_summary())
         out_path = state.recorder.out
         try:
             recording = state.recorder.load_recording()
         except RecorderError as exc:
             if not (out_path and not os.path.exists(out_path) and exit_code is not None):
-                raise ApiError(str(exc), status=400, exit_code=exit_code, proxy_error=proxy_error,
+                raise ApiError(str(exc), status=400, exit_code=exit_code,
                                browser_exit_code=browser_exit_code, stderr_tail=state.recorder.status()["stderr_tail"]) from exc
             # The addon writes the file after the first response only, and on Windows the stop
             # (CTRL_BREAK) ends mitmdump before its final flush: no file = nothing was recorded.
@@ -11103,17 +10244,17 @@ def record_stop() -> Response:
                 )
             else:
                 message = (
-                    "何も記録されませんでした。ブラウザのプロキシ設定（と https:// のサイトなら CA 証明書）を確認し、"
-                    "記録中にページを開いてください。"
+                    "何も記録されませんでした。記録用ブラウザが開く前に記録が止まった可能性があります。"
+                    "もう一度 [記録をはじめる] を押し、http:// のページを開いて操作してください。"
                 )
             raise ApiError(
                 message,
-                status=400, exit_code=exit_code, proxy_error=proxy_error, browser_exit_code=browser_exit_code,
+                status=400, exit_code=exit_code, browser_exit_code=browser_exit_code,
                 out=os.path.basename(state.recorder.out or ""), empty=True,
             )
         summary = _apply_loaded(state, recording, [f"recordings/{os.path.basename(state.recorder.out or '')}"], append, from_gui_recorder=True)
     summary.update(out=os.path.basename(state.recorder.out or ""), out_path=state.recorder.out, exit_code=exit_code,
-                   proxy_error=proxy_error, browser_exit_code=browser_exit_code)
+                   browser_exit_code=browser_exit_code)
     return _ok(**summary)
 
 
@@ -11125,7 +10266,7 @@ def recordings_upload() -> Response:
     files = flask_request.files.getlist("files") or flask_request.files.getlist("file")
     files = [f for f in files if f and f.filename]
     if not files:
-        raise ApiError("ファイルが選択されていません (.har / .json / .mitm)")
+        raise ApiError("ファイルが選択されていません (.har / .json)")
     append = _bool(flask_request.form.get("append"), False)
     saved: list[str] = []
     display: list[str] = []
@@ -11133,7 +10274,7 @@ def recordings_upload() -> Response:
         name = sanitise_upload_name(storage.filename)
         ext = os.path.splitext(name)[1].lower()
         if ext not in RECORDING_EXTENSIONS:
-            raise ApiError(f"対応していないファイル形式です: {storage.filename} (対応: .har / .json / .mitm)")
+            raise ApiError(f"対応していないファイル形式です: {storage.filename} (対応: .har / .json)")
         target = unique_path(state.path_in("uploads", name, "アップロードファイル名"))
         try:
             storage.save(target)
@@ -11275,14 +10416,14 @@ def api_generate() -> Response:
             "steps": len(plan.steps),
             "final_step_index": plan.final_step_index,
             "auth": to_plain(plan.auth) if plan.auth is not None else None,
-            "suggested_name": _suggest_script_name(state, plan),
+            "suggested_name": _suggest_script_name(plan),
             "plan_options": options_to_plain(plan_opts),
             "gen_options": options_to_plain(gen_opts),
         }
     return jsonify(payload)
 
 
-def _suggest_script_name(state: AppState, plan: Plan) -> str:
+def _suggest_script_name(plan: Plan) -> str:
     host = ""
     for step in plan.steps:
         url = step.literal_url()
@@ -11484,67 +10625,6 @@ def run_save_output() -> Response:
     return _ok(name=name, path=path, size=len(output.encode("utf-8")), truncated=state.runner.status()["stdout_truncated"])
 
 
-# --------------------------------------------------------------------------- Windows
-
-@bp.get("/api/win/status")
-def win_status() -> Response:
-    state = get_state()
-    if not is_windows():
-        return jsonify({"is_windows": False, "proxy": None, "cert": {"installed": None, "path": None}, "error": None,
-                        "proxy_backup_active": False, "message": NOT_WINDOWS_MESSAGE})
-    info = status_summary()
-    info["proxy_backup_active"] = state.proxy_backup is not None
-    info["proxy_server_set"] = state.proxy_server
-    return jsonify(info)
-
-
-@bp.post("/api/win/proxy")
-def win_proxy() -> Response:
-    _windows_only()
-    state = get_state()
-    body = _json_body()
-    enable = _bool(body.get("enable"), True)
-    server = str(body.get("server") or "").strip()
-    if enable and not server:
-        raise ApiError("プロキシのアドレス (例: 127.0.0.1:8080) を指定してください")
-    try:
-        backup = set_system_proxy(server, enable=enable, override=str(body.get("override") or _PROXY_OVERRIDE))
-    except ValueError as exc:
-        raise ApiError(str(exc)) from exc
-    except Exception as exc:
-        raise ApiError(f"システムプロキシを設定できませんでした: {exc}", status=500) from exc
-    if state.proxy_backup is None:
-        state.proxy_backup = backup
-    state.proxy_server = server if enable else None
-    state.register_proxy_restore(restore_system_proxy)
-    return _ok(proxy=get_system_proxy(), backup=backup)
-
-
-@bp.post("/api/win/proxy/restore")
-def win_proxy_restore() -> Response:
-    _windows_only()
-    state = get_state()
-    if state.proxy_backup is None:
-        return _ok(restored=False, proxy=get_system_proxy(), message="この GUI で変更したプロキシ設定はありません")
-    error = _restore_proxy(state)
-    if error:
-        raise ApiError(error, status=500)
-    return _ok(restored=True, proxy=get_system_proxy())
-
-
-@bp.post("/api/win/cert/install")
-def win_cert_install() -> Response:
-    _windows_only()
-    body = _json_body(required=False)
-    path = body.get("path")
-    if path is not None:
-        path = str(path)
-    ok, output = install_ca_cert(path)
-    if not ok:
-        raise ApiError(output or "証明書の登録に失敗しました", status=400, output=output)
-    return _ok(output=output, installed=cert_installed(), path=path or mitmproxy_ca_cert_path())
-
-
 # --------------------------------------------------------------------------- かんたんモード (DESIGN.md §13.11)
 
 #: Folders of the work directory the easy mode may open in the file manager.
@@ -11553,25 +10633,12 @@ _OPENABLE_FOLDERS = ("workdir", "scripts", "outputs", "recordings", "uploads")
 
 @bp.post("/api/browser/open")
 def browser_open() -> Response:
-    """Open Edge (or the default browser) at ``{"url": ...}`` (blank = new tab).
+    """(Re)open the in-app recording browser of the running recording at ``{"url": ...}``.
 
-    With ``{"browser": "iehost"}`` the in-app recording browser is (re)opened instead: when it is
-    still running nothing happens (``relaunched: false``); when the recorder is running it is started
-    again against the recorder's proxy (``relaunched: true``); otherwise 409.
+    When it is still running nothing happens (``relaunched: false``); otherwise it is started again
+    against the recorder's proxy (``relaunched: true``).  409 when nothing is being recorded.
     """
     body = _json_body(required=False)
-    if str(body.get("browser") or "").strip().lower() == "iehost":
-        return _browser_open_iehost(body)
-    try:
-        result = open_url(body.get("url"), prefer_edge=_bool(body.get("prefer_edge"), True))
-    except ValueError as exc:
-        raise ApiError(str(exc)) from exc
-    except RuntimeError as exc:
-        raise ApiError(str(exc), status=500) from exc
-    return _ok(**result)
-
-
-def _browser_open_iehost(body: dict[str, Any]) -> Response:
     state = get_state()
     start_url = _iehost_start_url(body.get("url"))
     with state.lock:
@@ -11580,19 +10647,12 @@ def _browser_open_iehost(body: dict[str, Any]) -> Response:
             return _ok(running=True, relaunched=False, browser=_browser_payload(proc))
         if not state.recorder.running:
             raise ApiError("記録が開始されていません", status=409)
-        if state.record_browser_kind != "iehost":
-            # an Edge / manual recording intercepts HTTPS and has no emulation set up for the
-            # recording browser; opening one now would only confuse (and auto-stop) that recording
-            raise ApiError("この記録は記録用ブラウザを使わない方式で始められています。記録用ブラウザは開けません。", status=409)
         _require_iehost(state)
-        recorder_status = state.recorder.status()
-        listen_host = getattr(state.recorder, "listen_host", None) or recorder_status.get("listen_host") or "127.0.0.1"
-        port = getattr(state.recorder, "port", None) or recorder_status.get("port")
+        port = getattr(state.recorder, "port", None) or state.recorder.status().get("port")
         if not port:
             raise ApiError("記録用プロキシのポートが分かりません", status=500)
-        proxy_address = proxy_server_for(str(listen_host), int(port))
         state.close_browser(timeout=2.0)  # an exited process object is dropped before the new one starts
-        proc = _launch_iehost(state, proxy_address, start_url, https_recorded=not state.record_https_passthrough)
+        proc = _launch_iehost(state, _proxy_address(int(port)), start_url)
     return _ok(running=True, relaunched=True, browser=_browser_payload(proc))
 
 
@@ -11630,8 +10690,8 @@ def easy_build() -> Response:
         plan = _rebuild_plan(state, plan_opts)
         if not plan.steps:
             raise ApiError(
-                "スクリプトにできる通信が記録にありませんでした。記録中にサイトの画面を開いたか、"
-                "ブラウザが記録用プロキシを通っているか (証明書の登録を含む) を確認してください。",
+                "スクリプトにできる通信が記録にありませんでした。記録中に記録用ブラウザで"
+                " http:// のサイトの画面を開いたかを確認してください。",
                 status=400,
             )
         try:
@@ -11645,7 +10705,7 @@ def easy_build() -> Response:
         state.last_secrets = secrets
         raw_name = body.get("name")
         if raw_name is None or not str(raw_name).strip():
-            raw_name = f"{_suggest_script_name(state, plan)}_{datetime.now().strftime('%Y%m%d_%H%M')}"
+            raw_name = f"{_suggest_script_name(plan)}_{datetime.now().strftime('%Y%m%d_%H%M')}"
         name = _script_name(raw_name)
         path = state.path_in("scripts", name, "スクリプト名")
         try:
@@ -11957,26 +11017,19 @@ def run_gui(host: str = "127.0.0.1", port: int = 8765, workdir: str = "reqrec_wo
 
 
 def _shutdown(state: AppState) -> None:
-    """Stop children and put the Windows proxy back (also registered via atexit)."""
+    """Stop the children (recorder, recording browser, script run)."""
     try:
         state.close()
     except Exception:
         pass
-    if state.proxy_backup is not None:
-        try:
-            restore_system_proxy(state.proxy_backup)
-            state.proxy_backup = None
-            print("システムプロキシの設定を元に戻しました", flush=True)
-        except Exception as exc:  # pragma: no cover - Windows only
-            print(f"システムプロキシを元に戻せませんでした: {exc}", file=sys.stderr)
 
 
 # ===== former reqrec/gui.html: the GUI page (GUI_HTML) =====
 # The single page of the GUI: a Jinja template (name ``_GUI_TEMPLATE``, served from memory by
 # ``create_app``'s loader) rendered by the ``/`` route, the CSS and the JavaScript inlined in
-# ``{% raw %}`` blocks (vanilla JS, no CDN, no build step: the GUI works offline).  The former file
-# except two lines: the Jinja comment below and the AppLocker message, which names
-# ``python -m reqrec browser build``.
+# ``{% raw %}`` blocks (vanilla JS, no CDN, no build step: the GUI works offline).  Started as the
+# former file; on 2026-10-12 the inputs of the removed recording modes were taken out (port, listen
+# address, recording method, system proxy, certificate, https recording, legacy TLS).
 
 #: The GUI page (Jinja template).
 GUI_HTML = r'''<!DOCTYPE html>
@@ -12035,7 +11088,6 @@ body {
 }
 a { color: var(--primary); }
 code { font-family: var(--mono); font-size: .92em; background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 0 .3em; word-break: break-all; }
-pre code { background: none; border: 0; padding: 0; }
 h1 { font-size: 1.45rem; margin: 0 0 .35rem; letter-spacing: -.01em; }
 h2 { font-size: 1.05rem; margin: 0 0 .75rem; color: var(--text); }
 h3 { font-size: .95rem; margin: 1rem 0 .4rem; color: var(--text-muted); font-weight: 600; }
@@ -12163,9 +11215,6 @@ input:focus, select:focus, button:focus-visible { outline: 2px solid #8fb4f2; ou
 .rec-count { display: flex; align-items: baseline; gap: .4rem; }
 .rec-count-num { font-size: 2rem; font-weight: 800; color: var(--primary); font-variant-numeric: tabular-nums; }
 .rec-count-label { color: var(--text-muted); }
-.howto { padding-left: 1.3rem; margin: .25rem 0; }
-.howto > li { margin-bottom: .6rem; }
-.howto ul { margin: .3rem 0 0; padding-left: 1.1rem; color: var(--text-muted); }
 details summary { cursor: pointer; color: var(--text-muted); font-size: .9rem; margin-top: .5rem; }
 
 /* ------------------------------------------------------------------ load panel */
@@ -12197,7 +11246,6 @@ table.flows tbody tr.dropped td { background: var(--dropped-bg); color: var(--dr
 table.flows tbody tr.dropped:hover td { background: #eef1f6; }
 table.flows tbody tr.final td { background: var(--ok-soft); }
 table.flows tbody tr.final td.col-step .step-no { background: var(--ok); }
-table.flows tbody tr.loading td { opacity: .5; }
 .col-check, .col-radio { width: 2.6rem; text-align: center !important; }
 .col-step { width: 4.5rem; white-space: nowrap; }
 .col-method { width: 5rem; }
@@ -12360,19 +11408,15 @@ body.easy-mode .content { max-width: 960px; }
 
 /* ------------------------------------------------------------------ 記録用ブラウザ (IE エンジン) */
 select.w-full { width: 100%; max-width: 100%; }
-#rec-browser-hint, .rec-iehost-only .hint { margin-top: .25rem; }
+#rec-emulation + .hint { margin-top: .25rem; }
 .easy-ready li.bad { color: #7a1e14; }
-.check input:disabled + span { opacity: .55; }
 {% endraw %}
 </style>
 </head>
 <body data-token="{{ token }}"
-      data-is-windows="{{ 'true' if is_windows else 'false' }}"
-      data-gui-address="{{ gui_address }}"
       data-mitm-available="{{ 'true' if mitmproxy_available else 'false' }}"
       data-iehost-available="{{ 'true' if iehost and iehost.available else 'false' }}"
-      data-iehost-reason="{{ (iehost.reason if iehost and iehost.reason else '') }}"
-      data-workdir="{{ workdir }}">
+      data-iehost-reason="{{ (iehost.reason if iehost and iehost.reason else '') }}">
 
 <header class="topbar">
   <div class="topbar-row">
@@ -12381,7 +11425,7 @@ select.w-full { width: 100%; max-width: 100%; }
       <span class="brand-tagline">ブラウザ操作の HTTP 通信を記録して、Python のスクレイピングスクリプトを自動生成します</span>
     </div>
     <div class="status-bar" id="status-bar" role="status" aria-live="polite">
-      <span class="status-dot" id="status-dot"></span>
+      <span class="status-dot"></span>
       <span id="status-text">準備完了。</span>
     </div>
     <button type="button" id="mode-toggle" class="btn tiny ghost mode-toggle" title="フィルタ設定や通信の一覧など、細かい設定を表示します">詳細設定を表示</button>
@@ -12415,21 +11459,21 @@ select.w-full { width: 100%; max-width: 100%; }
   <div class="easy-stage" id="easy-idle">
     <div class="easy-hero">
       <h1 id="h-easy">サイトの操作を記録して、自動取得スクリプトを作ります</h1>
-      <p class="lead" id="easy-lead">やることは 3 つだけです。ポートやプロキシなどの設定はすべて自動で行います。Windows の設定や証明書は変更しません。</p>
+      <p class="lead">やることは 3 つだけです。ポートやプロキシなどの設定はすべて自動で行います。Windows の設定や証明書は変更しません。</p>
       <ol class="easy-flow">
-        <li><span class="easy-flow-num">1</span><div><strong>記録をはじめる</strong> を押す<br><span class="hint" id="easy-hint-1">記録用のブラウザが開きます (Edge の IE モードと同じエンジン)</span></div></li>
+        <li><span class="easy-flow-num">1</span><div><strong>記録をはじめる</strong> を押す<br><span class="hint">記録用のブラウザが開きます (Edge の IE モードと同じエンジン)</span></div></li>
         <li><span class="easy-flow-num">2</span><div><strong>いつもどおりサイトを操作する</strong><br><span class="hint">ログイン → 一覧を開く → 欲しいデータの画面まで</span></div></li>
-        <li><span class="easy-flow-num">3</span><div><strong>記録をおわる</strong> を押す<br><span class="hint" id="easy-hint-3">ブラウザを閉じるだけでスクリプトが自動でできあがります</span></div></li>
+        <li><span class="easy-flow-num">3</span><div><strong>記録をおわる</strong> を押す<br><span class="hint">ブラウザを閉じるだけでスクリプトが自動でできあがります</span></div></li>
       </ol>
     </div>
     <div class="card easy-card">
       <div class="form-grid compact">
         <label for="easy-url">開くサイトのアドレス <span class="hint">(任意)</span></label>
         <div><input id="easy-url" type="text" class="w-full" placeholder="例: http://kanri/  または  http://192.168.1.10/seisan/" autocomplete="url">
-          <div class="hint" id="easy-url-hint">空欄のままでも構いません。開いたブラウザのアドレス欄にサイトのアドレスを入れて開けます。</div></div>
+          <div class="hint">空欄のままでも構いません。開いたブラウザのアドレス欄にサイトのアドレスを入れて開けます。</div></div>
       </div>
       <div class="easy-actions">
-        <button type="button" id="easy-start" class="btn primary xl" {% if not mitmproxy_available %}disabled{% endif %}>● 記録をはじめる</button>
+        <button type="button" id="easy-start" class="btn primary xl" {% if not (mitmproxy_available and iehost and iehost.available) %}disabled{% endif %}>● 記録をはじめる</button>
       </div>
       <ul class="easy-ready" id="easy-ready" aria-live="polite"></ul>
       <div class="easy-loaded" id="easy-loaded" hidden>
@@ -12444,16 +11488,15 @@ select.w-full { width: 100%; max-width: 100%; }
     <div class="card easy-card easy-live-card">
       <div class="easy-live"><span class="rec-light"></span><span>記録中</span></div>
       <div class="easy-count"><span class="easy-count-num" id="easy-count">0</span><span class="easy-count-label">件の通信を記録しました</span></div>
-      <p class="easy-guide" id="easy-guide">開いたブラウザで、<strong>いつもどおりサイトを操作</strong>してください。<br>欲しいデータが画面に表示されたら <strong>[記録をおわる]</strong> を押します。</p>
-      <div class="notice warn" id="easy-cert-note" hidden></div>
-      <div class="notice info" id="easy-manual-proxy" hidden></div>
+      <p class="easy-guide">記録用のブラウザが開きました。そのウィンドウでいつもどおりサイトを操作してください。<br>終わったら、ブラウザの赤い <strong>[記録をおわる]</strong> か、この画面の <strong>[記録をおわる]</strong> を押します。</p>
+      <div class="notice info" id="easy-browser-note" hidden></div>
       <div class="notice error" id="easy-rec-error" hidden></div>
       <div class="easy-actions">
         <button type="button" id="easy-stop" class="btn danger xl">■ 記録をおわる</button>
         <button type="button" id="easy-open-browser" class="btn">ブラウザをもう一度開く</button>
         <button type="button" id="easy-cancel" class="btn ghost">やめる (記録を破棄)</button>
       </div>
-      <p class="hint" id="easy-count-hint">件数が増えないときは、ブラウザが開き直されていないか、別のブラウザを使っていないか確認してください。</p>
+      <p class="hint">件数が増えないときは、記録用のブラウザ (タイトルに「記録中」と付いた窓) でサイトを開いているか確認してください。https:// のページは記録されません。</p>
     </div>
   </div>
 
@@ -12520,8 +11563,8 @@ select.w-full { width: 100%; max-width: 100%; }
 <section id="panel-record" class="panel active" aria-labelledby="h-record">
   <div class="panel-head">
     <h1 id="h-record">1. ブラウザの通信を記録する</h1>
-    <p class="lead">このツールが用意するプロキシ (中継サーバー) をブラウザに設定し、普段どおりにサイトを操作すると、やり取りされた HTTP 通信がすべて記録されます。別タブで開いた画面も同じプロキシを通るので、そのまま記録されます。<br>
-    すでに HAR ファイル (ブラウザの開発者ツールで保存した通信ログ) がある場合は、この手順を飛ばして「<a href="#" data-goto="load">2 読み込み</a>」へ進んでください。</p>
+    <p class="lead">[記録開始] を押すと記録用ブラウザ (Edge の IE モードと同じエンジン) が開きます。その窓で普段どおりにサイトを操作すると、http:// の通信がすべて記録されます (https:// は記録しません)。別窓やダイアログで開いた画面も、記録用ブラウザのタブとして記録されます。操作が終わったら [記録停止して読み込む] を押します。<br>
+    すでに HAR ファイル (IE の F12 開発者ツールで保存した通信ログ) がある場合は、この手順を飛ばして「<a href="#" data-goto="load">2 読み込み</a>」へ進んでください。</p>
   </div>
 
   {% if not mitmproxy_available %}
@@ -12530,38 +11573,29 @@ select.w-full { width: 100%; max-width: 100%; }
     <code>pip install "reqrec[record]"</code> を実行し、GUI を再起動してください。HAR ファイルの読み込みはそのまま使えます。
   </div>
   {% endif %}
+  {% if not (iehost and iehost.available) %}
+  <div class="notice warn" id="rec-unavailable">
+    <strong>記録用ブラウザ (IE エンジン) が使えないため、この PC では記録できません。</strong> {{ iehost.reason if iehost and iehost.reason else '' }}
+    HAR ファイルの読み込み以降はそのまま使えます。
+  </div>
+  {% endif %}
 
   <div class="grid-2">
     <div class="card">
       <h2>記録の設定</h2>
       <div class="form-grid">
-        <label for="rec-port">プロキシのポート番号</label>
-        <div><input id="rec-port" type="number" min="1" max="65535" value="8080" class="w-s"> <span class="hint">通常は 8080 のままで構いません</span></div>
-
         <label for="rec-hosts">記録するサイト (ホスト名)</label>
         <div><input id="rec-hosts" type="text" placeholder="例: example.co.jp, api.example.co.jp (空欄 = すべて記録)" class="w-full">
           <div class="hint">カンマ区切りで複数指定できます。サブドメインも含めて記録されます。空欄なら開いたサイトをすべて記録します。</div></div>
 
-        <label for="rec-listen">待ち受けアドレス</label>
-        <div><input id="rec-listen" type="text" value="127.0.0.1" class="w-m"> <span class="hint">この PC のブラウザだけ使う場合は 127.0.0.1 のまま</span></div>
-
         <label>追加モード</label>
         <div><label class="check"><input id="rec-append" type="checkbox"><span>停止したとき、すでに読み込んである記録に<strong>追加して結合</strong>する</span></label></div>
 
-        <label class="win-only" for="rec-browser" hidden>記録方式</label>
-        <div class="win-only" hidden>
-          <select id="rec-browser" class="w-full">
-            <option value="iehost">アプリ内の記録用ブラウザで開く (IE エンジン、設定変更なし、http のみ)</option>
-            <option value="none">自分でブラウザを設定する (システムプロキシ / Edge)</option>
-          </select>
-          <div class="hint" id="rec-browser-hint">記録用のブラウザだけがこのツールのプロキシを通ります。Windows のプロキシ設定や証明書は変更しません。</div>
-        </div>
+        <label for="rec-start-url">最初に開くアドレス</label>
+        <div><input id="rec-start-url" type="text" class="w-full" placeholder="例: http://kanri/  (空欄なら空のページで開きます)" autocomplete="url"></div>
 
-        <label class="win-only rec-iehost-only" for="rec-start-url" hidden>最初に開くアドレス</label>
-        <div class="win-only rec-iehost-only" hidden><input id="rec-start-url" type="text" class="w-full" placeholder="例: http://kanri/  (空欄なら空のページで開きます)" autocomplete="url"></div>
-
-        <label class="win-only rec-iehost-only" for="rec-emulation" hidden>表示モード (記録用ブラウザ)</label>
-        <div class="win-only rec-iehost-only" hidden>
+        <label for="rec-emulation">表示モード (記録用ブラウザ)</label>
+        <div>
           <select id="rec-emulation" class="w-full">
             <option value="keep">変更しない (今の設定のまま)</option>
             <option value="default">既定 (IE7 互換表示、レジストリに書き込まない)</option>
@@ -12572,21 +11606,12 @@ select.w-full { width: 100%; max-width: 100%; }
           <div class="hint">Edge の IE モードで表示が崩れないサイトは「既定」のままで構いません。既定以外は、この記録用ブラウザだけに効く設定をユーザーのレジストリ (HKCU) に書き込みます。選んだ表示モードは次回以降も (かんたん画面でも) そのまま使われます。</div>
         </div>
 
-        <label class="win-only" hidden>https://</label>
-        <div class="win-only" hidden>
-          <label class="check"><input id="rec-https-passthrough" type="checkbox" checked><span>https:// の通信は記録せず素通しする (どのポート番号でも。証明書不要)</span></label>
-        </div>
-
-        <label class="win-only" hidden>Windows</label>
-        <div class="win-only" hidden>
-          <label class="check"><input id="rec-sysproxy" type="checkbox"><span><strong>システムプロキシを自動で設定する</strong>（Edge の IE モード / Windows 全体に適用。停止時に元の設定へ戻します。記録方式が「自分でブラウザを設定する」のときだけ使えます）</span></label>
-        </div>
       </div>
       <div class="actions">
-        <button type="button" id="btn-rec-start" class="btn primary">● 記録開始</button>
+        <button type="button" id="btn-rec-start" class="btn primary" {% if not (mitmproxy_available and iehost and iehost.available) %}disabled{% endif %}>● 記録開始</button>
         <button type="button" id="btn-rec-stop" class="btn danger" disabled>■ 記録停止して読み込む</button>
       </div>
-      <p class="hint">※ この GUI 自身への通信 (<code id="self-address">{{ gui_address }}</code>) は記録から自動的に除外されます。</p>
+      <p class="hint">※ この GUI 自身への通信 (<code>{{ gui_address }}</code>) は記録から自動的に除外されます。</p>
     </div>
 
     <div class="card">
@@ -12598,56 +11623,23 @@ select.w-full { width: 100%; max-width: 100%; }
       <dl class="kv">
         <dt>プロキシのアドレス</dt><dd id="rec-proxy-address">—</dd>
         <dt>出力ファイル</dt><dd id="rec-out">—</dd>
-        <dt class="win-only" hidden>記録用ブラウザ</dt><dd class="win-only" id="rec-browser-state" hidden>—</dd>
+        <dt>記録用ブラウザ</dt><dd id="rec-browser-state">—</dd>
       </dl>
       <div id="rec-error" class="notice error" hidden></div>
-      <details id="rec-log-details">
+      <details>
         <summary>プロキシのログを表示</summary>
         <pre class="console small" id="rec-log"></pre>
       </details>
     </div>
   </div>
 
-  <div class="card">
-    <h2>ブラウザ側の手順</h2>
-    <p class="hint win-only" hidden>記録方式が「アプリ内の記録用ブラウザで開く」のときは、下の手順は不要です。[記録開始] で開く記録用ブラウザ (タイトルに「記録中」と付いた窓) でサイトを操作してください。以下は「自分でブラウザを設定する」を選んだときの手順です。</p>
-    <ol class="howto">
-      <li><strong>プロキシを設定する</strong> — ブラウザ (または Windows) の HTTP / HTTPS プロキシを <code id="howto-proxy">127.0.0.1:8080</code> にします。
-        <ul>
-          <li>Chrome / Edge を専用プロファイルで起動する例: <code id="howto-chrome">chrome --proxy-server="127.0.0.1:8080" --user-data-dir=%TEMP%\reqrec-profile</code></li>
-          <li><strong>Edge の IE モード</strong>は Windows の「インターネット オプション」(コントロール パネル → ネットワークとインターネット → インターネット オプション → 接続 → LAN の設定) のプロキシ設定を使います。Windows ではこの画面の「システムプロキシを自動で設定する」にチェックを入れると自動で設定・復元します。</li>
-        </ul>
-      </li>
-      <li><strong>CA 証明書を一度だけ登録する</strong> — HTTPS サイトを記録するために必要です。記録開始後、プロキシ経由で <code>http://mitm.it</code> を開いて自分の OS 用の証明書をダウンロードするか、<code>~/.mitmproxy/mitmproxy-ca-cert.pem</code> (Windows なら <code>%USERPROFILE%\.mitmproxy\mitmproxy-ca-cert.cer</code>) を「信頼されたルート証明機関」に登録します。<span class="win-only" hidden>Windows では下の「CA 証明書をインストール」ボタンで登録できます。</span></li>
-      <li><strong>記録したい操作を行う</strong> — ログイン → 一覧を開く → 詳細を見る、のように取得したい結果まで普段どおりに操作します。レスポンスを受け取るたびに自動保存されます。</li>
-      <li><strong>[記録停止して読み込む]</strong> を押すと、記録が読み込まれて「3 ステップ」へ進みます。</li>
-    </ol>
-    <details>
-      <summary>コンソールと同じ手順書を表示</summary>
-      <pre class="console small" id="rec-instructions">(記録を開始すると表示されます)</pre>
-    </details>
-  </div>
-
-  <div class="card win-only" hidden>
-    <h2>Windows の設定 (Edge IE モード向け)</h2>
-    <dl class="kv">
-      <dt>システムプロキシ</dt><dd id="win-proxy-status">確認中…</dd>
-      <dt>mitmproxy の CA 証明書</dt><dd id="win-cert-status">確認中…</dd>
-    </dl>
-    <div class="actions">
-      <button type="button" id="btn-win-cert" class="btn">CA 証明書をインストール</button>
-      <button type="button" id="btn-win-proxy-restore" class="btn">プロキシ設定を元に戻す</button>
-      <button type="button" id="btn-win-refresh" class="btn ghost">状態を更新</button>
-    </div>
-    <pre class="console small" id="win-output" hidden></pre>
-  </div>
 </section>
 
 <!-- ===================================================== 2 読み込み -->
 <section id="panel-load" class="panel" aria-labelledby="h-load">
   <div class="panel-head">
     <h1 id="h-load">2. 記録ファイルを読み込む</h1>
-    <p class="lead">「1 記録」で保存したファイルのほか、ブラウザの開発者ツール (F12 → ネットワーク → 「すべて HAR として保存」) で保存した <strong>.har</strong>、mitmproxy の <strong>.mitm</strong> も読み込めます。<br>
+    <p class="lead">「1 記録」で保存したファイルのほか、IE の F12 開発者ツール (IEChooser.exe で IE モードのタブを選ぶ → ネットワーク → 「HAR としてエクスポート」) で保存した <strong>.har</strong> も読み込めます。<br>
     <strong>別タブで開いた画面</strong>を HAR で記録した場合はタブごとに HAR を保存し、複数ファイルをまとめて選ぶか「追加して結合」で読み込むと 1 つの流れとして扱えます。</p>
   </div>
 
@@ -12655,8 +11647,8 @@ select.w-full { width: 100%; max-width: 100%; }
     <div class="card">
       <h2>ファイルを選んで読み込む</h2>
       <div class="dropzone" id="dropzone">
-        <input id="file-input" type="file" multiple accept=".har,.json,.mitm,.flows,.flow">
-        <p>ここにファイルをドラッグ＆ドロップするか、クリックして選択 (.har / .json / .mitm、複数可)</p>
+        <input id="file-input" type="file" multiple accept=".har,.json">
+        <p>ここにファイルをドラッグ＆ドロップするか、クリックして選択 (.har / .json、複数可)</p>
         <p class="hint" id="file-chosen">ファイルが選ばれていません</p>
       </div>
       <label class="check"><input id="append-toggle" type="checkbox"><span><strong>追加して結合</strong>する (読み込み済みの記録を置き換えず、時刻順に結合します)</span></label>
@@ -12717,7 +11709,6 @@ select.w-full { width: 100%; max-width: 100%; }
         <label class="check"><input type="checkbox" class="opt" data-opt="detect_loops" checked><span>ループ (ページ送りなど) を検出してまとめる</span></label>
         <label class="check"><input type="checkbox" class="opt" data-opt="redact_secrets" checked><span>パスワードなどの秘密情報を環境変数から読む (スクリプトに書き込まない)</span></label>
         <label class="check"><input type="checkbox" class="opt" data-opt="detect_auth" checked><span>HTTP 認証 (Windows 統合認証 NTLM / Basic / Digest) のやり取りを検出して統合する</span></label>
-        <label class="check"><input type="checkbox" class="gopt" data-gopt="legacy_tls"><span>古い TLS / 暗号しか使えないサーバー (IE モードで使っている社内サーバーなど) 向けの接続設定を生成コードに入れる</span></label>
       </div>
       <div class="form-grid compact">
         <label for="opt-include-hosts">このホストだけ採用</label>
@@ -12765,7 +11756,7 @@ select.w-full { width: 100%; max-width: 100%; }
     </div>
     <p class="hint">☑ = スクリプトに採用　/　◉ 結果 = スクリプトの最後に出力するデータとして使うリクエスト　/　灰色の行 = 除外 (理由を「判定」列に表示)　/　行をクリック = リクエストとレスポンスの内容を表示</p>
     <div class="table-wrap">
-      <table class="data flows" id="flow-table">
+      <table class="data flows">
         <thead>
           <tr>
             <th class="col-check" title="チェック = スクリプトに採用">採用</th>
@@ -12945,7 +11936,6 @@ select.w-full { width: 100%; max-width: 100%; }
   // ------------------------------------------------------------------ basics
   const body = document.body;
   const TOKEN = body.dataset.token;
-  const IS_WINDOWS = body.dataset.isWindows === 'true';
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
@@ -12991,10 +11981,7 @@ select.w-full { width: 100%; max-width: 100%; }
       if (v === undefined || v === null || v === false) continue;
       if (k === 'class') node.className = v;
       else if (k === 'text') node.textContent = v;
-      else if (k === 'html') node.innerHTML = v; // only used with static, trusted markup
-      else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
       else if (k === 'dataset') Object.assign(node.dataset, v);
-      else if (v === true) node.setAttribute(k, '');
       else node.setAttribute(k, v);
     }
     for (const c of [].concat(children)) {
@@ -13045,8 +12032,6 @@ select.w-full { width: 100%; max-width: 100%; }
     if (b) { if (badge) { b.textContent = badge; b.hidden = false; } else { b.hidden = true; } }
   }
 
-  if (IS_WINDOWS) $$('.win-only').forEach((n) => { n.hidden = false; });
-
   // ------------------------------------------------------------------ shared state
   const S = {
     recording: null,     // summary from the server
@@ -13072,43 +12057,9 @@ select.w-full { width: 100%; max-width: 100%; }
     const errEl = $('#rec-error');
     const logEl = $('#rec-log');
 
-    function proxyAddressFromForm() {
-      let host = ($('#rec-listen').value || '127.0.0.1').trim();
-      if (['0.0.0.0', '::', '*', ''].includes(host)) host = '127.0.0.1';
-      return `${host}:${$('#rec-port').value || 8080}`;
-    }
-    function syncHowto() {
-      const addr = proxyAddressFromForm();
-      $('#howto-proxy').textContent = addr;
-      $('#howto-chrome').textContent = `chrome --proxy-server="${addr}" --user-data-dir=%TEMP%\\reqrec-profile`;
-    }
-    $('#rec-port').addEventListener('input', syncHowto);
-    $('#rec-listen').addEventListener('input', syncHowto);
-    syncHowto();
-
-    // ---- 記録方式 (Windows only): アプリ内の記録用ブラウザ (IE エンジン) か、自分でブラウザを設定するか (DESIGN.md §13.12)
-    const IEHOST_AVAILABLE = IS_WINDOWS && body.dataset.iehostAvailable === 'true';
-    const browserSel = $('#rec-browser');
-    function browserMode() { return IS_WINDOWS && browserSel && browserSel.value === 'iehost' ? 'iehost' : 'none'; }
-    function syncBrowserMode() {
-      if (!IS_WINDOWS) return;
-      const ie = browserMode() === 'iehost';
-      $$('.rec-iehost-only').forEach((n) => { n.hidden = !ie; });
-      const sys = $('#rec-sysproxy');
-      sys.disabled = ie;
-      if (ie) sys.checked = false;
-    }
-    if (IS_WINDOWS) {
-      if (!IEHOST_AVAILABLE) {
-        browserSel.value = 'none';
-        browserSel.querySelector('option[value="iehost"]').disabled = true;
-        $('#rec-browser-hint').textContent = '記録用ブラウザ (IE エンジン) は使えません: ' + (body.dataset.iehostReason || '理由不明');
-        $('#rec-https-passthrough').checked = false;
-      }
-      browserSel.addEventListener('change', () => { $('#rec-https-passthrough').checked = browserMode() === 'iehost'; syncBrowserMode(); });
-      syncBrowserMode();
-    }
-    function emulationValue() { return IS_WINDOWS && $('#rec-emulation') ? $('#rec-emulation').value : 'keep'; }
+    // 記録は常にアプリ内の記録用ブラウザ (IE エンジン, DESIGN.md §13.12) で行う
+    const IEHOST_AVAILABLE = body.dataset.iehostAvailable === 'true';
+    const CAN_RECORD = IEHOST_AVAILABLE && body.dataset.mitmAvailable === 'true';
     function setEmulation(name) {  // the select starts at the 表示モード currently in the registry
       const sel = $('#rec-emulation');
       if (sel && name && sel.querySelector(`option[value="${name}"]`)) sel.value = name;
@@ -13137,8 +12088,8 @@ select.w-full { width: 100%; max-width: 100%; }
       if (st.running && st.browser && st.browser.kind === 'iehost' && !st.browser.running && !body.classList.contains('easy-mode')) {
         setStatus('記録用ブラウザが閉じられました。[記録停止して読み込む] を押すと記録が読み込まれます。', 'info');
       }
-      if (st.port) $('#rec-proxy-address').textContent = `${st.listen_host && !['0.0.0.0', '::'].includes(st.listen_host) ? st.listen_host : '127.0.0.1'}:${st.port}`;
-      btnStart.disabled = running;
+      if (st.port) $('#rec-proxy-address').textContent = `127.0.0.1:${st.port}`;
+      btnStart.disabled = running || !CAN_RECORD;
       btnStop.disabled = !running && !st.out;
       const log = [st.stdout_tail, st.stderr_tail].filter(Boolean).join('\n');
       logEl.textContent = log;
@@ -13154,38 +12105,26 @@ select.w-full { width: 100%; max-width: 100%; }
     function stopPolling() { clearInterval(S.recPoll); S.recPoll = null; }
 
     btnStart.addEventListener('click', async () => {
-      const port = parseInt($('#rec-port').value, 10);
-      if (!(port >= 1 && port <= 65535)) { setStatus('ポート番号は 1〜65535 で指定してください', 'error'); return; }
       btnStart.disabled = true;
-      const mode = browserMode();
-      setStatus(mode === 'iehost' ? '記録プロキシと記録用ブラウザを起動しています…（初回は数秒かかります）' : '記録プロキシを起動しています…', 'busy');
+      setStatus('記録プロキシと記録用ブラウザを起動しています…（初回は数秒かかります）', 'busy');
       try {
         const res = await api('/api/record/start', { method: 'POST', json: {
-          port,
           hosts: splitHosts($('#rec-hosts').value),
-          listen_host: ($('#rec-listen').value || '127.0.0.1').trim(),
-          set_system_proxy: IS_WINDOWS && mode !== 'iehost' && $('#rec-sysproxy').checked,
           append: $('#rec-append').checked,
-          browser: mode,
-          start_url: IS_WINDOWS ? $('#rec-start-url').value.trim() : '',
-          https_passthrough: IS_WINDOWS && $('#rec-https-passthrough').checked,
-          emulation: mode === 'iehost' ? emulationValue() : 'keep',
+          start_url: $('#rec-start-url').value.trim(),
+          emulation: $('#rec-emulation').value,
           origin: 'advanced',  // never stopped automatically by the easy screen
         } });
-        $('#rec-instructions').textContent = res.instructions || '';
         $('#rec-proxy-address').textContent = res.proxy_address || '';
         render(res.status || { running: true, flows: 0, out: res.out });
         renderBrowser(res.browser);
         if (res.status && res.status.error) {
           setStatus('記録プロキシが起動できませんでした: ' + res.status.error, 'error');
-        } else if (res.browser && res.browser.running) {
-          setStatus('記録を開始しました。開いた記録用ブラウザでサイトを操作してください (http:// のページだけが記録されます)。', 'ok');
         } else {
-          setStatus(`記録を開始しました。ブラウザのプロキシを ${res.proxy_address} にしてサイトを操作してください。`, 'ok');
+          setStatus('記録を開始しました。開いた記録用ブラウザでサイトを操作してください (http:// のページだけが記録されます)。', 'ok');
         }
-        if (res.system_proxy && res.system_proxy.set) Windows.refresh();
       } catch (e) {
-        btnStart.disabled = false;
+        btnStart.disabled = !CAN_RECORD;
         fail(e, '記録を開始できません');
       }
     });
@@ -13200,10 +12139,8 @@ select.w-full { width: 100%; max-width: 100%; }
         Load.applySummary(res);
         let msg = `記録を読み込みました: ${res.flows} 件のリクエスト (${res.out})`;
         if (res.excluded_self) msg += `。GUI 自身への通信 ${res.excluded_self} 件は自動的に除外しました`;
-        if (res.proxy_error) msg += '。' + res.proxy_error;
         setStatus(msg, 'ok');
         Load.refreshFiles();
-        Windows.refresh();
         show('steps');
         Steps.resetOverrides();
         Steps.replan();
@@ -13211,49 +12148,10 @@ select.w-full { width: 100%; max-width: 100%; }
         stopPolling();
         await poll();
         fail(e, '記録を停止できません');
-        Windows.refresh();
       }
     });
 
-    return { render, poll, startPolling, subscribe, emulationValue, setEmulation };
-  })();
-
-  // ================================================================== Windows
-  const Windows = (() => {
-    const out = $('#win-output');
-    function showOut(text) { out.textContent = text || ''; out.hidden = !text; }
-    async function refresh() {
-      if (!IS_WINDOWS) return;
-      try {
-        const st = await api('/api/win/status');
-        const p = st.proxy || {};
-        $('#win-proxy-status').textContent = p.enabled ? `有効: ${p.server || '(未設定)'}${st.proxy_backup_active ? '（この GUI が設定中。停止時に元へ戻します）' : ''}` : '無効（直接接続）';
-        const c = st.cert || {};
-        $('#win-cert-status').textContent = c.installed === true ? `登録済み (${c.path || ''})` : c.installed === false ? (c.path ? `未登録 — ${c.path}` : '未登録 — まず一度「記録開始」でプロキシを起動すると証明書が作成されます') : '確認できません (certutil が見つかりません)';
-        $('#btn-win-proxy-restore').disabled = !st.proxy_backup_active;
-        if (st.error) showOut(st.error);
-      } catch (e) { $('#win-proxy-status').textContent = e.message; }
-    }
-    if (IS_WINDOWS) {
-      $('#btn-win-cert').addEventListener('click', async () => {
-        setStatus('CA 証明書を登録しています…', 'busy');
-        try {
-          const res = await api('/api/win/cert/install', { method: 'POST', json: {} });
-          showOut(res.output);
-          setStatus('CA 証明書を登録しました', 'ok');
-        } catch (e) { showOut(e.data && e.data.output); fail(e, '証明書を登録できません'); }
-        refresh();
-      });
-      $('#btn-win-proxy-restore').addEventListener('click', async () => {
-        try {
-          const res = await api('/api/win/proxy/restore', { method: 'POST', json: {} });
-          setStatus(res.restored ? 'システムプロキシを元の設定に戻しました' : (res.message || '変更はありません'), 'ok');
-        } catch (e) { fail(e); }
-        refresh();
-      });
-      $('#btn-win-refresh').addEventListener('click', refresh);
-    }
-    return { refresh };
+    return { render, poll, startPolling, subscribe, setEmulation };
   })();
 
   // ================================================================== 2 読み込み
@@ -13577,7 +12475,7 @@ select.w-full { width: 100%; max-width: 100%; }
     $('#btn-final-clear').addEventListener('click', () => { S.finalFlowId = null; replan(); });
     $('#btn-goto-code').addEventListener('click', () => show('code'));
 
-    return { replan, resetOverrides, clearTable, collectPlanOptions, collectGenOptions, render };
+    return { replan, resetOverrides, clearTable, collectPlanOptions, collectGenOptions };
   })();
 
   // ================================================================== 詳細ドロワー
@@ -13638,7 +12536,7 @@ select.w-full { width: 100%; max-width: 100%; }
         drawer.hidden = false; backdrop.hidden = false;
       } catch (e) { fail(e, '詳細を取得できません'); }
     }
-    return { open, close };
+    return { open };
   })();
 
   // ================================================================== 4 コード
@@ -13821,13 +12719,13 @@ select.w-full { width: 100%; max-width: 100%; }
   })();
 
   // ================================================================== かんたん画面 (既定)
-  // 「記録をはじめる」→ サイトを操作 → 「記録をおわる」だけで、ポート選択・システムプロキシ・CA 証明書・
-  // ブラウザ起動・解析・生成・保存をすべて自動で行う。細かい設定は「詳細設定を表示」で既存の 5 画面に切り替える。
+  // 「記録をはじめる」→ 記録用ブラウザでサイトを操作 → 「記録をおわる」だけで、ポート選択・記録用ブラウザの
+  // 起動・解析・生成・保存をすべて自動で行う。細かい設定は「詳細設定を表示」で既存の 5 画面に切り替える。
   const Easy = (() => {
     const MITM_AVAILABLE = body.dataset.mitmAvailable === 'true';
-    // アプリ内の記録用ブラウザ (IE エンジン, DESIGN.md §13.12): Windows でコンパイラか exe があるときだけ。
-    // 使えないときは従来どおり Edge + システムプロキシ (+ 証明書) で記録する。
-    const IEHOST = IS_WINDOWS && body.dataset.iehostAvailable === 'true';
+    // アプリ内の記録用ブラウザ (IE エンジン, DESIGN.md §13.12): Windows でコンパイラか exe があるときだけ使える。
+    // Windows の設定や証明書は変更しない。使えない PC では記録できない (HAR の読み込み以降は使える)。
+    const IEHOST = body.dataset.iehostAvailable === 'true';
     const IEHOST_REASON = body.dataset.iehostReason || '';
     const toggleBtn = $('#mode-toggle');
     const stages = { idle: $('#easy-idle'), recording: $('#easy-recording'), processing: $('#easy-processing'), done: $('#easy-done') };
@@ -13838,45 +12736,9 @@ select.w-full { width: 100%; max-width: 100%; }
     let lastBuild = null;
     let browserSeen = false;   // the recording browser was seen running during this recording (guards the auto-stop against racing the launch)
     let autoStopped = false;   // the auto-stop already fired for this recording
-    let recMode = null;        // 'iehost' / 'none' of the recording in progress (from the server, not from IEHOST)
     let recOrigin = null;      // 'easy' / 'advanced': which screen started the recording in progress (from the server)
     let lastIEError = null;    // last failure to start the recording browser in this GUI session
-    // On Windows the easy screen only records with the in-app browser: it never changes the Windows
-    // proxy or installs a certificate by itself.  Without the recording browser the user is sent to 詳細設定.
-    const EASY_BLOCKED = IS_WINDOWS && !IEHOST;
-    function canStart() { return MITM_AVAILABLE && !EASY_BLOCKED; }
-
-    const GUIDE_EDGE = ['開いたブラウザで、', 'いつもどおりサイトを操作', 'してください。', '欲しいデータが画面に表示されたら ', '[記録をおわる]', ' を押します。'];
-    function setGuide(iehostMode) {
-      const g = clear($('#easy-guide'));
-      if (iehostMode) {
-        g.appendChild(document.createTextNode('記録用のブラウザが開きました。そのウィンドウでいつもどおりサイトを操作してください。'));
-        g.appendChild(el('br'));
-        g.appendChild(document.createTextNode('終わったら、ブラウザの赤い '));
-        g.appendChild(el('strong', { text: '[記録をおわる]' }));
-        g.appendChild(document.createTextNode(' か、この画面の '));
-        g.appendChild(el('strong', { text: '[記録をおわる]' }));
-        g.appendChild(document.createTextNode(' を押します。'));
-        $('#easy-count-hint').textContent = '件数が増えないときは、記録用のブラウザ (タイトルに「記録中」と付いた窓) でサイトを開いているか確認してください。https:// のページは記録されません。';
-      } else {
-        g.appendChild(document.createTextNode(GUIDE_EDGE[0]));
-        g.appendChild(el('strong', { text: GUIDE_EDGE[1] }));
-        g.appendChild(document.createTextNode(GUIDE_EDGE[2]));
-        g.appendChild(el('br'));
-        g.appendChild(document.createTextNode(GUIDE_EDGE[3]));
-        g.appendChild(el('strong', { text: GUIDE_EDGE[4] }));
-        g.appendChild(document.createTextNode(GUIDE_EDGE[5]));
-        $('#easy-count-hint').textContent = '件数が増えないときは、ブラウザが開き直されていないか、別のブラウザを使っていないか確認してください。';
-      }
-    }
-    if (!IS_WINDOWS) {
-      $('#easy-lead').textContent = 'やることは 3 つだけです。記録用のプロキシは自動で起動します。ブラウザのプロキシ設定だけは手動で行います。';
-    }
-    if (!IEHOST) {  // the idle hero describes the Edge flow instead
-      $('#easy-hint-1').textContent = IS_WINDOWS ? 'ブラウザ (Edge) が自動で開きます' : 'ブラウザを開いてプロキシを設定します';
-      $('#easy-hint-3').textContent = 'スクリプトが自動でできあがります';
-      $('#easy-url-hint').textContent = '普段ブラウザのお気に入りから開いているサイトなら、空欄のままで構いません。開いたブラウザでそのサイトを開いてください。';
-    }
+    function canStart() { return MITM_AVAILABLE && IEHOST; }
 
     // ---------------------------------------------------------------- mode
     function setMode(mode, persist = true) {
@@ -13903,8 +12765,6 @@ select.w-full { width: 100%; max-width: 100%; }
         const st = await api('/api/record/status');
         if (st.running) recOrigin = st.origin || null;
         if (st.running && current !== 'recording') {
-          recMode = st.browser_kind || (st.browser && st.browser.kind) || null;
-          setGuide(recMode === 'iehost');
           browserSeen = !!(st.browser && st.browser.running);
           autoStopped = false;
           stage('recording');
@@ -13932,14 +12792,13 @@ select.w-full { width: 100%; max-width: 100%; }
       const add = (cls, text) => list.appendChild(el('li', { class: cls, text }));
       if (!MITM_AVAILABLE) { add('bad', '記録機能: 準備できていません (mitmproxy が未インストール)'); return; }
       add('ok', '記録機能: 使えます');
-      if (!IS_WINDOWS) { add('warn', 'Windows 以外: ブラウザのプロキシ設定は手動になります'); return; }
       if (IEHOST) {
         if (lastIEError) add('bad', '記録用ブラウザ (IE エンジン): 前回、起動できませんでした: ' + lastIEError);
         else add('ok', '記録用ブラウザ (IE エンジン): 使えます (Windows の設定や証明書は変更しません)');
         return;
       }
       add('bad', '記録用ブラウザ (IE エンジン): 準備できていません: ' + (IEHOST_REASON || '理由不明'));
-      add('warn', 'この画面からは記録できません。管理者に連絡するか、右上の「詳細設定を表示」→「1 記録」で記録方式「自分でブラウザを設定する」を選んでください (Windows のプロキシ設定の変更と証明書の登録が必要です)。');
+      add('warn', 'この PC では記録できません。管理者に連絡してください (HAR ファイルを読み込んでスクリプトを作ることはできます)。');
     }
 
     // ---------------------------------------------------------------- live count
@@ -13956,9 +12815,8 @@ select.w-full { width: 100%; max-width: 100%; }
     Record.subscribe((st) => {  // Record polls /api/record/status every second
       if (current !== 'recording') return;
       renderLive(st);
-      if (st.browser_kind) recMode = st.browser_kind;
       if (st.running) recOrigin = st.origin || null;
-      if (recMode !== 'iehost' || !st.browser || st.browser.kind !== 'iehost') return;
+      if (!st.browser || st.browser.kind !== 'iehost') return;
       if (st.browser.running) { browserSeen = true; return; }
       // Closing the recording browser is the natural "I'm done" of the in-app flow: stop + build once.
       // Only while this screen is shown, and only for a recording started from this screen: one started
@@ -13981,25 +12839,15 @@ select.w-full { width: 100%; max-width: 100%; }
     // ---------------------------------------------------------------- browser
     async function openBrowser() {
       const url = $('#easy-url').value.trim();
-      if (recMode === 'iehost') {
-        try {
-          const res = await api('/api/browser/open', { method: 'POST', json: { browser: 'iehost', url } });
-          if (res.browser && res.browser.running) { browserSeen = true; autoStopped = false; }
-          setStatus(res.relaunched ? '記録用ブラウザを開き直しました。' : '記録用ブラウザはすでに開いています。', 'ok');
-          return res;
-        } catch (e) {
-          if (e.data && e.data.kind === 'iehost') lastIEError = e.message;  // the exe itself could not be started
-          $('#easy-manual-proxy').textContent = '記録用ブラウザを開けませんでした (' + e.message + ')。';
-          $('#easy-manual-proxy').hidden = false;
-          return null;
-        }
-      }
       try {
         const res = await api('/api/browser/open', { method: 'POST', json: { url } });
+        if (res.browser && res.browser.running) { browserSeen = true; autoStopped = false; }
+        setStatus(res.relaunched ? '記録用ブラウザを開き直しました。' : '記録用ブラウザはすでに開いています。', 'ok');
         return res;
       } catch (e) {
-        $('#easy-manual-proxy').textContent = 'ブラウザを自動で開けませんでした (' + e.message + ')。Edge を手で開いてサイトを操作してください。';
-        $('#easy-manual-proxy').hidden = false;
+        if (e.data && e.data.kind === 'iehost') lastIEError = e.message;  // the exe itself could not be started
+        $('#easy-browser-note').textContent = '記録用ブラウザを開けませんでした (' + e.message + ')。';
+        $('#easy-browser-note').hidden = false;
         return null;
       }
     }
@@ -14007,27 +12855,24 @@ select.w-full { width: 100%; max-width: 100%; }
     // ---------------------------------------------------------------- start / stop / cancel
     async function start() {
       if (!canStart()) {
-        showError(EASY_BLOCKED
-          ? '記録用ブラウザが使えないため、この画面からは記録できません: ' + (IEHOST_REASON || '理由不明') + '　右上の「詳細設定を表示」から記録方式を選んでください。'
-          : '記録機能の準備ができていません (mitmproxy が未インストール)。');
+        showError(!MITM_AVAILABLE
+          ? '記録機能の準備ができていません (mitmproxy が未インストール)。'
+          : '記録用ブラウザが使えないため記録できません: ' + (IEHOST_REASON || '理由不明') + '　管理者に連絡してください。');
         return;
       }
       showError('');
       btnStart.disabled = true;
-      $('#easy-manual-proxy').hidden = true;
+      $('#easy-browser-note').hidden = true;
       $('#easy-rec-error').hidden = true;
-      $('#easy-cert-note').hidden = true;
       $('#easy-count').textContent = '0';
       browserSeen = false;
       autoStopped = false;
-      stage('processing', IEHOST ? '記録の準備をしています… (記録用ブラウザを開きます。初回は数秒かかります)' : '記録の準備をしています…');
+      stage('processing', '記録の準備をしています… (記録用ブラウザを開きます。初回は数秒かかります)');
       let res;
       try {
         res = await api('/api/record/start', { method: 'POST', json: {
-          port: 'auto', hosts: [], listen_host: '127.0.0.1', set_system_proxy: false, append: false,
-          browser: IEHOST ? 'iehost' : 'none',
+          hosts: [], append: false,
           start_url: $('#easy-url').value.trim(),
-          https_passthrough: IEHOST,
           emulation: 'keep',  // 表示モード is only changed from 詳細設定
           origin: 'easy',     // only easy-started recordings are stopped automatically when the browser closes
         } });
@@ -14053,36 +12898,19 @@ select.w-full { width: 100%; max-width: 100%; }
         return;
       }
       Record.render(res.status || { running: true, flows: 0, out: res.out });
-      $('#rec-instructions').textContent = res.instructions || '';
       if (res.status && res.status.error) {
         stage('idle'); btnStart.disabled = !canStart();
         showError('記録用の中継サーバーを起動できませんでした: ' + res.status.error);
         setStatus('記録を始められませんでした', 'error');
         return;
       }
-      if (!IS_WINDOWS) {
-        const m = $('#easy-manual-proxy');
-        m.textContent = `この OS では自動設定できません。ブラウザの HTTP / HTTPS プロキシを ${res.proxy_address} に設定してからサイトを操作してください。`;
-        m.hidden = false;
-      }
-      recMode = res.browser_kind || (IEHOST ? 'iehost' : 'none');
       recOrigin = res.origin || 'easy';
-      const iehostMode = recMode === 'iehost';
-      setGuide(iehostMode);
       stage('recording');
       Record.startPolling();
-      if (iehostMode) {
-        // No certificate, no system proxy, no Edge: the server already opened the recording browser.
-        browserSeen = !!(res.browser && res.browser.running);
-        (res.warnings || []).forEach((w) => setStatus(w, 'info'));
-        $('#easy-cert-note').hidden = true;
-        setStatus('記録中です。開いた記録用ブラウザでサイトを操作してください。', 'ok');
-        return;
-      }
-      // Only reached off Windows (EASY_BLOCKED stops Windows without the recording browser): the
-      // user points the browser at the proxy by hand, as the notice above says.
-      setStatus('記録中です。ブラウザでサイトを操作してください。', 'ok');
-      await openBrowser();
+      // the server already opened the recording browser
+      browserSeen = !!(res.browser && res.browser.running);
+      (res.warnings || []).forEach((w) => setStatus(w, 'info'));
+      setStatus('記録中です。開いた記録用ブラウザでサイトを操作してください。', 'ok');
     }
 
     async function stop() {
@@ -14096,20 +12924,17 @@ select.w-full { width: 100%; max-width: 100%; }
       } catch (e) {
         btnStop.disabled = false;
         await pollOnce();
-        Windows.refresh();
         stage('idle'); btnStart.disabled = !canStart();
         const empty = !!(e.data && e.data.empty);
-        showError((empty ? '' : '記録を保存できませんでした: ') + e.message + (e.data && e.data.proxy_error ? ' / ' + e.data.proxy_error : ''));
+        showError((empty ? '' : '記録を保存できませんでした: ') + e.message);
         setStatus(empty ? '何も記録されませんでした' : '記録を保存できませんでした', 'error');
         readiness();
         return;
       }
       btnStop.disabled = false;
-      recMode = null;
       recOrigin = null;
       Load.applySummary(res);
       Load.refreshFiles();
-      Windows.refresh();
       Steps.resetOverrides();
       stage('processing', `記録した ${res.flows} 件の通信を解析して、スクリプトを作成しています…`);
       await build();
@@ -14145,7 +12970,6 @@ select.w-full { width: 100%; max-width: 100%; }
     async function discardSilently(message) {
       stage('processing', '記録を止めています…');
       try { await api('/api/record/stop', { method: 'POST', json: { discard: true } }); } catch (e) { /* already stopped */ }
-      recMode = null;
       recOrigin = null;
       await pollOnce();
       stage('idle'); btnStart.disabled = !canStart();
@@ -14161,10 +12985,8 @@ select.w-full { width: 100%; max-width: 100%; }
         const res = await api('/api/record/stop', { method: 'POST', json: { discard: true } });
         if (res.recording) Load.applySummary(res.recording);  // unchanged: the discarded recording is never loaded
       } catch (e) { /* already stopped: nothing to discard */ }
-      recMode = null;
       recOrigin = null;
       await pollOnce();
-      Windows.refresh();
       stage('idle'); btnStart.disabled = !canStart();
       setStatus('記録をやめました', 'info');
       readiness();
@@ -14258,7 +13080,7 @@ select.w-full { width: 100%; max-width: 100%; }
     const ERROR_HINTS = [
       [/getaddrinfo failed|Name or service not known|NameResolutionError|nodename nor servname/i, 'サイトに接続できません (アドレスが見つかりません)。社内ネットワークに接続しているか、VPN が必要なサイトではないか確認してください。'],
       [/ConnectTimeout|Read timed out|timed out/i, 'サイトの応答がありません (タイムアウト)。しばらくしてからもう一度実行してください。'],
-      [/CERTIFICATE_VERIFY_FAILED|SSLError|SSLCertVerificationError/i, 'サイトの証明書を確認できませんでした。詳細設定の「古い TLS」の項目を有効にして作り直すと動くことがあります。'],
+      [/CERTIFICATE_VERIFY_FAILED|SSLError|SSLCertVerificationError/i, 'https:// のサイトの証明書を確認できませんでした。このツールが対象とするのは http:// のサイトです。'],
       [/ConnectionRefused|Connection refused|WinError 10061/i, 'サイトに接続できません (接続が拒否されました)。サイトが動いているか確認してください。'],
       [/\b(401|403) Client Error|Unauthorized for url|Forbidden for url/, 'ログインに失敗したか、権限がありません。パスワードなどの入力値を確認してください。'],
       [/REQREC_[A-Z_]+ (が|is) /, '実行に必要な入力 (パスワードなど) が足りません。上の入力欄をすべて埋めてください。'],
@@ -14318,9 +13140,7 @@ select.w-full { width: 100%; max-width: 100%; }
         // a page reload during an in-app-browser recording keeps the auto-stop working, but only for a
         // recording that was started from the easy screen (record_origin is kept by the server)
         const b = st.browser || null;
-        recMode = st.record_browser_kind || (b && b.kind) || null;
         recOrigin = st.record_origin || null;
-        setGuide(recMode === 'iehost');
         browserSeen = !!(b && b.kind === 'iehost' && b.running);
         autoStopped = false;
         stage('recording');
@@ -14332,7 +13152,7 @@ select.w-full { width: 100%; max-width: 100%; }
         readiness();
       }
     }
-    return { initFromState, setMode, stage, refreshLoaded };
+    return { initFromState, refreshLoaded };
   })();
 
   // ================================================================== 起動
@@ -14347,7 +13167,6 @@ select.w-full { width: 100%; max-width: 100%; }
       if (st.recording && st.recording.loaded) Steps.replan();
       Load.refreshFiles();
       Run.refreshScripts();
-      Windows.refresh();
       let panel = null;
       try { panel = localStorage.getItem('reqrec.panel'); } catch (e) { /* ignore */ }
       if (st.recorder && st.recorder.running) panel = 'record';
@@ -14366,16 +13185,15 @@ select.w-full { width: 100%; max-width: 100%; }
 '''
 
 
-# ===== former reqrec/cli.py: argparse CLI (reqrec record / import / inspect / generate / gui / browser) =====
-# argparse CLI.  Contract: DESIGN.md §9.
+# ===== former reqrec/cli.py: argparse CLI (reqrec import / inspect / generate / gui / browser) =====
+# argparse CLI.  Contract: DESIGN.md §9.  Recording itself is done in the GUI (``reqrec gui``).
 #
 # Sub-commands::
 #
-#     reqrec record   -o rec.json [-p 8080] [--listen-host 127.0.0.1] [--hosts a.com,b.com]
 #     reqrec import   INPUT... -o rec.json
 #     reqrec inspect  INPUT... [filter options] [override options] [--json]
 #     reqrec generate INPUT... -o scrape.py [filter options] [override options] [codegen options]
-#                     [--legacy-tls] [--dump-plan plan.json] [--run]
+#                     [--dump-plan plan.json] [--run]
 #     reqrec gui      [--host 127.0.0.1] [--port 8765] [--workdir DIR] [--no-browser]
 #     reqrec browser  build | status   (prebuild the recording browser next to reqrec.py; Windows)
 #
@@ -14391,7 +13209,7 @@ select.w-full { width: 100%; max-width: 100%; }
 #
 # This module only parses arguments, maps them onto ``PlanOptions`` / ``GenOptions`` and formats
 # results.  The pipeline functions are bound to module-level names (``load_recording``,
-# ``load_recordings``, ``build_plan``, ``generate``, ``run_record``) so tests can monkeypatch them.
+# ``load_recordings``, ``build_plan``, ``generate``) so tests can monkeypatch them.
 
 
 EXIT_OK = 0
@@ -14816,11 +13634,6 @@ def add_generate_options(parser: argparse.ArgumentParser) -> None:
         "--strict-status", action="store_true",
         help="記録時と同じステータスコードでなければエラーにする（既定は 4xx/5xx のみエラー）",
     )
-    group.add_argument(
-        "--legacy-tls", action="store_true",
-        help="古い TLS（1.0/1.1）や弱い暗号しか使えないサーバー（IE モードで使っている社内サーバーなど）向けの"
-             "接続設定を生成コードに入れる",
-    )
 
 
 def gen_options_from_args(args: argparse.Namespace) -> GenOptions:
@@ -14832,7 +13645,6 @@ def gen_options_from_args(args: argparse.Namespace) -> GenOptions:
         timeout=getattr(args, "timeout", _GEN_DEFAULTS.timeout),
         print_final=_GEN_DEFAULTS.print_final,
         strict_status=bool(getattr(args, "strict_status", False)),
-        legacy_tls=bool(getattr(args, "legacy_tls", False)),
     )
 
 
@@ -14845,7 +13657,7 @@ reqrec - Web サイトの HTTP 通信を記録して、同じ操作を再現す�
 
 _EPILOG = """\
 典型的な流れ:
-  1. 記録する   reqrec record -o rec.json            （または DevTools で HAR を保存）
+  1. 記録する   reqrec gui                           （記録用ブラウザで操作。IE の F12 で保存した HAR も可）
   2. 確認する   reqrec inspect rec.json
   3. 生成する   reqrec generate rec.json -o scrape.py
   4. 実行する   REQREC_PASSWORD=... python scrape.py
@@ -14857,41 +13669,22 @@ _EPILOG = """\
 各コマンドの詳細: reqrec <コマンド> -h"""
 
 
-_INPUT_HELP = ("入力ファイル（.har / .mitm / .flows / .json）。複数指定すると時刻順に結合して 1 つの記録として扱います"
+_INPUT_HELP = ("入力ファイル（.har / .json）。複数指定すると時刻順に結合して 1 つの記録として扱います"
                "（別タブで開いた画面の HAR など）")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the top-level parser with its sub-commands (record / import / inspect / generate / gui / browser)."""
+    """Build the top-level parser with its sub-commands (import / inspect / generate / gui / browser)."""
     parser = _ArgumentParser(prog="reqrec", description=_DESCRIPTION, epilog=_EPILOG)
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}", help="バージョンを表示して終了する")
 
     subparsers = parser.add_subparsers(dest="command", title="コマンド")
 
-    # -- record -----------------------------------------------------------------------------------
-    p_record = subparsers.add_parser(
-        "record",
-        help="mitmproxy ベースのプロキシを起動してブラウザ（やアプリ）の通信を記録する",
-        description="mitmproxy ベースの記録用プロキシを起動します。ブラウザのプロキシ設定を指定のアドレスに向け、\n"
-                    "操作が終わったら Ctrl+C で停止すると記録ファイル（JSON）が保存されます。\n"
-                    'mitmproxy が必要です: pip install "reqrec[record]"',
-    )
-    p_record.add_argument("-o", "--out", required=True, metavar="FILE", help="記録の保存先（JSON）")
-    p_record.add_argument("-p", "--port", type=_port, default=8080, metavar="PORT", help="プロキシの待ち受けポート（既定: 8080）")
-    p_record.add_argument("--listen-host", default="127.0.0.1", metavar="HOST",
-                          help="プロキシの待ち受けアドレス（既定: 127.0.0.1。スマホから使うなら 0.0.0.0）")
-    p_record.add_argument("--hosts", action="append", metavar="HOST", default=None,
-                          help="記録対象をこのホスト（とそのサブドメイン）に限定する。繰り返し指定・カンマ区切り可")
-    p_record.add_argument("-v", "--verbose", action="store_true", help="mitmdump 自体の出力も表示する")
-    p_record.add_argument("--mitm-arg", action="append", metavar="ARG", default=None,
-                          help="mitmdump にそのまま渡す追加引数（例: --mitm-arg=--ssl-insecure）。繰り返し指定可")
-    p_record.set_defaults(func=cmd_record)
-
     # -- import -----------------------------------------------------------------------------------
     p_import = subparsers.add_parser(
         "import",
-        help="HAR / mitmproxy フローファイルを reqrec の記録形式（JSON）に変換する",
-        description="DevTools の HAR（.har）、mitmproxy のフローファイル（.mitm / .flows）、または reqrec の記録（.json）を\n"
+        help="HAR を reqrec の記録形式（JSON）に変換する",
+        description="開発者ツールの HAR（.har）または reqrec の記録（.json）を\n"
                     "読み込み、reqrec の記録形式（JSON）で保存します。inspect / generate は HAR を直接読めるので、\n"
                     "変換は必須ではありません（記録を 1 つの形式でまとめて保管したい場合などに使います）。",
     )
@@ -15028,20 +13821,7 @@ def _input_label(paths: Sequence[str]) -> str:
     return ", ".join(str(p) for p in paths)
 
 
-# --------------------------------------------------------------------------- record / import
-
-def cmd_record(args: argparse.Namespace) -> int:
-    """``reqrec record``: delegate to the mitmproxy launcher."""
-    hosts = split_hosts(args.hosts)
-    return int(run_record(
-        out=args.out,
-        port=args.port,
-        hosts=hosts or None,
-        listen_host=args.listen_host,
-        quiet=not args.verbose,
-        extra_args=list(args.mitm_arg or ()),
-    ))
-
+# --------------------------------------------------------------------------- browser / gui / import
 
 #: ``reqrec browser`` without ``build`` / ``status`` (the former ``python -m reqrec.iehost`` usage text).
 _BROWSER_USAGE = (

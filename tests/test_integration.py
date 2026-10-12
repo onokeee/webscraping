@@ -591,9 +591,7 @@ def test_firefox_script_fails_loudly_with_wrong_password(firefox):
 # percent-encoded postback), merging several recordings, and the manual overrides - at plan level,
 # as generated source, and executed against ``mock_adapter`` sites that hand out fresh tokens.
 
-import sys  # noqa: E402
 import types  # noqa: E402
-from urllib.parse import unquote_to_bytes  # noqa: E402
 
 from reqrec import load_recordings  # noqa: E402
 from reqrec import TOKEN_HEADER, create_app  # noqa: E402
@@ -694,10 +692,9 @@ def test_legacy_generated_script_matches_design_13(legacy):
     assert 'os.environ.get("REQREC_NTLM_PASSWORD", "")' in source
     assert "Authorization" not in source and "TlRMTVNTUAA" not in source
     assert "reqrec[sspi]" in source and "reqrec[ntlm]" in source
-    # §13.3 verification knob is always there
-    assert "VERIFY_TLS = True  # 自己署名証明書のサイトなら False か CA 証明書 (.pem) のパスに" in source
-    assert "session.verify = VERIFY_TLS" in source
-    assert "_LegacyTLSAdapter" not in source  # only with legacy_tls
+    # §13.3 is gone: http:// sites only, so no TLS settings at all
+    for removed in ("VERIFY_TLS", "session.verify", "_LegacyTLSAdapter", "session.mount(", "import ssl"):
+        assert removed not in source, removed
     # §13.4 bytes-based soup, _text(resp) for the text result, cp932 form rebuilt field by field
     assert "BeautifulSoup(resp.content, 'html.parser'" in source
     assert "def _text(resp):" in source and "print(_text(final_resp)[:2000])" in source
@@ -712,20 +709,6 @@ def test_legacy_generated_script_matches_design_13(legacy):
     assert sum(1 for c in comments if JAPANESE_RE.search(c)) >= 10
     assert "認証: 統合 Windows 認証（NTLM）" in source and "記録時のユーザー: EXAMPLE\\\\taro" in source
     assert recording.flows[2].response.text().count("売上レポート") >= 1  # the Shift_JIS page decodes for the plan
-
-
-def test_legacy_script_with_legacy_tls_mounts_the_adapter(legacy):
-    recording, _plan, _source = legacy
-    plan = build_plan(recording, PlanOptions())
-    source = generate(plan, GenOptions(legacy_tls=True))
-    compile(source, "legacy_tls.py", "exec")
-    assert "class _LegacyTLSAdapter(requests.adapters.HTTPAdapter):" in source
-    assert 'session.mount("https://", _LegacyTLSAdapter())' in source
-    assert "ctx.minimum_version = ssl.TLSVersion.TLSv1" in source
-    assert 'ctx.set_ciphers("DEFAULT:@SECLEVEL=1")' in source
-    assert 'getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0)' in source
-    assert "import ssl" in source and "IE モード" in source
-    assert "session.verify = VERIFY_TLS" in source
 
 
 # --------------------------------------------------------------------------- legacy fixture: execution
@@ -821,12 +804,12 @@ def test_legacy_script_replays_with_fresh_viewstate(legacy, monkeypatch):
     assert recorded_viewstate.encode() not in unquote_to_bytes(site.adapter.calls[1].body)
 
 
-def test_legacy_script_legacy_tls_variant_replays(legacy, monkeypatch):
+def test_legacy_script_strict_variant_replays(legacy, monkeypatch):
     recording, _plan, _source = legacy
-    source = generate(build_plan(recording, PlanOptions()), GenOptions(legacy_tls=True, comments=False, strict_status=True))
+    source = generate(build_plan(recording, PlanOptions()), GenOptions(comments=False, strict_status=True))
     monkeypatch.setitem(sys.modules, "requests_negotiate_sspi", _stub_module("requests_negotiate_sspi", HttpNegotiateAuth=_NoAuth))
     site = IntranetSite()
-    out = run_generated(source, site.adapter, env={})  # http:// URLs: the https adapter is mounted but unused
+    out = run_generated(source, site.adapter, env={})
     _assert_legacy_replay(site, out)
 
 
@@ -863,13 +846,13 @@ def test_legacy_script_without_any_ntlm_package_stops_with_japanese_hint(legacy,
     assert site.adapter.calls == []  # nothing was sent
 
 
-def test_legacy_cli_generate_with_legacy_tls_replays(tmp_path, capsys, monkeypatch):
+def test_legacy_cli_generate_replays(tmp_path, capsys, monkeypatch):
     target = tmp_path / "legacy.py"
-    assert cli.main(["generate", LEGACY_HAR, "-o", str(target), "--legacy-tls"]) == 0
+    assert cli.main(["generate", LEGACY_HAR, "-o", str(target)]) == 0
     err = capsys.readouterr().err
     assert "認証: NTLM (記録時のユーザー: EXAMPLE\\taro)" in err and "session.auth" in err
     source = target.read_text(encoding="utf-8")
-    assert "_LegacyTLSAdapter" in source and "TlRMTVNTUAA" not in source
+    assert "session.auth = HttpNegotiateAuth()" in source and "TlRMTVNTUAA" not in source
     monkeypatch.setitem(sys.modules, "requests_negotiate_sspi", _stub_module("requests_negotiate_sspi", HttpNegotiateAuth=_NoAuth))
     site = IntranetSite()
     _assert_legacy_replay(site, run_generated(source, site.adapter, env={}))

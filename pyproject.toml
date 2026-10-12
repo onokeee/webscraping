@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "reqrec"
 version = "0.1.0"
-description = "Record a website's HTTP traffic (proxy or HAR) and generate a standalone Python scraping script from it, like a macro recorder for HTTP."
+description = "Record the http:// traffic of an Edge IE-mode intranet site with a built-in IE-engine recording browser (or import a HAR) and generate a standalone Python scraping script from it, like a macro recorder for HTTP."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

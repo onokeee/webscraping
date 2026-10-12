@@ -6,7 +6,6 @@ dist/
 .pytest_cache/
 .venv/
 venv/
-*.mitm
 *.har.bak
 /recordings/
 

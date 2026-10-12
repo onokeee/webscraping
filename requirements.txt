@@ -1,0 +1,29 @@
+# -*- coding: utf-8 -*-
+# reqrec を動かすために pip で入れるライブラリです。python.exe のあるフォルダで次を実行します。
+# -r のあとは、この requirements.txt の場所に合わせて書き換えてください。
+#   .\python.exe -m pip install -r C:\work\reqrec\requirements.txt
+#
+# バージョンは動作確認したものに固定しています。mitmproxy 12 は Python 3.12 以上が必要です。
+#
+# インターネットにつながらない PC に入れるときは、つながる PC で部品をフォルダに集めてから持っていきます。
+# 両方の PC で Python のバージョン（3.12 / 3.13 など）と 32 / 64 ビットをそろえてください。
+#   .\python.exe -m pip download -r C:\work\reqrec\requirements.txt -d wheels        （つながる PC）
+#   .\python.exe -m pip install --no-index --find-links wheels -r C:\work\reqrec\requirements.txt   （つながらない PC）
+
+# GUI の画面（この PC の中だけで動く Web 画面）
+flask==3.1.3
+
+# 記録（記録用ブラウザの通信を中継して記録する）
+mitmproxy==12.2.3
+
+# 生成したスクリプトと「試しに実行する」が使う
+requests==2.34.2
+beautifulsoup4==4.15.0
+
+# ---- 以下は必要なときだけ、行頭の「# 」を消してから入れてください ----
+
+# 社内サイトが Windows 統合認証（開くと自動でログインされる）で、生成したスクリプトをこの Python で動かす場合
+# requests-negotiate-sspi>=0.5
+
+# 「生成オプション」の HTML パーサーで lxml を選ぶ場合
+# lxml==6.1.3

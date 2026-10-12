@@ -2,13 +2,37 @@
 
 ## Module layout (2026-10-12)
 
+**2026-10-12 (3): scope reduction.** reqrec is now a tool only for legacy intranet sites used in
+Edge's IE mode over plain `http://`.  Recording happens only in the GUI, in the in-app IE-engine
+recording browser (`RecBrowser.exe`, §13.12): `POST /api/record/start` starts mitmdump on
+`127.0.0.1` (`RECORD_LISTEN_HOST`) on a free port (`find_free_port`, the GUI's own port avoided)
+with `HTTPS_PASSTHROUGH_ARGS` (`--ignore-hosts .*`) always on, and opens the recording browser
+through it.  A PC that cannot run the recording browser cannot record; there is no fallback.
+Importing a HAR (e.g. saved with IE11's F12 tools) or a reqrec JSON recording, the analysis, code
+generation, script runs, downloads, 表示モード, the host filter, 追加モード and the CLI commands
+`import` / `inspect` / `generate` / `gui` / `browser` are unchanged.  Everything that existed only
+for Chrome / normal Edge / other browsers / smartphones / https recording / mitmproxy flow files
+was deleted.  The history sections below still mention these names (as history); where a section
+specifies a removed feature, a note dated 2026-10-12 (3) says so.
+
+| area | removed | kept |
+|---|---|---|
+| Windows system proxy and CA certificate (the `winsupport` sub-section of `gui`, §13.7) | `get_system_proxy`, `set_system_proxy`, `restore_system_proxy`, `refresh_proxy_settings`, `proxy_server_for`, `status_summary`, `mitmproxy_ca_cert_path`, `cert_installed`, `install_ca_cert`, `INTERNET_SETTINGS_KEY`, `DEFAULT_PROXY_OVERRIDE`, `INTERNET_OPTION_*`; `AppState.proxy_backup` / `proxy_server` / `register_proxy_restore` (and its `atexit` hook), `_restore_proxy`, `_PROXY_OVERRIDE`, `_windows_only`; the routes `GET /api/win/status`, `POST /api/win/proxy`, `POST /api/win/proxy/restore`, `POST /api/win/cert/install`; the `windows` block of `/api/state` | `is_windows`, `NOT_WINDOWS_MESSAGE` (core section); `iehost._winreg` |
+| other browsers (the `webapp/launch` sub-section) | `find_edge`, `_EDGE_CANDIDATES`, `_EDGE_APP_PATHS_KEY`, `_is_windows`, `open_url`, `DEFAULT_START_URL` | `validate_url` (an empty address is now a `ValueError`), `open_folder` |
+| manual recording (記録方式 「自分でブラウザを設定する」 = browser kind `"none"`) | `_BROWSER_KINDS`, `AppState.record_browser_kind` / `record_https_passthrough`; the `record_start` fields `port`, `listen_host`, `set_system_proxy`, `browser`, `https_passthrough` (now ignored) and the response fields `instructions`, `auto_port`, `system_proxy`, `browser_kind`, `https_passthrough`; `listen_host` of `build_command` / `RecorderManager` and the wildcard-to-loopback mapping of `find_free_port` / `wait_until_listening`; the page's port, listen-address, 記録方式, HTTPS and system-proxy inputs and its 「ブラウザ側の手順」 and 「Windows の設定」 cards | the `record_start` fields `hosts`, `append`, `start_url`, `emulation`, `origin`; `RECORD_LISTEN_HOST = "127.0.0.1"`; new `_proxy_address(port)` |
+| https recording | `RecBrowser.exe --https`, the C# `Options.HttpsRecorded`, `iehost.launch(https_recorded=...)` | `HTTPS_PASSTHROUGH_ARGS`, now passed to every recording |
+| `reqrec record` (the recorder's `run` sub-section, §3) | `cmd_record`, `run_record`, `stop_child`, `format_instructions`, `_print_summary`, `_GRACE_FIRST_WAIT`, `_GRACE_AFTER_SIGINT` | `build_command`, `mitmdump_launcher`, `mitmproxy_available`, `_wait` |
+| mitmproxy flow files (the importers' `mitm` sub-section, §2) | `load_mitm`, `_import_mitmproxy`, `_flows_in_order`, `MITM_EXTENSIONS`, `MITMPROXY_INSTALL_HINT`; `.mitm` / `.flows` / `.flow` as input and upload | `flow_from_mitm` and its helpers (used by the recorder addon); `RECORDING_EXTENSIONS = {".har", ".json"}` |
+| legacy TLS (codegen, §13.3) | `GenOptions.legacy_tls`, `generate --legacy-tls`, the GUI checkbox; `VERIFY_TLS`, `session.verify`, `import ssl` / `import warnings`, `_LegacyTLSAdapter` in generated scripts | — |
+
 The whole application is **one module, `reqrec.py`, in the repository root** (no package folder,
-no data files).  The repository holds only `reqrec.py`, `pyproject.toml`, `README.md`, `DESIGN.md`,
-`.gitignore` and `tests/`.  The layout was flattened twice on 2026-10-12: first the package with
+no data files).  The repository holds only `reqrec.py`, `pyproject.toml`, `requirements.txt` (pinned
+libraries for a portable Python), `README.md`, `DESIGN.md`, `.gitignore` and `tests/`.  The layout was flattened twice on 2026-10-12: first the package with
 sub-folders (HEAD 65346c2 and earlier) became one flat folder `reqrec/` with 11 files, then
 (**2026-10-12 (2)**) those 11 files became `reqrec.py`.  The history sections below (§1–§13.10) were
 written for the oldest layout and keep its names; read them through the table below.  The overview,
-the current-state sections §13.11–§13.13 and README.md use the current names.
+the current-state sections §13.11–§13.13 and README.md use the current names and the reduced scope
+above.
 
 `reqrec.py` from top to bottom: the module docstring, one import block, `__version__`, one `__all__`
 (grouped by section), `_register_script_module()`, then one section per file of the 11-file layout,
@@ -22,14 +46,14 @@ them as sub-sections with the same kind of heading (`# ===== former reqrec/filte
 |---|---|---|
 | 2026-10-12 (2) | `reqrec/__init__.py` | the top of `reqrec.py`, before the first section: `__version__` and `__all__` (now one list for every section), plus `_register_script_module()` (below) |
 | 2026-10-12 (2) | `reqrec/core.py` | section `core` (`former reqrec/core.py`; sub-sections `former reqrec/model.py`, `former reqrec/util.py`) |
-| 2026-10-12 (2) | `reqrec/importers.py` | section `importers` (sub-sections `former reqrec/importers/__init__.py`, `…/har.py`, `…/mitm.py`); logger still `reqrec.importers` |
+| 2026-10-12 (2) | `reqrec/importers.py` | section `importers` (sub-sections `former reqrec/importers/__init__.py`, `…/har.py`, `…/mitm.py`); logger still `reqrec.importers`.  Since 2026-10-12 (3) the `…/mitm.py` sub-section holds only `flow_from_mitm` and its helpers (used by the recorder addon) |
 | 2026-10-12 (2) | `reqrec/analysis.py` | section `analysis` (sub-sections `former reqrec/filters.py`, `deps.py`, `loops.py`, `plan.py`); bs4 is now imported inside the three functions that parse HTML |
 | 2026-10-12 (2) | `reqrec/codegen.py` | section `codegen` |
-| 2026-10-12 (2) | `reqrec/recorder.py` | section `recorder` (sub-sections addon, run, manager); `addons` stays, `ADDON_PATH` is now `reqrec.py` itself |
+| 2026-10-12 (2) | `reqrec/recorder.py` | section `recorder` (sub-sections addon, run, manager); `addons` stays, `ADDON_PATH` is now `reqrec.py` itself.  Since 2026-10-12 (3) the run sub-section holds only the mitmdump command line (`build_command`, `mitmdump_launcher`, `mitmproxy_available`, `_wait`) |
 | 2026-10-12 (2) | `reqrec/iehost.py` | section `iehost`: the namespace class `iehost` (below) and the top-level classes `IEHostError` / `BrowserProcess`.  Its `main()` (`python -m reqrec.iehost build \| status`) became the CLI sub-command `reqrec browser build \| status` (`cmd_browser_build` / `cmd_browser_status` / `cmd_browser_usage` in the `cli` section) |
 | 2026-10-12 (2) | `reqrec/RecBrowser.cs` | constant `RECBROWSER_CS` (raw string, heading `former reqrec/RecBrowser.cs`, right after the `iehost` section), byte for byte.  It is written to a file only to compile it: `<workdir>/bin/RecBrowser.cs`, or a temporary file for `reqrec browser build` |
 | 2026-10-12 (2) | `reqrec/RecBrowser.exe` + `.sha256` (git-ignored output of `python -m reqrec.iehost build`) | `RecBrowser.exe` + `.sha256` next to `reqrec.py` (output of `reqrec browser build`; `iehost.SHIPPED_DIR`; git-ignored as `/RecBrowser.exe*`) |
-| 2026-10-12 (2) | `reqrec/gui.py` | section `gui` (sub-sections winsupport, webapp/launch, webapp/state, webapp/routes, webapp/__init__).  Flask import name still `reqrec.gui`, blueprint still `reqrec` (endpoint names unchanged) |
+| 2026-10-12 (2) | `reqrec/gui.py` | section `gui` (sub-sections winsupport, webapp/launch, webapp/state, webapp/routes, webapp/__init__).  Flask import name still `reqrec.gui`, blueprint still `reqrec` (endpoint names unchanged).  Since 2026-10-12 (3) the winsupport sub-section is gone and webapp/launch keeps only `validate_url` and `open_folder` |
 | 2026-10-12 (2) | `reqrec/gui.html` | constant `GUI_HTML` (raw string, heading `former reqrec/gui.html`, right after the `gui` section), byte for byte except two lines: the Jinja comment at the top, and the AppLocker message, which now names `python -m reqrec browser build` instead of `python -m reqrec.iehost build`.  `create_app` gives it to Jinja from memory as the template `gui.html` (`DictLoader`; the `.html` name keeps autoescaping on), so the index route renders it with `render_template` and Jinja compiles it once per app, as it did the former file; the Flask app has no template / static folder |
 | 2026-10-12 (2) | `reqrec/cli.py` | section `cli` (now with the `browser` sub-command); its `main()` and `_exit_code_from_system_exit` are the last section, the entry point |
 | 2026-10-12 | `__init__.py`, `codegen.py`, `cli.py` | unchanged (`reqrec/__init__.py`, `reqrec/codegen.py`, `reqrec/cli.py`) |
@@ -60,7 +84,8 @@ Qualified names in the history sections map onto plain top-level names: `model.X
 `core.X`, `importers.X`, `filters.X` / `deps.X` / `loops.X` / `plan.X` / `analysis.X`, `codegen.X`,
 `recorder.X` (`recorder.run.X`, `recorder.manager.X`), `winsupport.X` / `launch.X` / `state.X` /
 `routes.X` / `gui.X` and `cli.X` are all `reqrec.X` now (`reqrec.webapp.run_gui` → `reqrec.run_gui`),
-except the renamed names below; `iehost.X` stays `iehost.X` (`reqrec.iehost.X`).
+except the renamed names below and the names removed on 2026-10-12 (3) (table at the top of this
+section), which have no counterpart; `iehost.X` stays `iehost.X` (`reqrec.iehost.X`).
 
 **How the one file is used.**
 * `reqrec ...` and `python -m reqrec ...`; `python reqrec.py ...` works too (it runs as `__main__`,
@@ -114,7 +139,8 @@ except the renamed names below; `iehost.X` stays `iehost.X` (`reqrec.iehost.X`).
   do not use the GUI start about 0.17 s slower than at HEAD 65346c2 (median of `--version`:
   `python -m reqrec.cli` 0.81 s → `python -m reqrec` 0.98 s); the GUI starts faster than the former
   `reqrec.gui`, and mitmdump has Flask loaded already.  Importing Flask lazily would mean creating
-  the blueprint `bp` and registering its 26 routes only inside `create_app`, so it was not done.
+  the blueprint `bp` and registering its 22 routes (26 before the 2026-10-12 (3) scope reduction
+removed the four `/api/win/*` routes) only inside `create_app`, so it was not done.
   `GET /` costs what it did with the former file (about 17 ms with the Flask test client; the
   template is compiled once, see `GUI_HTML` above).
 * **History**: `git log --follow reqrec.py` stops at the commit that created the file (it is far
@@ -139,8 +165,8 @@ and the other got a section prefix:
 | `codegen._VERSION` | `__version__` |
 | `cli`'s fallback `load_recordings` | removed (the importers' `load_recordings` always exists) |
 | `iehost.main` | `cmd_browser_build` / `cmd_browser_status` / `cmd_browser_usage` (CLI) |
-| `iehost.build_command`, `_wait`, `_winreg`, `_write_text`, `_GRACE_AFTER_TERMINATE` | unchanged inside the `iehost` namespace (they clash with recorder / gui / cli names) |
-| `iehost.SOURCE_PATH` | removed: the source is `RECBROWSER_CS`.  The `source` argument of `ensure_built` / `availability` / `shipped_exe` / `build_shipped` is now the C# **text** (default `RECBROWSER_CS`); the distribution folder is `iehost.SHIPPED_DIR` or the new `folder` argument (`is_available` takes `folder` instead of `source`); `iehost.SOURCE_NAME` / `iehost.source_path(workdir)` name the file written for csc; `availability()["source"]` is that path |
+| `iehost.build_command`, `_wait`, `_winreg`, `_write_text`, `_GRACE_AFTER_TERMINATE` | unchanged inside the `iehost` namespace (they clash with recorder / gui / cli names; since 2026-10-12 (3) `_winreg` and `_GRACE_AFTER_TERMINATE` no longer have a top-level namesake, the other three still do) |
+| `iehost.SOURCE_PATH` | removed: the source is `RECBROWSER_CS`.  The `source` argument of `ensure_built` / `availability` / `shipped_exe` / `build_shipped` is now the C# **text** (default `RECBROWSER_CS`); the distribution folder is `iehost.SHIPPED_DIR` or the new `folder` argument (`is_available` took `folder` instead of `source`; it was removed on 2026-10-12 (3) as unused, `availability` is the check); `iehost.SOURCE_NAME` / `iehost.source_path(workdir)` name the file written for csc; `availability()["source"]` is that path |
 | each module's `__all__` | one `__all__` at the top, grouped by section |
 
 **The `iehost` namespace.** Callers use the recording-browser functions qualified
@@ -152,10 +178,11 @@ replacing one attribute behaves exactly as replacing an attribute of the former 
 `monkeypatch` `iehost.csc_path` / `iehost.is_windows` / `iehost.BUILD_PLATFORM`, and
 `iehost.launch` / `iehost.availability` as the GUI routes see them (`routes_mod.iehost`).  This kept
 the tests simplest (their `iehost.X` calls did not change).  `IEHostError` and `BrowserProcess` are
-top-level classes, also reachable as `iehost.IEHostError` / `iehost.BrowserProcess`.
+top-level classes; `BrowserProcess` is also reachable as `iehost.BrowserProcess`.
 
-**Monkeypatching** a top-level name now affects every section: e.g. `mitmproxy_available` patched
-for a GUI test is also what `run_record` sees, where the former modules each had their own binding.
+**Monkeypatching** a top-level name now affects every section: e.g. `build_command` patched for a
+GUI test is also the default `command_builder` of every `RecorderManager` created afterwards
+(recorder section), where the former modules each had their own binding.
 For the same reason a test must not `importlib.reload` the module (it would replace every class
 other tests hold); `tests/test_gui.py` imports a fresh copy of the file instead.
 
@@ -169,7 +196,7 @@ are those of the time each section was written; read them through this table.
 | `test_importers.py`, `test_merge.py` | `test_core.py` |
 | `test_filters.py`, `test_loops.py`, `test_deps.py`, `test_plan.py`, `test_overrides.py`, `test_auth.py`, `test_review3_analysis.py` | `test_analysis.py` |
 | `test_codegen.py`, `test_codegen_phase2.py`, `test_review3_codegen.py` | `test_codegen.py` |
-| `test_webapp.py`, `test_webapp_easy.py`, `test_webapp_iehost.py`, `test_winsupport.py` | `test_gui.py` |
+| `test_webapp.py`, `test_webapp_easy.py`, `test_webapp_iehost.py`, `test_winsupport.py` | `test_gui.py` (of the former `test_winsupport.py` only the platform tests remain: `is_windows`, importing without `winreg`; its system-proxy and certificate tests were deleted on 2026-10-12 (3)) |
 | `test_webapp_browser.py` | `test_gui_browser.py` (Playwright; `REQREC_CHROMIUM`) |
 | `test_integration.py`, `test_integration_legacy.py`, `e2e/test_e2e.py`, `e2e/test_server_capture.py`, `e2e/test_factory_replay.py` | `test_integration.py` |
 | `test_iehost_engine.py`, `test_iedriver.py`, `test_factory_site.py`, `e2e/test_gui_recording.py`, `e2e/test_factory_live.py` | `test_real_engine.py` (opt-in parts: `REQREC_IEHOST_TESTS=1`) |
@@ -180,22 +207,24 @@ are those of the time each section was written; read them through this table.
 
 ## Overview
 
-`reqrec` records a website's HTTP traffic (via a mitmproxy-based recording proxy, a HAR file
-exported from browser DevTools, or a saved mitmproxy flow file) and generates a **standalone
-Python script** (`requests` + `BeautifulSoup`) that replays the same conversation — like a macro
-recorder, but at the HTTP request/response level instead of screen elements.
+`reqrec` records the HTTP traffic of a legacy intranet site used in Edge's IE mode over plain
+`http://` and generates a **standalone Python script** (`requests` + `BeautifulSoup`) that
+replays the same conversation — like a macro recorder, but at the HTTP request/response level
+instead of screen elements.  Recording is done in the GUI's own IE-engine recording browser
+(`RecBrowser.exe`, §13.12), whose process alone is routed through a mitmproxy-based recording proxy
+(the reqrec addon); an existing HAR file (e.g. saved with IE11's F12 tools) or reqrec JSON
+recording can be imported instead.
 
 ```
- browser ──proxy──▶ mitmproxy addon ─┐
- DevTools ──"Save all as HAR"────────┼──▶ Recording (JSON) ──▶ build_plan ──▶ Plan ──▶ generate ──▶ scrape.py
- mitmdump -w flows.mitm ─────────────┘
+ RecBrowser.exe ──its own proxy setting──▶ mitmproxy addon ─┐
+ HAR / reqrec JSON file ────────────────────────────────────┴──▶ Recording (JSON) ──▶ build_plan ──▶ Plan ──▶ generate ──▶ scrape.py
 ```
 
 The three stages are deliberately separated so each can be tested alone:
 
 | stage | input → output | module |
 |---|---|---|
-| import / record | HAR / .mitm / live proxy → `Recording` | `importers`, `recorder` sections of `reqrec.py` |
+| import / record | HAR / reqrec JSON / the recording browser through the addon → `Recording` | `importers`, `recorder` sections of `reqrec.py` |
 | analyse | `Recording` → `Plan` | `analysis` section (filters → deps → loops → plan sub-sections) |
 | generate | `Plan` → Python source | `codegen` section |
 | UI | argparse CLI; Flask GUI (§13.6, §13.11); recording browser (§13.12) | `cli`; `gui` + `GUI_HTML`; `iehost` + `RECBROWSER_CS` |
@@ -219,8 +248,10 @@ HARs) — cleaning happens in `filters.clean_request_headers`.
 # reqrec/importers/__init__.py
 def load_recording(path: str) -> Recording
 ```
-Dispatch: `.har` → HAR; `.mitm` / `.flows` / `.flow` → mitmproxy; `.json` → sniff: a dict with
-`"log"` is HAR, a dict with `"flows"` is our Recording. Unknown → `ValueError` with a clear message.
+Dispatch: `.har` → HAR; `.json` → sniff: a dict with `"log"` is HAR, a dict with `"flows"` is our
+Recording. Unknown → `ValueError` with a clear message listing the supported `.har, .json`.  This
+includes the mitmproxy flow files `.mitm` / `.flows` / `.flow`, whose importer was removed on
+2026-10-12 (3).
 
 ```python
 # reqrec/importers/har.py
@@ -242,11 +273,12 @@ def recording_from_har(har: dict, source: str = "") -> Recording
 * Tolerate missing/odd fields (never crash on a real-world HAR; skip an entry only if it has no URL).
 
 ```python
-# reqrec/importers/mitm.py
-def load_mitm(path: str) -> Recording           # mitmproxy.io.FlowReader; ImportError → friendly message
-def flow_from_mitm(flow, flow_id: str) -> Flow   # shared with the recorder addon (HTTPFlow only)
+# reqrec/importers/mitm.py   — now only the converter the recorder addon (§3) uses
+def flow_from_mitm(flow, flow_id: str) -> Flow   # HTTPFlow (or a duck-typed object) -> Flow
 ```
-Use `flow.request.pretty_url`, `headers.fields` (bytes pairs → str, latin-1/utf-8 tolerant),
+`load_mitm` (reading saved `.mitm` flow files with `mitmproxy.io.FlowReader`) was removed on
+2026-10-12 (3); `flow_from_mitm` and its helpers (`decode_header_fields`, `infer_resource_type`,
+`_timestamp`) stay.  Use `flow.request.pretty_url`, `headers.fields` (bytes pairs → str, latin-1/utf-8 tolerant),
 `flow.request.content` / `flow.response.content` (**decoded** of Content-Encoding; fall back to
 `raw_content` when decoding fails), `flow.request.timestamp_start`.
 
@@ -264,17 +296,25 @@ Append every completed HTTP flow (optionally only for the given hosts and their 
 killed session still leaves a valid recording. `meta = {"source": "mitmproxy", "started_at": …}`.
 
 ```python
-# reqrec/recorder/run.py
-def run_record(out: str, port: int = 8080, hosts: list[str] | None = None,
-               listen_host: str = "127.0.0.1", quiet: bool = True, extra_args: list[str] = ()) -> int
+# reqrec/recorder/run.py   — now only the mitmdump command line
+RECORD_LISTEN_HOST = "127.0.0.1"
+def mitmproxy_available() -> bool          # a mitmdump executable on PATH or an importable mitmproxy
+def mitmdump_launcher() -> list[str]       # [mitmdump] when on PATH, else [sys.executable, "-c", MITMDUMP_PYTHON_STUB]
+def build_command(out: str, port: int = 8080, hosts: list[str] | str | None = None,
+                  extra_args: Sequence[str] = ()) -> list[str]
 ```
-Spawn `mitmdump` (via `sys.executable -m mitmproxy.tools.main mitmdump` or the `mitmdump` binary,
-whichever exists) with `-s <path to addon.py> --set reqrec_out=… --set reqrec_hosts=… -p PORT
---listen-host HOST`. Before starting, print **Japanese** instructions: how to point the browser at
-`http://HOST:PORT`, that the CA certificate must be installed once (`~/.mitmproxy/mitmproxy-ca-cert.pem`
-or visit `http://mitm.it` through the proxy), and that `Ctrl+C` stops recording. Forward
-`KeyboardInterrupt` to the child gracefully; return its exit code. If mitmproxy is missing, print
-`pip install "reqrec[record]"` and return 1.
+`build_command` returns (the bracketed parts only when they apply)
+
+```
+<mitmdump_launcher()> -s <ADDON_PATH> --set reqrec_out=<absolute out> [--set reqrec_hosts=a,b]
+    -p PORT --listen-host 127.0.0.1 --set flow_detail=0 [extra_args...]
+```
+It is the default `command_builder` of `RecorderManager` (§13.6), the only way reqrec records; the
+GUI always passes `extra_args=HTTPS_PASSTHROUGH_ARGS` (`--ignore-hosts .*`, §13.12).  The proxy
+always listens on this PC only: its one client is the recording browser.  `run_record` (the `reqrec record` command: Japanese instructions for pointing
+a browser at the proxy, installing the CA certificate / `http://mitm.it`, `Ctrl+C` to stop) was
+removed on 2026-10-12 (3) together with `stop_child`, `format_instructions` and `build_command`'s
+`listen_host` parameter.
 
 ## 4. Filters (`reqrec/filters.py`)
 
@@ -337,7 +377,7 @@ class Candidate:
 
 def find_candidates(flow: Flow, opts: PlanOptions) -> list[Candidate]
 def locate_value(value: str, source: Flow) -> Extractor | None      # var left as "" ; caller names it
-def locate_in_cookies(value: str, earlier: list[Flow]) -> str | None  # returns the cookie *name* if value equals (any variant of) a Set-Cookie value from an earlier response
+def find_cookie(value: str, earlier: list[Flow]) -> tuple[str, str] | None  # (cookie name, raw cookie value) if value equals (any variant of) a Set-Cookie value from an earlier response
 def is_dynamic_looking(value: str) -> bool                          # long random-ish token heuristic (for warnings)
 ```
 * Candidates: every query value, form value, JSON leaf (str/int/float, via recursive walk),
@@ -365,7 +405,7 @@ def is_dynamic_looking(value: str) -> bool                          # long rando
   5. `Location` header containing the value (final URL) → `url` with a verified pattern.
   Never return a locator keyed by the dynamic value itself (that would break on the next run).
   Patterns must have exactly **one** capturing group and be verified against the recorded text.
-* `locate_in_cookies`: compare against cookie values parsed from earlier `Set-Cookie` headers (first
+* `find_cookie`: compare against cookie values parsed from earlier `Set-Cookie` headers (first
   `name=value` segment), including URL-decoded/encoded variants (Laravel's `XSRF-TOKEN` is sent
   URL-encoded in the cookie and decoded in the `X-XSRF-TOKEN` header).
 
@@ -401,7 +441,7 @@ def build_plan(recording: Recording, opts: PlanOptions | None = None) -> Plan
 5. For each step in order, build a `Step` from the **first** flow of its group (request) and the
    **last** flow (response → `response_kind`, `expected_status`). Then for every `Candidate`:
    * `util.looks_like_timestamp(value, around=flow.started_at)` → `Ref.expr("str(int(time.time()*1000))")` / `"str(int(time.time()))"`.
-   * `locate_in_cookies` → `Ref.expr('session.cookies.get("NAME")')` (or `unquote(session.cookies.get("NAME"))` when the header value is the URL-decoded cookie).
+   * `find_cookie` → `Ref.expr('session.cookies.get("NAME")')` (or `unquote(session.cookies.get("NAME"))` when the header value is the URL-decoded cookie).
    * search earlier steps' responses, **latest first**, with `locate_value` (for a collapsed chain,
      search the final response first, then intermediate hops only for `header`/`url` kinds) →
      add/reuse an `Extractor` on that step (de-duplicate by (step, kind, locator)); value → `Ref.var`.
@@ -462,14 +502,21 @@ local server (see §10).
 ## 9. CLI (`reqrec/cli.py`)
 
 ```
-reqrec record   -o rec.json [-p 8080] [--listen-host 127.0.0.1] [--hosts a.com,b.com]
-reqrec import   INPUT(.har|.mitm|.json) -o rec.json
+reqrec import   INPUT(.har|.json) -o rec.json
 reqrec inspect  INPUT [filter options] [--json]
 reqrec generate INPUT -o scrape.py [filter options] [--html-parser html.parser|lxml] [--no-redact]
                 [--delay SEC] [--timeout SEC] [--no-comments] [--strict-status] [--dump-plan plan.json] [--run]
+reqrec gui      [--host 127.0.0.1] [--port 8765] [--workdir DIR] [--no-browser]
+reqrec browser  build | status
 filter options: --include-host H (repeatable, comma ok) --exclude-host H --keep-static --keep-trackers
                 --keep-all --no-collapse-redirects --no-loops --min-value-length N --max-steps N
 ```
+(`gui` and `browser` came later: Phase 2 and the 2026-10-12 (2) layout.)  The former
+`reqrec record -o rec.json [-p 8080] [--listen-host 127.0.0.1] [--hosts a.com,b.com]` was removed
+on 2026-10-12 (3): recording is done only in the GUI's recording browser (§13.12), and
+`reqrec record` is now an unknown command (usage error, exit 2).  `generate --legacy-tls` (§13.3) is
+gone too.
+
 `main(argv=None) -> int`. Messages in Japanese. `inspect` prints a table: kept steps (index, method,
 status, url, extracted vars) then dropped flows with reasons, then warnings. `generate` prints the
 plan summary + warnings to stderr and writes the script (or `-` for stdout). Exit codes: 0 / 1 (error) / 2 (usage).
@@ -519,14 +566,16 @@ Nobody edits `model.py`, `util.py`, `pyproject.toml` or another owner's files. N
 
 User requirements added after v0.1: (1) a **no-code** tool — a **Flask web app** — rather than CLI only;
 (2) first-class session / cookie handling (already in v0.1, exposed in the GUI); (3) **Edge IE mode**
-support: recording through the Windows system proxy, Windows integrated auth (NTLM / Negotiate),
-legacy TLS servers, Shift_JIS pages, ASP.NET WebForms; (4) screens that open in a **new tab**
-(`target=_blank` / `window.open`) — natively covered by proxy recording, and for the HAR path by
-**merging several recordings**.
+support: recording through the Windows system proxy (since replaced by the in-app recording
+browser, §13.12; the system-proxy path was removed on 2026-10-12 (3)), Windows integrated auth
+(NTLM / Negotiate), legacy TLS servers (removed on 2026-10-12 (3): reqrec targets `http://` only, §13.3),
+Shift_JIS pages, ASP.NET WebForms; (4) screens that open in a **new tab**
+(`target=_blank` / `window.open`) — covered by the recording browser (popups open as tabs in its
+own process and are recorded), and for the HAR path by **merging several recordings**.
 
 `model.py` already carries the new fields (do not edit it): `PlanOptions.exclude_flow_ids /
-include_flow_ids / final_flow_id / detect_auth`, `GenOptions.legacy_tls`, `Plan.auth: AuthInfo`,
-`Plan.final_step_index`, `Recording.merge(list)`, `Recording.save(path, atomic=True)`.
+include_flow_ids / final_flow_id / detect_auth`, `GenOptions.legacy_tls` (removed on 2026-10-12 (3)), `Plan.auth: AuthInfo`,
+`Plan.final_step_index`, `Recording.merge(list)`, `Recording.save(path)` (always atomic).
 `cli.py` already has the `gui` sub-command calling `reqrec.webapp.run_gui(host, port, workdir, open_browser)`.
 
 ## 13.1 Manual overrides and the "result" step  (filters.py, plan.py, codegen.py, cli.py)
@@ -590,17 +639,16 @@ GET /  Authorization: NTLM TlRMTVNTUAAD…   → 200
     The docstring "注意" lists the required package and env vars. No `Authorization` header of that
     scheme appears anywhere in the emitted steps.
 
-## 13.3 Legacy TLS and certificate verification  (codegen.py, cli.py)
+## 13.3 Legacy TLS and certificate verification  (removed)
 
-* Always emit `VERIFY_TLS = True  # 自己署名証明書のサイトなら False か CA 証明書 (.pem) のパスに` in the
-  settings block and `session.verify = VERIFY_TLS` in `main()`.
-* `GenOptions.legacy_tls` (`generate --legacy-tls`; GUI checkbox「古いTLS/暗号しか使えないサーバー」):
-  emit a `_LegacyTLSAdapter(requests.adapters.HTTPAdapter)` whose `init_poolmanager` /
-  `proxy_manager_for` build an `ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)` with
-  `minimum_version = ssl.TLSVersion.TLSv1` (guarded `try`), `set_ciphers("DEFAULT:@SECLEVEL=1")`,
-  `options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0)`, `check_hostname`/`verify_mode` left to
-  requests (honour `VERIFY_TLS`), and `session.mount("https://", _LegacyTLSAdapter())`. Comment in
-  Japanese why this exists (IE モードで使っている古い社内サーバー向け).
+**Removed on 2026-10-12 (3)**: reqrec targets plain `http://` sites only.  This section used to
+require `VERIFY_TLS = True` plus `session.verify = VERIFY_TLS` in every generated script and, with
+`GenOptions.legacy_tls` (`generate --legacy-tls`, a GUI checkbox), a `_LegacyTLSAdapter` mounted
+for `https://` (TLS 1.0, `@SECLEVEL=1`, `OP_LEGACY_SERVER_CONNECT`).  All of it is gone:
+generated scripts contain no `VERIFY_TLS`, `session.verify`, `import ssl`, `import warnings`,
+`_LegacyTLSAdapter` or `session.mount("https://", ...)`, and those names are no longer reserved
+identifiers.  An `https://` URL in an imported HAR is replayed with `requests`' default certificate
+verification.
 
 ## 13.4 Character encoding of responses  (codegen.py)
 
@@ -649,16 +697,37 @@ offline). UI language: **Japanese**. Served only on the bind address; default `1
 * `debug=False`; no `flask run` reloader.
 
 **JSON API** (all return JSON; errors `{"error": "<日本語>"}` with 4xx):
-* `GET /` → page. `GET /api/state` → `{recorder: {...}, recording: {loaded: bool, sources: [...], flows: n},
-  plan_options, gen_options, windows: {is_windows, proxy, cert}}`.
-* Recording: `POST /api/record/start {port, hosts: [...], listen_host, set_system_proxy: bool}` → starts
-  `RecorderManager` (below); output `workdir/recordings/rec_YYYYmmdd_HHMMSS.json`; when
-  `set_system_proxy` and Windows → `winsupport.set_system_proxy` (backup saved; restored on stop /
-  app exit). Returns `{instructions: "<日本語>", out, proxy_address}`. `GET /api/record/status` →
-  `{running, flows, out, stderr_tail, error}` (counts flows by reading the flushed JSON, tolerant of a
-  file mid-write). `POST /api/record/stop` → stops, restores proxy, **loads the recording** as current
-  (merging with already loaded ones only when `{"append": true}`), returns `{out, flows}`.
-* Loading: `POST /api/recordings/upload` (multipart, field `files`, several allowed: .har/.json/.mitm;
+* `GET /` → page. `GET /api/state` → `{version, workdir, gui_address, mitmproxy_available,
+  recorder: {...}, recording: {loaded: bool, sources: [...], flows: n, ...}, plan_loaded, plan_options,
+  gen_options, run, iehost, browser, record_origin, last_script, secrets}` (the `windows: {is_windows,
+  proxy, cert}` block and `record_browser_kind` were removed on 2026-10-12 (3)).
+* Recording (current contract since 2026-10-12 (3); every recording opens the recording browser,
+  §13.12): `POST /api/record/start {hosts: [...] | "a,b", append: bool, start_url, emulation: "keep" |
+  <iehost.EMULATION_LEVELS key>, origin: "easy" | "advanced"}`, all optional; the former keys `port`,
+  `listen_host`, `set_system_proxy`, `browser` and `https_passthrough` are ignored.  Order: validate
+  `hosts`, `start_url` (`_iehost_start_url`), `emulation`, `origin` (400) → 409 when already
+  recording → 400 when mitmproxy is missing (only with the default command builder) →
+  `_require_iehost` (400 with `iehost.availability()["reason"]`) → `port = find_free_port("127.0.0.1",
+  preferred=8080, avoid=(GUI port,))` → close a leftover recording browser,
+  `RecorderManager.start(out, port=port, hosts=hosts, extra_args=list(HTTPS_PASSTHROUGH_ARGS))` (output
+  `workdir/recordings/rec_YYYYmmdd_HHMMSS.json`) → when the child is running: `wait_until_listening`
+  (500 `kind: "proxy"` on timeout), 表示モード (500 `kind: "emulation"`) and
+  `_launch_iehost(state, "127.0.0.1:PORT", start_url)` (500 `kind: "iehost"`); each of these three
+  failures stops the recorder and forgets the file (`_abandon_start`).  Returns `{out, out_path, port,
+  proxy_address: "127.0.0.1:PORT", status, browser, emulation, origin, warnings,
+  self_excluded_hosts}`.  `GET /api/record/status` → `RecorderManager.status()` (`{running, flows,
+  out, out_name, pid, exit_code, started_at, stopped_at, port, hosts, stdout_tail, stderr_tail, error,
+  command}`; counts flows by reading the flushed JSON, tolerant of a file mid-write) plus
+  `mitmproxy_available`, `browser: {kind, running, pid, exit_code}` and `origin`.
+  `POST /api/record/stop {append?, discard?}` → closes the recording browser, stops the recorder,
+  **loads the recording** as current (merging with already loaded ones only when `append`, by
+  default the choice made at start), returns the recording summary plus `{out, out_path, exit_code,
+  browser_exit_code}`; nothing recorded → 400 「何も記録されませんでした。…」 with `empty: true`;
+  `{discard: true}` loads nothing and deletes the file (§13.11).  The former `instructions`,
+  `auto_port`, `system_proxy`, `browser_kind`, `https_passthrough`, `listen_host`,
+  `proxy_backup_active` and `proxy_error` fields are gone.
+* Loading: `POST /api/recordings/upload` (multipart, field `files`, several allowed: `.har` / `.json`
+  = `RECORDING_EXTENSIONS`, anything else 400 (`.mitm` since 2026-10-12 (3));
   `append` form field) → saves to `uploads/`, `load_recordings`, sets/merges current; returns summary.
   `GET /api/recordings` lists files in `recordings/` and `uploads/` (name, size, mtime, flows if cheap).
   `POST /api/recordings/open {names: [...], append}` opens server-side files by name.
@@ -675,25 +744,32 @@ offline). UI language: **Japanese**. Served only on the bind address; default `1
   thread (cwd `workdir/scripts/`, env = os.environ + given), max one at a time; `GET /api/run/status`
   → `{running, exit_code, stdout_tail, stderr_tail, started_at}`; `POST /api/run/stop`.
   `POST /api/run/save_output {name}` writes the last stdout to `workdir/outputs/<name>`.
-* Windows: `GET /api/win/status` → `{is_windows, proxy: {enabled, server, override}, cert: {installed:
-  bool|null, path}}`; `POST /api/win/proxy {enable, server}`; `POST /api/win/proxy/restore`;
-  `POST /api/win/cert/install` (runs `certutil -user -addstore Root <cert>`; returns output). On other
-  OSes → 400 with 「Windows 以外では使えません」.
+* Windows: the endpoints `GET /api/win/status`, `POST /api/win/proxy`, `POST /api/win/proxy/restore`
+  and `POST /api/win/cert/install` (system proxy and `certutil` CA install, §13.7) were removed on
+  2026-10-12 (3); reqrec never changes the Windows proxy or installs a certificate.
 
-**RecorderManager** (`reqrec/recorder/manager.py`): wraps `recorder.run.build_command` + `subprocess.Popen`
-(`stdout/stderr` to a bounded ring buffer in a reader thread), `start(out, port, hosts, listen_host)`,
-`stop(timeout) -> exit_code` (SIGINT/CTRL_BREAK on Windows → terminate → kill; mirrors `run.stop_child`),
-`status()`, `flow_count()` (reads the JSON file; returns last good count while the file is mid-write).
-Must be testable with a fake command (inject `command_builder`).
+**RecorderManager** (recorder section, former `reqrec/recorder/manager.py`): wraps `build_command`
+(or an injected `command_builder`, called as `command_builder(out_abs, port=..., hosts=[...])`, plus
+`extra_args=[...]` when there are any) + `subprocess.Popen` (stdout / stderr drained by reader
+threads into bounded ring buffers); `start(out, port=8080, hosts=None, extra_args=()) -> status()`;
+`wait_until_listening(timeout=20.0)` (dials `127.0.0.1:port`, i.e. `RECORD_LISTEN_HOST`; `False` when
+the child exits first or the time runs out); `stop(timeout) -> exit_code` (SIGINT, or
+`CTRL_BREAK_EVENT` on Windows where the child runs in its own process group → wait → `terminate()` →
+wait → `kill()`); `forget()`; `status()` (keys listed above); `flow_count()` (reads the JSON file;
+returns last good count while the file is mid-write); `load_recording()`.  There is no `listen_host`
+attribute or parameter any more: the proxy always listens on `127.0.0.1`.  Must be testable with a
+fake command (inject `command_builder`).
 
 **UI** (single page, sections as tabs or a vertical flow):
-1. 記録 — ポート・対象ホスト入力、[記録開始]/[記録停止]、進行中はフロー件数をライブ表示、手順カード
-   (プロキシ設定 `127.0.0.1:8080`、CA 証明書 `~/.mitmproxy/mitmproxy-ca-cert.pem` / `http://mitm.it`、
-   Edge IE モードは Windows の「インターネット オプション」のプロキシを使う旨)。Windows では
-   [システムプロキシを設定する] チェックと [CA 証明書をインストール] ボタン、状態表示。
-2. 読み込み — ファイル選択(複数: .har/.json/.mitm)、作業フォルダ内ファイル一覧から開く、「追加して結合」トグル。
+1. 記録 — 記録するサイト (ホスト名)、追加モード、最初に開くアドレス、表示モード (記録用ブラウザ)、
+   [記録開始] (記録用プロキシを空きポートで起動し、記録用ブラウザを開く) / [記録停止して読み込む]、記録の状態
+   (ライブ件数、プロキシのアドレス、出力ファイル、記録用ブラウザの状態、プロキシのログ)。記録用ブラウザが使えない PC
+   では [記録開始] は無効で、理由を表示する (`#rec-unavailable`)。The port input, the 手順カード (proxy
+   `127.0.0.1:8080`, CA certificate, `http://mitm.it`, Internet Options) and the Windows card
+   ([システムプロキシを設定する], [CA 証明書をインストール]) were removed on 2026-10-12 (3).
+2. 読み込み — ファイル選択(複数: .har/.json)、IE の F12 開発者ツールで保存した HAR の案内、作業フォルダ内ファイル一覧から開く、「追加して結合」トグル。
 3. ステップ — フィルタ設定(静的ファイル/トラッカー/全て残す、リダイレクト統合、ループ検出、秘密情報の環境変数化、
-   ホスト include/exclude、認証検出、レガシーTLS)、全フローの表(チェック=採用、判定理由、ステップ番号、メソッド、
+   ホスト include/exclude、認証検出)、全フローの表(チェック=採用、判定理由、ステップ番号、メソッド、
    ステータス、種類、URL、参照元)、「結果として使う」ラジオ、クリックで詳細ドロワー(リクエスト/レスポンスのヘッダー・本文)。
    表の変更は即 `/api/plan` 再計算。
 4. コード — [生成] → プレビュー(`<pre>` + 行番号は任意)、ファイル名入力、[保存]、[ダウンロード]、警告と環境変数の一覧。
@@ -703,29 +779,29 @@ Status bar with the last message. Keep the JS modular (`api()`, render functions
 
 **Tests**: `tests/test_webapp.py` (Flask test client; every endpoint; token/Host/Origin enforcement;
 path traversal attempts; plan/generate on `tests/fixtures/login_flow_chrome.har`; run endpoint with a
-tiny script; Windows endpoints → 400 off-Windows; RecorderManager with a fake "mitmdump" python stub
-that writes a recording file and exits on SIGINT/terminate), `tests/test_winsupport.py` (pure logic with
-injected fakes for winreg / subprocess), `tests/test_webapp_browser.py` (Playwright, Chromium at
+tiny script; RecorderManager with a fake "mitmdump" python stub
+that writes a recording file and exits on SIGINT/terminate; since 2026-10-12 (3) the record endpoints
+run with a faked recording browser, see §13.12; the Windows-endpoint and `test_winsupport.py`
+system-proxy / certificate tests were deleted with those features), `tests/test_webapp_browser.py` (Playwright, Chromium at
 `/opt/pw-browsers/chromium` with fallback to default; skipped when unavailable): start the app on a
 free port in a thread, upload the fixture HAR, wait for the steps table, uncheck one flow and see the
 plan refresh, pick a final step, click 生成, assert the code preview contains `def step_01_`, save,
 and run against `tests/e2e/mock_adapter.py`? — no: run is tested with a trivial script; the fixture
 script can't reach the fake hosts.
 
-## 13.7 Windows support module  (reqrec/winsupport.py)
+## 13.7 Windows support module  (removed)
 
-```python
-def is_windows() -> bool
-def get_system_proxy() -> dict            # {"enabled": bool, "server": str, "override": str}  (HKCU\…\Internet Settings)
-def set_system_proxy(server: str, enable: bool = True, override: str = "<local>;localhost;127.0.0.1") -> dict   # returns backup of previous values
-def restore_system_proxy(backup: dict) -> None
-def refresh_proxy_settings() -> None      # ctypes wininet InternetSetOptionW(None, 39, None, 0) and (None, 37, None, 0)
-def mitmproxy_ca_cert_path() -> Optional[str]   # ~/.mitmproxy/mitmproxy-ca-cert.cer or .pem, whichever exists
-def cert_installed() -> Optional[bool]    # certutil -user -store Root, look for "mitmproxy"; None when certutil unavailable
-def install_ca_cert(path: Optional[str] = None) -> tuple[bool, str]   # certutil -user -addstore Root <path>
-```
-All functions accept injected `winreg` / `run` callables for tests and raise `RuntimeError("Windows 以外では使えません")`
-when called for real on other OSes (except `is_windows`, `mitmproxy_ca_cert_path`).
+**Removed on 2026-10-12 (3).**  The module (later the `winsupport` sub-section of the `gui` section)
+read and changed the Windows system proxy (`get_system_proxy` / `set_system_proxy` /
+`restore_system_proxy` / `refresh_proxy_settings`, `HKCU\…\Internet Settings`) and installed
+mitmproxy's CA certificate with `certutil` (`mitmproxy_ca_cert_path` / `cert_installed` /
+`install_ca_cert`), so that Edge IE mode could be recorded through the system proxy and https
+through the mitmproxy CA.  Factory PCs forbid both changes, and on PCs with a PAC / auto-detect
+configuration the system proxy did not even take effect (§13.12 "Why").  The recording browser
+needs neither, and https is never recorded, so all of it was deleted together with the
+`/api/win/*` endpoints (§13.6).  Only `is_windows()` and `NOT_WINDOWS_MESSAGE` remain, in the
+platform part of the core section.  The only registry value reqrec still writes is the recording
+browser's 表示モード (`iehost.set_emulation`, §13.12).
 
 ## 13.8 Legacy fixture  (tests/fixtures/legacy_webforms_ntlm.har)
 
@@ -752,6 +828,13 @@ HAR: DevTools 設定「ポップアップに対して DevTools を自動的に�
 (`pip install .` と `reqrec gui`、PyInstaller での exe 化の例 `pyinstaller --onefile --name reqrec --collect-all reqrec --collect-all mitmproxy -m reqrec.cli` は検証していない旨を明記);
 更新したオプション表・FAQ (文字化け, 401 が続く, 証明書エラー, IE モードのサイトで TLS エラー).
 
+**Superseded on 2026-10-12 (3)** (the features are gone): why the proxy path works for IE mode,
+Windows プロキシ設定とCA証明書, 「IE11 F12 … プロキシ記録を推奨」 (the recording browser is now the
+recommended way, IE11 F12 HAR the alternative), レガシー TLS オプション, the DevTools steps for
+「別タブで開く画面」 (the recording browser opens popups / new windows as tabs and records them;
+several HARs can still be merged) and the FAQ entries 証明書エラー (記録時) and
+IE モードのサイトで TLS エラー.
+
 ## 13.10 File ownership for phase 2
 
 | owner | files |
@@ -776,31 +859,36 @@ client over the existing API plus the three endpoints below, and it keeps the ad
 sync (`Record.render`, `Load.applySummary`, `Steps.replan`, `Code.renderSecrets`, `Run`).
 
 **Flow (the script in GUI_HTML, module `Easy`):**
-1. **start** — `POST /api/record/start {port: "auto", hosts: [], listen_host: "127.0.0.1",
-   set_system_proxy: false, append: false, origin: "easy", browser: "iehost" (Windows with the recording browser) |
-   "none" (other OSes), start_url: <address box>, https_passthrough: <iehost>, emulation: "keep"}`.
-   `"auto"` makes the server pick a free port with `gui.find_free_port(listen_host,
-   preferred=8080, avoid=(gui port,))`; the response carries `port`, `auto_port`, `browser_kind`,
-   `browser` and `warnings`.  With `browser: "iehost"` the server waits for the proxy and opens the
-   in-app recording browser itself (§13.12): no certificate, no system proxy, no Edge.
-   `emulation: "keep"` = the easy screen never touches 表示モード (only 詳細設定 does).
-2. **no automatic fallback on Windows** — when the recording browser is unavailable (`data-iehost-
-   available="false"`) the easy screen does **not** change the system proxy or install the CA; it
-   explains the reason and points to 詳細設定 → 記録方式 「自分でブラウザを設定する」.  A launch
+1. **start** — `POST /api/record/start {hosts: [], append: false, start_url: <address box>,
+   emulation: "keep", origin: "easy"}`.  The server always picks a free port on `127.0.0.1`
+   (`find_free_port("127.0.0.1", preferred=8080, avoid=(gui port,))`), waits for the proxy and opens
+   the in-app recording browser itself (§13.12): no certificate, no system proxy, no Edge.  The
+   response carries `port`, `proxy_address`, `browser`, `origin` and `warnings`.  `emulation: "keep"`
+   = the easy screen never touches 表示モード (only 詳細設定 does).  (Until 2026-10-12 (3) the body
+   also had `port: "auto"`, `listen_host`, `set_system_proxy`, `https_passthrough` and
+   `browser: "iehost" | "none"`, with a manual-proxy flow on other OSes.)
+2. **no recording browser = no recording** — [記録をはじめる] is rendered disabled unless mitmproxy
+   and the recording browser are available (`data-mitm-available` / `data-iehost-available`), and the
+   readiness list (`#easy-ready`) shows the reason (`data-iehost-reason`: not Windows, or neither
+   `csc.exe` nor a prebuilt `RecBrowser.exe`) with 「この PC では記録できません」.  There is no fallback:
+   no system proxy, no certificate, no other browser; loading a HAR in 詳細設定 still works.  A launch
    failure at run time (e.g. the exe blocked by AppLocker) is shown with guidance for the
    administrator (`python -m reqrec browser build` + allow that folder) and kept in
    `/api/state` → `iehost.last_error` for the readiness list.
-3. **browser (other OSes)** — `POST /api/browser/open {url}` opens the default browser (Edge when
-   found: `gui.find_edge`) at the optional address (`gui.validate_url`: `http(s)://` only,
-   bare host names and `host:port` get `http://`, other schemes such as `javascript:` are
-   rejected); the user sets the proxy shown on screen by hand.  `{browser: "iehost"}` re-opens the
-   recording browser instead (only for an iehost recording).
+3. **browser** — [ブラウザをもう一度開く] = `POST /api/browser/open {url}` (re)opens the recording
+   browser of the running recording: while it still runs nothing happens (`relaunched: false`);
+   otherwise it is started again against the recorder's proxy (`127.0.0.1:<recorder port>`) at the
+   optional address (`_iehost_start_url` → `validate_url`: `http(s)://` only, bare host names and
+   `host:port` get `http://`, other schemes such as `javascript:` or `edge://` are rejected with
+   400), `relaunched: true`.  409 when nothing is being recorded; `_require_iehost` as for start; a
+   `browser` key in the body is ignored.
 4. **recording** — live count from the `Record` poller (`Record.subscribe`), [記録をおわる],
    [ブラウザをもう一度開く], [やめる] (`POST /api/record/stop {discard: true}`: nothing is loaded and
    the file is deleted).  Closing the recording browser stops automatically (once it was seen
    running; exit code 4 = its proxy could not be set → discard + message).  Switching back from
    詳細設定 re-reads `/api/record/status` so a recording started there is followed.
-5. **stop** — `POST /api/record/stop {}` (the append choice stored at start applies; loads the recording, restores the proxy;
+5. **stop** — `POST /api/record/stop {}` (the append choice stored at start applies; closes the
+   recording browser, stops the recorder and loads the recording;
    no recording file at all = 「何も記録されませんでした」 400 with `empty: true`),
    then **`POST /api/easy/build`**: `build_plan` with the current `PlanOptions` → `generate` →
    save to `scripts/<scrape_<host>_YYYYmmdd_HHMM>.py` (or `{"name": ...}`), returns
@@ -813,25 +901,28 @@ sync (`Record.render`, `Load.applySummary`, `Steps.replan`, `Code.renderSecrets`
    `os.startfile` / `open` / `xdg-open`; anything else is a 400), [試しに実行する] (env inputs
    for `secrets`, `Run.start` / `Run.stop`, output console, a plain-language hint for the common
    failures via `errorHint`, [結果をファイルに保存]), [もう一度記録する].
-   A recording loaded from the advanced panels (DevTools HAR) can be built from the idle screen
+   A recording loaded from the advanced panels (a HAR) can be built from the idle screen
    too ([読み込み済みの記録からスクリプトを作る]).
 
 **Security:** the new endpoints are `POST` and therefore covered by the token / Host / Origin
-hook of `create_app`.  `/api/browser/open` only ever launches a URL that passed `validate_url`;
-`/api/folder/open` only opens the fixed work-folder subdirectories.
+hook of `create_app`.  `/api/browser/open` only ever (re)starts the recording browser, with a start
+URL that passed `_iehost_start_url` (`validate_url`); `/api/folder/open` only opens the fixed
+work-folder subdirectories.
 
-**Tests:** `tests/test_gui.py` (its former `test_webapp_easy.py` section) — page markup, `find_free_port`, `port: "auto"` with a
-fake recorder, `/api/easy/build` on `login_flow_chrome.har` (file written, secrets reported,
-`last_script` updated, unsafe names rejected, token required), `/api/browser/open` and
-`/api/folder/open` with the launchers monkeypatched, and the launch helpers (`find_edge`, `validate_url`, `open_url`, `open_folder`) with injected
-fakes (Edge discovery through paths / registry, URL validation, fallbacks).
+**Tests:** `tests/test_gui.py` (its former `test_webapp_easy.py` section) — page markup, `find_free_port`, the automatic port of
+`/api/record/start` (fake recorder and fake recording browser; the GUI's own port is avoided),
+`/api/easy/build` on `login_flow_chrome.har` (file written, secrets reported,
+`last_script` updated, unsafe names rejected, token required), `/api/browser/open` (bad start URL
+rejected; relaunch in the iehost section) and `/api/folder/open`, and the helpers `validate_url` and
+`open_folder` with injected fakes (URL validation, the opener per OS).
 
 ## 13.12 In-app IE-engine recording browser  (reqrec.py: iehost section, RECBROWSER_CS, gui section)
 
 **Why.** Factory PCs commonly use Edge IE mode for legacy intranet sites, have a PAC / auto-detect
 proxy configuration, and forbid installing certificates or changing Internet Options.  Edge IE mode
 only honours the *system* proxy, and on such PCs the Windows proxy auto-configuration wins over a
-manually written proxy, so the §13.6 flow records nothing.  Instead reqrec ships a tiny browser
+manually written proxy, so the former system-proxy flow (§13.6 / §13.7, removed on 2026-10-12 (3))
+recorded nothing.  Instead reqrec ships a tiny browser
 that hosts **the same engine** (the WebBrowser control: ieframe / MSHTML / Trident 7) in its own
 process and routes **only that process** through the recorder.  Nothing in Windows, Internet
 Options or Edge changes, and no certificate is needed because only plain `http://` is recorded.
@@ -863,10 +954,14 @@ Options or Edge changes, and no certificate is needed because only plain `http:/
 **`RECBROWSER_CS`** (the former `RecBrowser.cs`; C# 5, compiled by `iehost.build_command`: `csc -nologo -target:winexe
 -platform:x86 -r:System.Windows.Forms.dll -r:System.Drawing.dll` — always 32-bit, like IE mode's content process, so 32-bit in-process ActiveX controls load; the former rule was x86 only when only the 32-bit
 `Framework` compiler exists, i.e. on 32-bit Windows): command line `--proxy HOST:PORT [--bypass ""]
-[--url URL] [--title T] [--log PATH] [--https] [--selftest] [--seconds N]`.  Window title
+[--url URL] [--title T] [--log PATH] [--selftest] [--seconds N]`.  Window title
 `<title> — 記録中`; toolbar 戻る / 進む / 更新 / address box / タブを閉じる / red **■ 記録をおわる**;
-tabs for popups; status strip that says only `http://` is recorded and announces an `https://`
-page / download as 「記録されません」 (unless `--https`: the recorder intercepts HTTPS).  Not
+tabs for popups; status strip that always says
+「● 記録中 — このウィンドウで開いた http:// のページの通信を記録しています（https:// は記録されません）」
+and announces an `https://` page / download as
+「記録されません」 (`static bool IsUnrecordedHttps(Uri url)`: the scheme is `https`).  The former
+`--https` option (C# `Options.HttpsRecorded`: the recorder intercepts HTTPS) was removed on
+2026-10-12 (3); the changed source changes the build digest, so every work folder rebuilds once.  Not
 `Silent` (`ScriptErrorsSuppressed = false`): Silent would also hide the 「Windows セキュリティ」
 credential prompt of Basic / Windows authentication; only `OLECMDID_SHOWSCRIPTERROR` (40, group
 `CGID_DocHostCommandHandler`) is answered at the site (no dialog, keep running scripts).  Exit
@@ -885,7 +980,9 @@ exe is missing, the digest in `bin/RecBrowser.cs.sha256` differs (`_build_digest
 the distribution folder (`RecBrowser.exe` next to reqrec.py) is copied when there is no `csc.exe`; a **shipped** exe — built
 there by `reqrec browser build` (from a temporary copy of the source) with `RecBrowser.exe.sha256` matching the source — is run in
 place, so an AppLocker / SRP policy only has to allow the distribution folder), `launch(workdir,
-proxy, url, title, https_recorded) -> BrowserProcess` (log under
+proxy_address, url=None, title=None) -> BrowserProcess` (argv `RecBrowser.exe --proxy <addr>
+--bypass "" --log <log> [--url URL] [--title T]`; the `https_recorded` parameter was removed on
+2026-10-12 (3); log under
 `<workdir>/logs/recbrowser_<timestamp>.log`; job object `KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK`:
 the browser dies with the GUI, programs it starts such as Excel do not), `BrowserProcess.close()`
 (`taskkill /PID` = WM_CLOSE → wait → `terminate` → `kill`; releases the job handle),
@@ -897,35 +994,48 @@ deletes it, after a read-only check; `record_start` also accepts `emulation: "ke
 access at all, which the easy screen always sends; `/api/state` → `iehost.emulation` reports the
 current preset so the 詳細設定 select starts there).
 
-**GUI / API.** `POST /api/record/start` takes `browser: "iehost"|"none"`, `start_url`,
-`https_passthrough` (default true for iehost → mitmdump `--ignore-hosts .*`: in regular proxy mode mitmproxy checks `ignore_hosts` only for CONNECT tunnels, so every HTTPS port is passed through untouched while plain `http://` is recorded — verified with mitmdump 12.2.3) and `emulation`;
-`browser: "iehost"` requires Windows and `availability()["available"]`, refuses
-`set_system_proxy`, starts the recorder, then `set_emulation` and `launch`; any failure stops the
+**GUI / API.** Since 2026-10-12 (3) every recording uses the recording browser (§13.6 has the
+full `record_start` order).  `POST /api/record/start` takes `start_url` and `emulation` (besides
+`hosts`, `append`, `origin`); there is no `browser` kind, no `set_system_proxy` and no
+`https_passthrough` switch any more.  It requires `iehost.availability()["available"]`
+(`_require_iehost`: 400 with the reason, off Windows
+「記録用ブラウザ (IE エンジン) は Windows でのみ使えます。」), starts the recorder on `127.0.0.1` on a
+free port, always with `HTTPS_PASSTHROUGH_ARGS`
+(mitmdump `--ignore-hosts .*`: in regular proxy mode mitmproxy checks `ignore_hosts` only for CONNECT tunnels, so every HTTPS port is passed through untouched while plain `http://` is recorded — verified with mitmdump 12.2.3),
+then `set_emulation` and `launch` (`_launch_iehost(state, "127.0.0.1:PORT", start_url)` →
+`iehost.launch(workdir, proxy_address, url=start_url, title=BROWSER_TITLE)`); any failure stops the
 recorder.  `GET /api/record/status` reports `browser: {kind, running, pid, exit_code}`;
 `POST /api/record/stop` closes the browser **before** the recorder and reports
-`browser_exit_code`; `POST /api/browser/open {browser: "iehost"}` relaunches it against the running
-recorder.  `AppState.browser` / `close_browser()`; `AppState.close()` closes it on exit.  The page
-gets `data-iehost-available` / `data-iehost-reason`.  `record_start` waits (without the lock, up
+`browser_exit_code`; `POST /api/browser/open {url}` relaunches it against the running recorder
+(§13.11).  `AppState.browser` / `close_browser()`; `AppState.close()` closes it on exit (the GUI's
+shutdown only calls `AppState.close()`).  The page gets `data-iehost-available` /
+`data-iehost-reason`; [記録開始] and [記録をはじめる] are rendered disabled unless mitmproxy and the
+recording browser are available.  `record_start` waits (without the lock, up
 to `PROXY_READY_TIMEOUT` = 20 s) for `RecorderManager.wait_until_listening()` before opening the
-browser, re-checks under the lock that the same recording is still running, and remembers the mode
-in `AppState.record_browser_kind` (exposed as `browser_kind` / `record_browser_kind`; `/api/browser/open`
-refuses to open the recording browser for a non-iehost recording).  For 表示モード 既定 nothing is
+browser and re-checks under the lock that the same recording is still running (the former
+`AppState.record_browser_kind` and the `browser_kind` / `record_browser_kind` fields are gone: every
+recording is an iehost recording).  For 表示モード 既定 nothing is
 opened for writing unless a leftover value exists, and failing to remove it is only a warning.
 `POST /api/record/stop {discard: true}` (easy screen [やめる]) closes and stops everything but loads
 nothing and deletes the half-made file.  `iehost.launch` puts the browser in a Windows job object
 with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`kill_on_close_job`), so it dies with the GUI process.
-The easy screen (§13.11) uses the recording browser whenever it is available (no certificate step,
-no system proxy) and stops automatically when the recording browser is closed; on Windows without
-the recording browser it does **not** fall back to changing the system proxy / installing the CA —
-it explains why and points to 詳細設定, where 記録方式, 最初に開くアドレス, 表示モード and the
-HTTPS pass-through switch are exposed.
+The easy screen (§13.11) records only through the recording browser (no certificate step, no
+system proxy) and stops automatically when the recording browser is closed.  Where the recording
+browser cannot be used, that PC cannot record: the easy screen and 「1 記録」 (`#rec-unavailable`)
+explain why; there is no fallback to the system proxy, a certificate or another browser, and HAR
+import still works.  詳細設定 exposes 最初に開くアドレス and 表示モード.
 
 **Tests.** `tests/test_iehost.py` (pure logic with fakes), `tests/test_gui.py` (former
 `test_webapp_iehost.py` section: API with a fake recorder and a fake `BrowserProcess`),
 `tests/test_real_engine.py` (former `test_iehost_engine.py` section, opt-in real engine:
 `REQREC_IEHOST_TESTS=1`; compiles the host, runs the fixture site (`testsite` section of
 `tests/ie_support.py`) and mitmdump on free ports, runs `--selftest`, checks the recording and that the registry is
-unchanged).
+unchanged).  Since every `/api/record/start` opens the recording browser (2026-10-12 (3)), the GUI
+tests that start a recording fake it (`iehost.availability` / `launch` / `set_emulation` /
+`get_emulation`, and `mitmproxy_available` where mitmproxy may be missing), and with a stub
+mitmdump that never binds a port they also fake `RecorderManager.wait_until_listening`; the GUI
+recording e2e with a real mitmdump uses a faked recording browser and drives the site through the
+proxy with `requests`.
 
 ## 13.13 Factory scenario findings (reqrec.py: analysis, codegen, gui sections)
 

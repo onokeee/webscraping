@@ -740,18 +740,22 @@ class TestLocateHeadersAndUrl:
 
 # --------------------------------------------------------------------------- cookies
 
-def test_locate_in_cookies_latest_first_and_variants():
+def test_find_cookie_latest_first_and_variants():
+    def cookie_name(value, flows):
+        hit = deps.find_cookie(value, flows)
+        return hit[0] if hit else None
+
     f1 = resp_flow(b"", HTML_CT + [("Set-Cookie", "sess=OLD123; Path=/"), ("Set-Cookie", "XSRF-TOKEN=abc%3D%3Dxyz; Path=/")])
     f2 = resp_flow(b"", HTML_CT + [("Set-Cookie", "sess=NEW456; Path=/; HttpOnly"), ("Set-Cookie", "gone=deleted; Max-Age=0")])
-    assert deps.locate_in_cookies("NEW456", [f1, f2]) == "sess"
-    assert deps.locate_in_cookies("OLD123", [f1, f2]) == "sess"
-    assert deps.locate_in_cookies("abc==xyz", [f1, f2]) == "XSRF-TOKEN"  # URL-decoded header vs encoded cookie
-    assert deps.locate_in_cookies("abc%3D%3Dxyz", [f1, f2]) == "XSRF-TOKEN"
+    assert cookie_name("NEW456", [f1, f2]) == "sess"
+    assert cookie_name("OLD123", [f1, f2]) == "sess"
+    assert cookie_name("abc==xyz", [f1, f2]) == "XSRF-TOKEN"  # URL-decoded header vs encoded cookie
+    assert cookie_name("abc%3D%3Dxyz", [f1, f2]) == "XSRF-TOKEN"
     assert deps.find_cookie("abc==xyz", [f1, f2]) == ("XSRF-TOKEN", "abc%3D%3Dxyz")
-    assert deps.locate_in_cookies("deleted", [f1, f2]) is None
-    assert deps.locate_in_cookies("nothing", [f1, f2]) is None
-    assert deps.locate_in_cookies("x", []) is None
-    assert deps.locate_in_cookies("x", [Flow("n", RecordedRequest("GET", "https://s/"), None)]) is None
+    assert cookie_name("deleted", [f1, f2]) is None
+    assert cookie_name("nothing", [f1, f2]) is None
+    assert cookie_name("x", []) is None
+    assert cookie_name("x", [Flow("n", RecordedRequest("GET", "https://s/"), None)]) is None
 
 
 # --------------------------------------------------------------------------- build_pattern
@@ -969,10 +973,6 @@ class Site:
 
     def plan(self, opts=None, **meta):
         return build_plan(self.recording(**meta), opts)
-
-
-def step_by_func(plan, needle):
-    return next(s for s in plan.steps if needle in s.func_name)
 
 
 def hdr(step, name):

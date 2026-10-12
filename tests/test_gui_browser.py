@@ -24,6 +24,9 @@ ROOT = Path(__file__).resolve().parent.parent
 LOGIN_HAR = ROOT / "tests" / "fixtures" / "login_flow_chrome.har"
 CHROMIUM_CANDIDATES = [os.environ.get("REQREC_CHROMIUM"), "/opt/pw-browsers/chromium"]
 TIMEOUT_MS = 45_000
+#: What the patched ``iehost.availability`` reports: the in-app recording browser can be used.
+RECBROWSER_AVAILABLE = {"available": True, "reason": None, "exe": "RecBrowser.exe", "built": True,
+                        "source": "RecBrowser.cs", "csc": "csc.exe", "prebuilt": None}
 
 expect.set_options(timeout=TIMEOUT_MS)
 
@@ -124,7 +127,7 @@ def test_page_loads_in_japanese(advanced):
 
 def test_upload_shows_step_table(advanced, server):
     page = advanced
-    rows = _upload_fixture(page)
+    _upload_fixture(page)
     expect(page.locator("#status-text")).to_contain_text("解析完了")
     expect(page.locator("#sum-steps")).to_have_text("5")
     expect(page.locator("#sum-kept")).to_have_text("8")
@@ -336,13 +339,15 @@ def _fail_start(page, kind, message):
         status=500, content_type="application/json", body=json.dumps({"error": message, "kind": kind})))
 
 
-@pytest.mark.skipif(os.name == "nt" and not __import__("reqrec").iehost.availability("x")["available"],
-                    reason="the easy screen cannot record on this Windows PC")
-def test_easy_start_errors_are_explained_by_kind(page, server):
-    from reqrec import mitmproxy_available
+def test_easy_start_errors_are_explained_by_kind(page, server, monkeypatch):
+    # [記録をはじめる] is enabled only with mitmproxy and a usable recording browser: pretend both (any OS)
+    import reqrec
 
-    if not mitmproxy_available():
-        pytest.skip("mitmproxy not installed: the easy screen cannot start")
+    monkeypatch.setattr(reqrec, "mitmproxy_available", lambda: True)
+    monkeypatch.setattr(reqrec.iehost, "availability", lambda workdir, **kw: dict(RECBROWSER_AVAILABLE))
+    monkeypatch.setattr(reqrec.iehost, "get_emulation", lambda *a, **kw: None)  # the registry is never read
+    page.reload(wait_until="networkidle")
+    expect(page.locator("#easy-start")).to_be_enabled()
     _fail_start(page, "proxy", "記録用プロキシを起動できませんでした: port busy")
     page.click("#easy-start")
     err = page.locator("#easy-error")
@@ -353,8 +358,7 @@ def test_easy_start_errors_are_explained_by_kind(page, server):
     _fail_start(page, "iehost", "記録用ブラウザを起動できませんでした: [WinError 1260]")
     page.click("#easy-start")
     expect(err).to_contain_text("RecBrowser.exe")
-    if os.name == "nt":
-        expect(page.locator("#easy-ready")).to_contain_text("前回、起動できませんでした")
+    expect(page.locator("#easy-ready")).to_contain_text("前回、起動できませんでした")
     # the browser logs the two (intended) 500 responses; nothing else may fail
     assert [e for e in page.js_errors if "status of 500" not in e] == []
 
@@ -366,14 +370,13 @@ class _FakeRecorder:
         self.running = True
         self.out = out
         self.port = 18555
-        self.listen_host = "127.0.0.1"
         self.command_builder = object()
         self.stopped = 0
 
     def status(self):
         return {"running": self.running, "flows": 3, "out": self.out, "out_name": os.path.basename(self.out),
                 "pid": 1, "exit_code": None if self.running else 0, "started_at": 1.0, "stopped_at": None,
-                "port": self.port, "listen_host": self.listen_host, "hosts": [], "stdout_tail": "",
+                "port": self.port, "hosts": [], "stdout_tail": "",
                 "stderr_tail": "", "error": None, "command": []}
 
     def stop(self, timeout=None):
@@ -421,7 +424,6 @@ def test_auto_stop_only_for_easy_started_recordings(page, server, origin, auto_s
         with state.lock:
             state.recorder = fake
             state.browser = browser
-            state.record_browser_kind = "iehost"
             state.record_origin = origin
             state.record_append = False
         page.reload(wait_until="networkidle")  # the page picks the recording up after a reload
@@ -440,6 +442,5 @@ def test_auto_stop_only_for_easy_started_recordings(page, server, origin, auto_s
         with state.lock:
             state.recorder = real_recorder
             state.browser = None
-            state.record_browser_kind = None
             state.record_origin = None
     assert page.js_errors == []

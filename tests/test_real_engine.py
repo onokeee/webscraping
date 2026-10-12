@@ -7,8 +7,8 @@ browser windows briefly) plus the inbox C# compiler and mitmproxy::
     .venv\\Scripts\\python -m pytest tests/test_real_engine.py -q
 
 Always on: the import-safety / source checks at the end of the first two sections and the whole
-``factory_site`` self-check section.  The GUI recording section runs with a real ``mitmdump`` off
-Windows only.
+``factory_site`` self-check section.  The GUI recording section runs the real ``mitmdump`` (when
+mitmproxy is installed) with a faked recording browser: ``requests`` stands in for RecBrowser.exe.
 
 One section per former test module (headed ``# ===== former tests/<name>.py ... =====``); helpers
 shared by several of them are defined once, in the first section.
@@ -267,8 +267,7 @@ class TestRecBrowserEngine:
             from reqrec import HTTPS_PASSTHROUGH_ARGS
 
             recorder_cmd = build_command(
-                str(rec_json), port=proxy_port, listen_host="127.0.0.1", quiet=True,
-                extra_args=list(HTTPS_PASSTHROUGH_ARGS),
+                str(rec_json), port=proxy_port, extra_args=list(HTTPS_PASSTHROUGH_ARGS),
             )
             with open(tmp_path / "mitmdump.out", "w", encoding="utf-8") as out:
                 recorder = subprocess.Popen(
@@ -300,7 +299,7 @@ class TestRecBrowserEngine:
         tab_lines = [line.split(" ", 1)[1] for line in lines if " tab: " in line]
         assert len(tab_lines) == 4, log_text  # index + popup + POST result + settings
         assert all(re.search(r" mode=\d+ opener=(yes|no) name=", line) for line in tab_lines), tab_lines
-        assert any(f"/popup.html?via=open mode=" in line and "opener=yes name=cfgwin" in line for line in tab_lines), tab_lines
+        assert any("/popup.html?via=open mode=" in line and "opener=yes name=cfgwin" in line for line in tab_lines), tab_lines
         assert any(f":{site_port}/post mode=" in line and "opener=yes" in line for line in tab_lines), tab_lines
         assert any("/settings.html?via=blank mode=" in line and "opener=yes" in line for line in tab_lines), tab_lines
         assert "NewWindow3" in log_text or "NewWindow2" in log_text, log_text
@@ -386,6 +385,8 @@ def test_host_source_guard_rails():
         assert dispid in code
     # C# 5 language level (inbox csc): no interpolated strings, no nameof, no null-conditional.
     assert '$"' not in code and "nameof(" not in code and "?." not in code
+    # http:// only: there is no switch that makes the host claim it records https:// pages
+    assert '"--https"' not in code and "HttpsRecorded" not in code
 
 
 # ===== former tests/test_iedriver.py: the test-only browser driver IEDriver.cs (opt-in) =====
@@ -590,8 +591,7 @@ class TestIEDriver:
             base = f"http://{host}:{site_port}"
             with open(tmp_path / "mitmdump.out", "w", encoding="utf-8") as out:
                 recorder = subprocess.Popen(
-                    build_command(str(rec_json), port=proxy_port, listen_host="127.0.0.1", quiet=True,
-                                  extra_args=list(HTTPS_PASSTHROUGH_ARGS)),
+                    build_command(str(rec_json), port=proxy_port, extra_args=list(HTTPS_PASSTHROUGH_ARGS)),
                     stdout=out, stderr=subprocess.STDOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 _wait_port(proxy_port, timeout=60, proc=recorder)
@@ -1469,29 +1469,71 @@ def test_command_line(tmp_path):
 
 
 # ===== former tests/e2e/test_gui_recording.py: the GUI's recording path with the real mitmdump =====
-# End-to-end: the GUI's recording path with the **real** ``mitmdump`` (DESIGN.md §13.6).
+# End-to-end: the GUI's recording path with the **real** ``mitmdump`` (DESIGN.md §13.6, §13.12).
 #
-# This is the path a user takes in 「1 記録」: ``RecorderManager`` spawns ``mitmdump`` with the reqrec
-# addon exactly as ``reqrec gui`` does, the browser (here: ``requests`` with ``proxies=``) talks to the
-# site of ``tests/support.py`` through that proxy, 「記録停止して読み込む」 loads the recording and
-# the steps table lists the proxied requests.  The first test drives the JSON API with Flask's test
-# client and goes on to generate, save and *run* the script from the GUI against a restarted site
-# (fresh tokens); the second does the recording through a real browser with Playwright.
+# [記録開始] starts ``mitmdump`` with the reqrec addon exactly as ``reqrec gui`` does (``RecorderManager``
+# on a free port of 127.0.0.1 with ``HTTPS_PASSTHROUGH_ARGS``) and then opens the recording browser
+# through it.  The recording browser itself is faked (``iehost.availability`` / ``launch`` /
+# ``get_emulation`` / ``set_emulation`` patched, so this runs without RecBrowser.exe; the opt-in sections
+# above drive the real one): ``requests`` with ``proxies=`` stands in for it and browses the site of
+# ``tests/support.py`` through the proxy address the GUI handed to the browser.  「記録停止して読み込む」
+# closes the browser, loads the recording and the steps table lists the proxied requests.  The first
+# test drives the JSON API with Flask's test client and goes on to generate, save and *run* the script
+# from the GUI against a restarted site (fresh tokens); the last one clicks through 詳細設定「1 記録」
+# in a real browser with Playwright.
 #
-# Skipped when mitmproxy is not installed (the browser test also when Playwright / Chromium are missing).
+# Runs on every OS; skipped when mitmproxy is not installed (the browser test also when Playwright /
+# Chromium are missing).
 
-#: The former module-level ``pytestmark`` of this section; each of its tests carries both marks.
+#: The former module-level ``pytestmark`` of this section (applied to each of its tests).
 needs_mitmdump = pytest.mark.skipif(not mitmproxy_available(), reason="mitmproxy (mitmdump) not installed")
-sigint_not_on_windows = pytest.mark.skipif(os.name == "nt", reason="SIGINT handling differs on Windows")
 
 TOKEN = "e2e-gui-token"
 #: GET /login, POST /login (302), GET /dashboard, 3 x GET /api/items, GET /export, GET /static/app.css
 EXPECTED_FLOWS = 8
+#: ``record_start`` waits for the real mitmdump itself; its own limit (20 s) is short for a cold first import.
 PROXY_START_TIMEOUT = 60.0
 CHROMIUM_CANDIDATES = [os.environ.get("REQREC_CHROMIUM"), "/opt/pw-browsers/chromium"]
+#: What the faked ``iehost.availability`` reports: the recording browser can be used.
+STAND_IN_AVAILABLE = {"available": True, "reason": None, "exe": "RecBrowser.exe", "built": True,
+                      "source": "RecBrowser.cs", "csc": "csc.exe", "prebuilt": None}
 
 
 # --------------------------------------------------------------------------- helpers
+
+
+class _StandInBrowser:
+    """What the faked ``iehost.launch`` returns: a recording browser that stays open until the GUI closes it."""
+
+    pid = 4242
+    log_path = None
+
+    def __init__(self) -> None:
+        self.code: Optional[int] = None
+
+    def poll(self) -> Optional[int]:
+        return self.code
+
+    def close(self, timeout: float = 5.0) -> int:
+        if self.code is None:
+            self.code = 0
+        return self.code
+
+
+def _fake_recording_browser(monkeypatch: pytest.MonkeyPatch) -> List[Dict[str, Any]]:
+    """Replace the recording browser by :class:`_StandInBrowser`; returns the ``iehost.launch`` calls."""
+    launched: List[Dict[str, Any]] = []
+
+    def launch(workdir: str, proxy_address: str, url: Optional[str] = None, title: Optional[str] = None, **kwargs: Any):
+        launched.append({"workdir": workdir, "proxy_address": proxy_address, "url": url, "title": title, **kwargs})
+        return _StandInBrowser()
+
+    monkeypatch.setattr(reqrec.iehost, "availability", lambda workdir, **kw: dict(STAND_IN_AVAILABLE))
+    monkeypatch.setattr(reqrec.iehost, "launch", launch)
+    monkeypatch.setattr(reqrec.iehost, "get_emulation", lambda *a, **kw: None)  # the registry is never read
+    monkeypatch.setattr(reqrec.iehost, "set_emulation", lambda *a, **kw: None)  # ... nor written
+    monkeypatch.setattr(reqrec, "PROXY_READY_TIMEOUT", PROXY_START_TIMEOUT)
+    return launched
 
 
 def _wait_until(pred: Callable[[], bool], timeout: float, what: str, interval: float = 0.2) -> None:
@@ -1503,26 +1545,11 @@ def _wait_until(pred: Callable[[], bool], timeout: float, what: str, interval: f
     raise AssertionError(f"timed out waiting for {what}")
 
 
-def _wait_for_proxy(port: int, still_alive: Callable[[], str | None], timeout: float = PROXY_START_TIMEOUT) -> None:
-    """Block until mitmdump accepts connections; ``still_alive()`` returns an error text once it died."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        err = still_alive()
-        if err:
-            raise AssertionError(f"mitmdump died before listening: {err}")
-        try:
-            socket.create_connection(("127.0.0.1", port), timeout=0.3).close()
-            return
-        except OSError:
-            time.sleep(0.2)
-    raise AssertionError("the recording proxy never opened its port")
-
-
 def _drive_site_through_proxy(base_url: str, proxy_port: int) -> dict[str, str]:
-    """The user's browsing session: login -> dashboard -> 3 pages -> CSV export (+ one static file)."""
+    """The user's session in the recording browser: login -> dashboard -> 3 pages -> CSV export (+ one static file)."""
     session = requests.Session()
     session.trust_env = False  # never use the sandbox's HTTP(S)_PROXY for the local site
-    proxies = {"http": f"http://127.0.0.1:{proxy_port}", "https": f"http://127.0.0.1:{proxy_port}"}
+    proxies = {"http": f"http://127.0.0.1:{proxy_port}"}  # http:// only, like the recording browser
     resp = session.get(base_url + "/login", proxies=proxies, timeout=20)
     resp.raise_for_status()
     token = re.search(r'name="_token" value="([^"]+)"', resp.text).group(1)
@@ -1544,59 +1571,61 @@ def _drive_site_through_proxy(base_url: str, proxy_port: int) -> dict[str, str]:
 # --------------------------------------------------------------------------- fixtures
 
 @pytest.fixture
-def gui(tmp_path: Path):
+def gui(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    launched = _fake_recording_browser(monkeypatch)
     workdir = tmp_path / "gui_work"
     app = create_app(str(workdir), host="127.0.0.1", port=_free_port(), token=TOKEN, TESTING=True)
     client = app.test_client()
     headers = {TOKEN_HEADER: TOKEN}
     try:
-        yield SimpleNamespace(app=app, client=client, workdir=workdir, H=headers, state=app.extensions["reqrec"])
+        yield SimpleNamespace(app=app, client=client, workdir=workdir, H=headers, state=app.extensions["reqrec"],
+                              launched=launched)
     finally:
         app.extensions["reqrec"].close()
 
 
 # --------------------------------------------------------------------------- JSON API path
 
-@sigint_not_on_windows
 @needs_mitmdump
 def test_record_with_real_mitmdump_then_plan_generate_and_run(gui):
     client, H, state = gui.client, gui.H, gui.state
     server, base_url = start_server()
-    proxy_port = _free_port()
     try:
-        # -- 記録開始 -------------------------------------------------------------------------
-        r = client.post("/api/record/start", json={"port": proxy_port, "hosts": ["127.0.0.1"], "listen_host": "127.0.0.1"}, headers=H)
+        # -- 記録開始: the proxy on a free port, then the recording browser through it ---------------
+        r = client.post("/api/record/start", json={"hosts": ["127.0.0.1"]}, headers=H)
         assert r.status_code == 200, r.get_json()
         started = r.get_json()
+        proxy_port = started["port"]
         assert started["status"]["running"] is True and started["status"]["error"] is None
         assert started["proxy_address"] == f"127.0.0.1:{proxy_port}"
         assert re.fullmatch(r"rec_\d{8}_\d{6}\.json", started["out"])
-        assert f"http://127.0.0.1:{proxy_port}" in started["instructions"] and "127.0.0.1" in started["instructions"]
         assert started["status"]["hosts"] == ["127.0.0.1"]
+        assert started["browser"]["kind"] == "iehost" and started["browser"]["running"] is True
+        assert [(c["proxy_address"], c["url"]) for c in gui.launched] == [(started["proxy_address"], None)]
+        # the browser is opened only once mitmdump accepts connections
+        socket.create_connection(("127.0.0.1", proxy_port), timeout=5).close()
 
-        def died() -> str | None:
-            st = client.get("/api/record/status").get_json()
-            return None if st["running"] else (st["error"] or st["stderr_tail"] or "exited")
-
-        _wait_for_proxy(proxy_port, died)
-
-        # -- the user browses through the proxy ------------------------------------------------
+        # -- the user browses in the recording browser -----------------------------------------------
         tokens = _drive_site_through_proxy(base_url, proxy_port)
         _wait_until(lambda: client.get("/api/record/status").get_json()["flows"] == EXPECTED_FLOWS, 30,
                     f"{EXPECTED_FLOWS} recorded flows (live count)")
         live = client.get("/api/record/status").get_json()
         assert live["running"] is True and live["flows"] == EXPECTED_FLOWS
+        assert live["browser"]["kind"] == "iehost" and live["browser"]["running"] is True
         assert client.get("/api/state").get_json()["recorder"]["running"] is True
 
-        # -- 記録停止して読み込む -------------------------------------------------------------
+        # -- 記録停止して読み込む (the recording browser is closed first) ------------------------------
         r = client.post("/api/record/stop", json={}, headers=H)
         assert r.status_code == 200, r.get_json()
         stopped = r.get_json()
         assert stopped["loaded"] is True and stopped["flows"] == EXPECTED_FLOWS
         assert stopped["sources"] == [f"recordings/{started['out']}"]
-        assert stopped["excluded_self"] == 0 and stopped["exit_code"] == 0
+        assert stopped["excluded_self"] == 0 and stopped["browser_exit_code"] == 0
+        # mitmdump exits 0 after SIGINT; on Windows the CTRL_BREAK ends it with STATUS_CONTROL_C_EXIT
+        # (0xC000013A), after the addon has flushed every flow: the recording is complete either way
+        assert stopped["exit_code"] == 0 or (os.name == "nt" and stopped["exit_code"] is not None)
         assert (gui.workdir / "recordings" / started["out"]).is_file()
-        assert state.recorder.running is False
+        assert state.recorder.running is False and state.browser is None
         rec = Recording.load(str(gui.workdir / "recordings" / started["out"]))
         assert rec.meta["source"] == "mitmproxy" and rec.meta["hosts"] == ["127.0.0.1"]
         assert [f.request.path for f in rec.flows] == [
@@ -1657,8 +1686,11 @@ def test_record_with_real_mitmdump_then_plan_generate_and_run(gui):
         items = site.requests_for("GET", "/api/items")
         assert all(e["headers"]["authorization"].split(" ", 1)[1] in site.issued_tokens("api_token") for e in items)
         assert [e["query"]["page"] for e in items] == ["1", "2", "3"]
+        # the export was saved by the script into the outputs folder; its stdout names it, then prints it
+        assert (gui.workdir / "outputs" / "items.csv").read_text(encoding="utf-8").startswith("id,name\n1,item-1-1\n")
         out = client.post("/api/run/save_output", json={"name": "recorded_site_out.txt"}, headers=H).get_json()
-        assert (gui.workdir / "outputs" / "recorded_site_out.txt").read_text(encoding="utf-8").startswith("id,name")
+        saved_out = (gui.workdir / "outputs" / "recorded_site_out.txt").read_text(encoding="utf-8")
+        assert "items.csv" in saved_out and "id,name\n1,item-1-1\n" in saved_out
         assert out["size"] > 0
     finally:
         if state.recorder.running:
@@ -1666,24 +1698,19 @@ def test_record_with_real_mitmdump_then_plan_generate_and_run(gui):
         stop_server(server)
 
 
-@sigint_not_on_windows
 @needs_mitmdump
 def test_record_stop_without_traffic_reports_japanese_error(gui):
     """Stopping a recording nobody browsed through must not load an empty recording."""
     client, H, state = gui.client, gui.H, gui.state
-    proxy_port = _free_port()
-    r = client.post("/api/record/start", json={"port": proxy_port, "hosts": ["127.0.0.1"]}, headers=H)
+    r = client.post("/api/record/start", json={"hosts": ["127.0.0.1"]}, headers=H)
     assert r.status_code == 200, r.get_json()
+    assert len(gui.launched) == 1  # mitmdump listened, the recording browser was opened (and never used)
     try:
-        def died() -> str | None:
-            st = client.get("/api/record/status").get_json()
-            return None if st["running"] else (st["error"] or "exited")
-
-        _wait_for_proxy(proxy_port, died)
         r = client.post("/api/record/stop", json={}, headers=H)
         assert r.status_code == 400
         body = r.get_json()
-        assert "フロー" in body["error"] or "記録ファイル" in body["error"]
+        assert "何も記録されませんでした" in body["error"] and body["empty"] is True
+        assert body["browser_exit_code"] == 0 and state.browser is None  # the recording browser was closed
         assert client.get("/api/state").get_json()["recording"]["loaded"] is False
     finally:
         if state.recorder.running:
@@ -1707,12 +1734,12 @@ def _launch_chromium(pw):
     pytest.skip("Chromium unavailable for Playwright: " + " / ".join(errors))
 
 
-@sigint_not_on_windows
 @needs_mitmdump
-def test_record_panel_in_real_browser_loads_recording_into_steps_table(tmp_path: Path):
+def test_record_panel_in_real_browser_loads_recording_into_steps_table(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     pw_api = pytest.importorskip("playwright.sync_api", reason="playwright not installed")
     from werkzeug.serving import make_server
 
+    launched = _fake_recording_browser(monkeypatch)  # before the page is rendered: [記録開始] is enabled
     workdir = tmp_path / "gui_work"
     app = create_app(str(workdir), host="127.0.0.1", port=8765)
     srv = make_server("127.0.0.1", 0, app, threaded=True)
@@ -1720,7 +1747,6 @@ def test_record_panel_in_real_browser_loads_recording_into_steps_table(tmp_path:
     app.extensions["reqrec"].port = gui_port
     threading.Thread(target=srv.serve_forever, name="reqrec-gui-e2e", daemon=True).start()
     server, base_url = start_server()
-    proxy_port = _free_port()
     js_errors: list[str] = []
     try:
         with pw_api.sync_playwright() as pw:
@@ -1735,17 +1761,20 @@ def test_record_panel_in_real_browser_loads_recording_into_steps_table(tmp_path:
                 page.on("console", lambda msg: js_errors.append(msg.text) if msg.type == "error" else None)
                 page.goto(f"http://127.0.0.1:{gui_port}/", wait_until="networkidle")
 
+                page.click("#mode-toggle")  # 詳細設定: the default かんたん画面 hides the five panels
                 page.click('.nav-step[data-panel="record"]')
-                page.fill("#rec-port", str(proxy_port))
                 page.fill("#rec-hosts", "127.0.0.1")
                 page.click("#btn-rec-start")
                 expect(page.locator("#rec-state-text")).to_contain_text("記録中")
-                expect(page.locator("#rec-proxy-address")).to_have_text(f"127.0.0.1:{proxy_port}")
-                expect(page.locator("#status-text")).to_contain_text(f"127.0.0.1:{proxy_port}")
+                address = page.locator("#rec-proxy-address")
+                expect(address).to_have_text(re.compile(r"^127\.0\.0\.1:\d+$"))
+                proxy_port = int(address.inner_text().rsplit(":", 1)[1])
+                assert [c["proxy_address"] for c in launched] == [f"127.0.0.1:{proxy_port}"]
+                expect(page.locator("#status-text")).to_contain_text("記録を開始しました")
+                expect(page.locator("#rec-browser-state")).to_contain_text("起動中")
                 expect(page.locator("#btn-rec-start")).to_be_disabled()
                 expect(page.locator("#btn-rec-stop")).to_be_enabled()
                 state = app.extensions["reqrec"]
-                _wait_for_proxy(proxy_port, lambda: None if state.recorder.running else (state.recorder.status()["error"] or "exited"))
 
                 _drive_site_through_proxy(base_url, proxy_port)
                 expect(page.locator("#rec-flow-count")).to_have_text(str(EXPECTED_FLOWS))  # live count
@@ -1769,7 +1798,7 @@ def test_record_panel_in_real_browser_loads_recording_into_steps_table(tmp_path:
                 page.click('.nav-step[data-panel="record"]')
                 expect(page.locator("#rec-state-text")).to_contain_text("停止中")
                 expect(page.locator("#rec-flow-count")).to_have_text(str(EXPECTED_FLOWS))
-                assert state.recorder.running is False
+                assert state.recorder.running is False and state.browser is None
                 assert len(list((workdir / "recordings").glob("rec_*.json"))) == 1
                 context.close()
             finally:

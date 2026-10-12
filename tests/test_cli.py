@@ -1,6 +1,6 @@
 """Tests for the cli section of ``reqrec.py`` (``reqrec`` / ``python -m reqrec``).
 
-The pipeline (``load_recording`` / ``build_plan`` / ``generate`` / ``run_record``) is monkeypatched
+The pipeline (``load_recording`` / ``load_recordings`` / ``build_plan`` / ``generate``) is monkeypatched
 with fakes so these tests exercise argument parsing, option -> dataclass mapping, output writing and
 exit codes without depending on the other modules.  A few tests at the end run the real pipeline on
 the bundled fixture (see ``tests/test_integration.py`` for the detailed expectations).
@@ -152,15 +152,10 @@ def fakes(monkeypatch):
         calls["gen_opts"] = opts
         return calls["script"]
 
-    def fake_run_record(**kwargs):
-        calls["record_kwargs"] = kwargs
-        return calls.get("record_rc", 0)
-
     monkeypatch.setattr(cli, "load_recording", fake_load_recording)
     monkeypatch.setattr(cli, "load_recordings", fake_load_recordings)
     monkeypatch.setattr(cli, "build_plan", fake_build_plan)
     monkeypatch.setattr(cli, "generate", fake_generate)
-    monkeypatch.setattr(cli, "run_record", fake_run_record)
     return calls
 
 
@@ -178,8 +173,10 @@ def test_help_is_japanese_and_exits_zero(capsys):
     assert "使い方:" in out
     assert "このヘルプを表示して終了する" in out
     assert "show this help message" not in out
-    for command in ("record", "import", "inspect", "generate"):
+    for command in ("import", "inspect", "generate", "gui", "browser"):
         assert command in out
+    assert "{import,inspect,generate,gui,browser}" in out  # recording is done in the GUI only
+    assert "reqrec record" not in out
 
 
 def test_subcommand_help(capsys):
@@ -190,8 +187,9 @@ def test_subcommand_help(capsys):
                  "--html-parser", "--no-comments", "--delay", "--timeout", "--strict-status", "--dump-plan", "--run",
                  # phase 2 (DESIGN §13.1 / §13.3)
                  "--exclude-flow", "--include-flow", "--final-flow", "--exclude-step", "--final-step",
-                 "--legacy-tls", "--no-detect-auth"):
+                 "--no-detect-auth"):
         assert flag in out
+    assert "--legacy-tls" not in out  # http:// only: no TLS options
     assert "INPUT [INPUT ...]" in out  # several recordings can be merged (§13.5)
 
 
@@ -227,13 +225,14 @@ def test_main_reads_sys_argv_when_argv_is_none(monkeypatch, capsys):
         ["generate", "in.har", "-o", "x.py", "--exclude-step", "0"],
         ["generate", "in.har", "-o", "x.py", "--exclude-step", "two"],
         ["generate", "in.har", "-o", "x.py", "--final-step", "-1"],
+        ["generate", "in.har", "-o", "x.py", "--legacy-tls"],  # removed option (http:// only)
         ["inspect"],
         ["inspect", "in.har", "--include-host"],  # option without value
         ["import", "in.har"],  # missing -o
-        ["record"],  # missing -o
-        ["record", "-o", "rec.json", "-p", "70000"],
-        ["record", "-o", "rec.json", "-p", "0"],
-        ["record", "-o", "rec.json", "--port", "eighty"],
+        ["record", "-o", "rec.json"],  # removed command: recording is done in the GUI
+        ["gui", "--port", "70000"],
+        ["gui", "--port", "0"],
+        ["gui", "--port", "eighty"],
     ],
 )
 def test_usage_errors_return_2(argv, capsys, fakes):
@@ -303,7 +302,6 @@ def test_generate_every_flag_maps_to_options(fakes, capsys):
         "--min-value-length", "6", "--max-steps", "10", "--no-redact",
         "--html-parser", "lxml", "--no-comments", "--delay", "1.5", "--timeout", "12", "--strict-status",
         "--exclude-flow", "f0002, 3", "--include-flow", "F0001", "--final-flow", "4", "--no-detect-auth",
-        "--legacy-tls",
     ]
     assert cli.main(argv) == 0
     assert fakes["plan_opts"] == PlanOptions(
@@ -324,7 +322,6 @@ def test_generate_every_flag_maps_to_options(fakes, capsys):
     )
     assert fakes["gen_opts"] == GenOptions(
         html_parser="lxml", comments=False, delay=1.5, timeout=12.0, print_final=True, strict_status=True,
-        legacy_tls=True,
     )
     assert len(fakes["plan_opts_history"]) == 1  # flow ids need no resolving pass
 
@@ -769,28 +766,6 @@ def test_import_to_missing_directory_is_an_error(fakes, tmp_path, capsys):
     assert "エラー:" in capsys.readouterr().err
 
 
-# --------------------------------------------------------------------------- record
-
-def test_record_wiring_defaults(fakes):
-    assert cli.main(["record", "-o", "rec.json"]) == 0
-    assert fakes["record_kwargs"] == {
-        "out": "rec.json", "port": 8080, "hosts": None, "listen_host": "127.0.0.1", "quiet": True, "extra_args": [],
-    }
-
-
-def test_record_wiring_all_flags_and_exit_code_passthrough(fakes):
-    fakes["record_rc"] = 3
-    rc = cli.main([
-        "record", "-o", "out/rec.json", "-p", "9090", "--listen-host", "0.0.0.0",
-        "--hosts", "A.com, b.com", "--hosts", "c.com", "-v", "--mitm-arg=--ssl-insecure", "--mitm-arg=-q",
-    ])
-    assert rc == 3
-    assert fakes["record_kwargs"] == {
-        "out": "out/rec.json", "port": 9090, "hosts": ["a.com", "b.com", "c.com"], "listen_host": "0.0.0.0",
-        "quiet": False, "extra_args": ["--ssl-insecure", "-q"],
-    }
-
-
 # --------------------------------------------------------------------------- runtime errors -> 1
 
 @pytest.mark.parametrize(
@@ -798,7 +773,7 @@ def test_record_wiring_all_flags_and_exit_code_passthrough(fakes):
     [
         (FileNotFoundError(2, "No such file or directory", "missing.har"), "ファイルが見つかりません: missing.har"),
         (ValueError("対応していないファイル形式です (.txt)"), "対応していないファイル形式です"),
-        (ImportError("mitmproxy がインストールされていません"), "mitmproxy がインストールされていません"),
+        (ImportError("bs4 がインストールされていません"), "bs4 がインストールされていません"),
         (PermissionError(13, "Permission denied", "/root/x"), "Permission denied"),
     ],
 )
@@ -902,10 +877,10 @@ def test_real_overrides_on_fixture(tmp_path, capsys):
     assert "結果にするステップ: 2 (POST https://shop.example.test/login)" in out and "★ 結果として表示" in out
 
     target = tmp_path / "scrape.py"
-    assert cli.main(["generate", FIXTURE, "-o", str(target), "--final-step", "2", "--exclude-flow", "f0014", "--legacy-tls"]) == 0
+    assert cli.main(["generate", FIXTURE, "-o", str(target), "--final-step", "2", "--exclude-flow", "f0014"]) == 0
     source = target.read_text(encoding="utf-8")
     compile(source, str(target), "exec")
-    assert "_LegacyTLSAdapter" in source and 'session.mount("https://", _LegacyTLSAdapter())' in source
+    assert "_LegacyTLSAdapter" not in source and "VERIFY_TLS" not in source  # http:// only: no TLS code
     assert "final_resp = resp" in source and "結果を表示（ステップ 2:" in source
     assert "/export" not in source  # the excluded flow is gone
     err = capsys.readouterr().err

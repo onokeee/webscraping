@@ -14,7 +14,6 @@ import io
 import json
 import os
 import re
-import ssl
 import subprocess
 import sys
 import tokenize
@@ -992,13 +991,14 @@ class TestMockAdapter:
         assert s.get(H + "/n").content == b""
 
 
-# ===== former tests/test_codegen_phase2.py: phase-2 code generation (auth, TLS, encodings, forms) =====
+# ===== former tests/test_codegen_phase2.py: phase-2 code generation (auth, encodings, forms) =====
 # Phase-2 tests for ``reqrec.codegen`` (DESIGN.md §13.1-§13.4).
 #
 # * §13.1 the printed result follows ``Plan.final_step_index`` (``final_resp`` / ``final_results``);
 # * §13.2 ``Plan.auth`` -> ``session.auth`` (Basic tuple, ``HTTPDigestAuth``, SSPI -> ``requests_ntlm``
 #   fallback) and no ``Authorization`` header of that scheme survives in the script;
-# * §13.3 ``VERIFY_TLS`` always, ``_LegacyTLSAdapter`` with ``GenOptions.legacy_tls``;
+# * §13.3 (TLS) is gone: reqrec targets http:// sites only, so no ``VERIFY_TLS`` / ``_LegacyTLSAdapter``
+#   is emitted and requests' own defaults apply;
 # * §13.4 responses are decoded from bytes (``_soup`` / ``_text``), Shift_JIS pages served without a
 #   charset come out right, and a legacy-charset form body is rebuilt from ``Step.form``.
 #
@@ -1377,92 +1377,25 @@ class TestAuth:
         assert exec_module(src)["AUTH_USERNAME"] == nasty
 
 
-# =========================================================================== §13.3 TLS
+# =========================================================================== §13.3 TLS (removed)
 
-class TestTLS:
-    def test_verify_tls_is_always_emitted_and_applied(self, monkeypatch):
-        src = generate(three_step_plan(None))
-        assert "VERIFY_TLS = True  # 自己署名証明書のサイトなら False か CA 証明書 (.pem) のパスに" in src
-        assert "session.verify = VERIFY_TLS" in src
-        assert src.index("VERIFY_TLS = True") < src.index("BASE_HEADERS = ")
+class TestNoTLSSettings:
+    """reqrec targets http:// sites only: the scripts carry no TLS knobs (``VERIFY_TLS``,
+    ``_LegacyTLSAdapter``, ``session.mount``), so requests' own defaults apply."""
+
+    REMOVED = ("VERIFY_TLS", "session.verify", "_LegacyTLSAdapter", "session.mount(", "import ssl", "import warnings")
+
+    @pytest.mark.parametrize("opts", [GenOptions(), GenOptions(comments=False, strict_status=True, delay=1)])
+    def test_no_tls_settings_are_emitted(self, opts):
+        for plan in (three_step_plan(None), basic_plan(), TestAuth().ntlm_plan()):
+            src = generate(plan, opts)
+            phase2_check_format(src)
+            assert [name for name in self.REMOVED if name in src] == []
+
+    def test_the_session_keeps_the_requests_defaults(self, monkeypatch):
         sessions = mounted_sessions(monkeypatch)
-        run_generated(src, three_step_adapter())
+        run_generated(generate(three_step_plan(None)), three_step_adapter())
         assert sessions and sessions[-1].verify is True
-        off = generate(three_step_plan(None), GenOptions(comments=False))
-        assert "VERIFY_TLS = True\n" in off and comment_tokens(off) == []
-
-    def test_no_adapter_without_legacy_tls(self):
-        src = generate(three_step_plan(None))
-        assert "_LegacyTLSAdapter" not in src and "import ssl" not in src and "import warnings" not in src
-
-    def test_legacy_adapter_is_emitted_and_builds_a_permissive_context(self):
-        src = generate(three_step_plan(None), GenOptions(legacy_tls=True))
-        phase2_check_format(src)
-        assert "import ssl" in src and "import warnings" in src
-        assert "class _LegacyTLSAdapter(requests.adapters.HTTPAdapter):" in src
-        assert 'session.mount("https://", _LegacyTLSAdapter())' in src
-        assert src.index("session.verify = VERIFY_TLS") < src.index('session.mount("https://"') < src.index("session.headers.update(")
-        assert "ctx.minimum_version = ssl.TLSVersion.TLSv1" in src
-        assert 'ctx.set_ciphers("DEFAULT:@SECLEVEL=1")' in src
-        assert 'ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0)' in src
-        assert "IE モード" in src
-        assert "CERT_NONE" not in src  # verification is left to requests / VERIFY_TLS
-
-        ns = exec_module(src)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")  # the deprecation of TLSv1 must be silenced by the adapter
-            adapter = ns["_LegacyTLSAdapter"]()
-        ctx = adapter.poolmanager.connection_pool_kw["ssl_context"]
-        assert isinstance(ctx, ssl.SSLContext)
-        assert ctx.protocol == ssl.PROTOCOL_TLS_CLIENT
-        assert ctx.minimum_version in (ssl.TLSVersion.TLSv1, ssl.TLSVersion.MINIMUM_SUPPORTED)
-        assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname is True
-        assert ctx.options & getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0) == getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0)
-        assert ctx.cert_store_stats()["x509_ca"] >= 0
-        proxy_ctx = adapter.proxy_manager_for("http://proxy.example.test:3128").connection_pool_kw["ssl_context"]
-        assert isinstance(proxy_ctx, ssl.SSLContext) and proxy_ctx is not ctx
-
-    @pytest.mark.parametrize("verify", [False, True, "/nonexistent/ca.pem"])
-    def test_legacy_adapter_honours_verify(self, verify, tmp_path):
-        """``cert_verify`` keeps ``check_hostname`` in step with ``verify`` so urllib3 can apply
-        ``CERT_NONE`` to our context (it raises otherwise) while ``True`` / a CA path still verify."""
-        ns = exec_module(generate(three_step_plan(None), GenOptions(legacy_tls=True)))
-        adapter = ns["_LegacyTLSAdapter"]()
-        request = requests.Request("GET", "https://legacy.example.test/x").prepare()
-        if isinstance(verify, str):
-            ca = tmp_path / "ca.pem"
-            ca.write_text("not really a cert\n", encoding="utf-8")
-            verify = str(ca)
-        pool = adapter.get_connection_with_tls_context(request, verify=verify)
-        adapter.cert_verify(pool, request.url, verify, None)
-        ctx = pool.conn_kw["ssl_context"]
-        if verify is False:
-            assert ctx.check_hostname is False
-            ctx.verify_mode = ssl.CERT_NONE  # what urllib3 does next; must not raise
-            assert pool.cert_reqs == "CERT_NONE"
-        else:
-            assert ctx.check_hostname is True
-            assert pool.cert_reqs == "CERT_REQUIRED"
-            ctx.verify_mode = ssl.CERT_REQUIRED
-            if isinstance(verify, str):
-                assert pool.ca_certs == verify
-
-    def test_legacy_script_still_runs_against_the_mock(self):
-        """The adapter is mounted on https:// only; an http:// plan exercises the full script."""
-        s1 = phase2_step(1, "GET", "/a", host=HTTP_H, extractors=[Extractor("v", "json", path=["v"], sample="1")])
-        s2 = phase2_step(2, "GET", "/b", host=HTTP_H, params=[("v", Ref.var("v"))])
-        src = generate(Plan(steps=[s1, s2]), GenOptions(legacy_tls=True))
-        phase2_check_format(src)
-        adapter = MockAdapter([Rule(HTTP_H + "/a", body={"v": 7}), Rule(HTTP_H + "/b", body={"ok": True})])
-        out = run_generated(src, adapter)
-        assert adapter.calls[1].query_dict == {"v": "7"} and json.loads(out) == {"ok": True}
-
-    def test_legacy_adapter_with_comments_off(self):
-        src = generate(three_step_plan(None), GenOptions(legacy_tls=True, comments=False))
-        phase2_check_format(src)
-        assert comment_tokens(src) == []
-        ns = exec_module(src)
-        assert isinstance(ns["_LegacyTLSAdapter"]().poolmanager.connection_pool_kw["ssl_context"], ssl.SSLContext)
 
 
 # =========================================================================== §13.4 encoding
@@ -1709,10 +1642,10 @@ PHASE2_PLANS = {
     "basic_synth": lambda: generate(basic_plan(with_constants=False)),
     "ntlm": lambda: generate(TestAuth().ntlm_plan()),
     "negotiate": lambda: generate(TestAuth().ntlm_plan("negotiate", None)),
-    "legacy_tls": lambda: generate(three_step_plan(None), GenOptions(legacy_tls=True)),
-    "legacy_tls_nocomments": lambda: generate(basic_plan(), GenOptions(legacy_tls=True, comments=False, strict_status=True, delay=1)),
+    "last": lambda: generate(three_step_plan(None)),
+    "basic_nocomments_strict": lambda: generate(basic_plan(), GenOptions(comments=False, strict_status=True, delay=1)),
     "legacy_form": lambda: generate(legacy_form_plan()),
-    "empty_legacy": lambda: generate(Plan(auth=AuthInfo(kind="ntlm")), GenOptions(legacy_tls=True)),
+    "empty_ntlm": lambda: generate(Plan(auth=AuthInfo(kind="ntlm"))),
 }
 
 
@@ -2241,7 +2174,7 @@ def kitchen_sink_plan() -> Plan:
 
 @pytest.mark.parametrize("final", [None, 1, 3, 4, 5, 6, 7])
 @pytest.mark.parametrize("opts", [GenOptions(), GenOptions(comments=False), GenOptions(print_final=False),
-                                  GenOptions(comments=False, legacy_tls=True, strict_status=True, delay=0.5)])
+                                  GenOptions(comments=False, strict_status=True, delay=0.5)])
 def test_kitchen_sink_is_well_formed(final, opts):
     plan = kitchen_sink_plan()
     plan.final_step_index = final
@@ -2265,7 +2198,7 @@ PLAN_OPTION_SETS = {
 GEN_OPTION_SETS = {
     "default": GenOptions(),
     "no_comments": GenOptions(comments=False),
-    "legacy": GenOptions(legacy_tls=True, strict_status=True, delay=1.0, html_parser="lxml"),
+    "strict_lxml": GenOptions(strict_status=True, delay=1.0, html_parser="lxml"),
     "no_print": GenOptions(print_final=False, comments=False),
 }
 

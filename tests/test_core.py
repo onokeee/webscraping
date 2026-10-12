@@ -1,4 +1,5 @@
-"""Tests for the importers section of ``reqrec.py``: HAR / mitmproxy / Recording-JSON import and merging recordings.
+"""Tests for the importers section of ``reqrec.py``: HAR / Recording-JSON import (+ ``flow_from_mitm``
+used by the recorder addon) and merging recordings.
 
 One section per former test module (headed ``# ===== former tests/<name>.py ... =====``).
 """
@@ -6,10 +7,8 @@ One section per former test module (headed ``# ===== former tests/<name>.py ... 
 from __future__ import annotations
 
 import base64
-import io
 import json
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,20 +18,20 @@ import reqrec as util
 from reqrec import build_plan
 from reqrec import Flow, PlanOptions, RecordedRequest, RecordedResponse, Recording, Ref, header_get_all
 from reqrec import (
-    MITMPROXY_INSTALL_HINT, decode_header_fields, flow_from_mitm, infer_resource_type, load_har, load_mitm,
+    decode_header_fields, flow_from_mitm, infer_resource_type, load_har,
     load_recording, load_recordings, parse_har_timestamp, recording_from_har,
 )
 
 
-# ===== former tests/test_importers.py: HAR / mitmproxy / Recording importers =====
-# Tests for reqrec.importers (HAR + mitmproxy importers and the load_recording dispatcher).
+# ===== former tests/test_importers.py: HAR / Recording importers =====
+# Tests for reqrec.importers (HAR importer, the load_recording dispatcher and flow_from_mitm, the
+# mitmproxy flow converter used by the recorder addon).
 
 FIXTURES = Path(__file__).parent / "fixtures"
 CHROME_HAR = FIXTURES / "login_flow_chrome.har"
 FIREFOX_HAR = FIXTURES / "api_firefox.har"
 
 try:
-    from mitmproxy import io as mio
     from mitmproxy.test import tflow
 
     HAVE_MITMPROXY = True
@@ -627,52 +626,39 @@ class TestLoadRecording:
         with pytest.raises(ValueError):
             load_recording(str(tmp_path / "noext"))
 
+    @pytest.mark.parametrize("name", ["flows.mitm", "x.flows", "x.flow"])
+    def test_mitmproxy_files_are_not_accepted(self, tmp_path: Path, name: str):
+        """Only .har and .json are read; saved mitmproxy flow files are an unknown format."""
+        p = tmp_path / name
+        p.write_bytes(b"mitmproxy flow file")
+        with pytest.raises(ValueError, match=r"\.har") as info:
+            load_recording(str(p))
+        assert ".har, .json" in str(info.value)
+
     def test_missing_file(self, tmp_path: Path):
         with pytest.raises(FileNotFoundError):
             load_recording(str(tmp_path / "missing.har"))
 
-    @needs_mitmproxy
-    @pytest.mark.parametrize("ext", [".mitm", ".flows", ".flow"])
-    def test_mitm_extensions(self, tmp_path: Path, ext: str):
-        p = tmp_path / f"flows{ext}"
-        with open(p, "wb") as fh:
-            mio.FlowWriter(fh).add(tflow.tflow(resp=True))
-        rec = load_recording(str(p))
-        assert len(rec.flows) == 1 and rec.meta["source"] == "mitmproxy"
 
-
-# =========================================================================== mitmproxy importer
-
-def _write_flows(path: Path, flows) -> None:
-    with open(path, "wb") as fh:
-        writer = mio.FlowWriter(fh)
-        for f in flows:
-            writer.add(f)
-
+# =========================================================================== flow_from_mitm (shared with the recorder addon)
 
 @needs_mitmproxy
-class TestLoadMitm:
-    def test_round_trip(self, tmp_path: Path):
+class TestFlowFromMitm:
+    def test_request_and_response_fields(self, tmp_path: Path):
         f = tflow.tflow(resp=True)
         f.request.host = "shop.example.test"
-        f.request.port = 443
-        f.request.scheme = "https"
+        f.request.port = 80
+        f.request.scheme = "http"
         f.request.path = "/items?page=2"
+        f.request.headers["Host"] = "shop.example.test"
         f.request.headers["Cookie"] = "session=abc"
         f.response.headers["Content-Type"] = "application/json"
         f.response.content = b'{"ok": true}'
-        p = tmp_path / "one.mitm"
-        _write_flows(p, [f])
 
-        rec = load_mitm(str(p))
-        assert rec.meta["source"] == "mitmproxy"
-        assert rec.meta["file"] == str(p)
-        assert rec.meta["flows_total"] == 1 and rec.meta["skipped_flows"] == 0
-        assert "read_error" not in rec.meta
-        flow = rec.flows[0]
+        flow = flow_from_mitm(f, "f0001")
         assert flow.id == "f0001"
         assert flow.request.method == "GET"
-        assert flow.request.url == "https://shop.example.test/items?page=2"
+        assert flow.request.url == "http://shop.example.test/items?page=2"
         assert flow.request.header("cookie") == "session=abc"
         assert flow.request.body == b"content"  # tflow requests carry a body
         assert flow.response.status == 200
@@ -680,55 +666,11 @@ class TestLoadMitm:
         assert flow.response.body == b'{"ok": true}'
         assert flow.started_at == pytest.approx(f.request.timestamp_start)
 
+        rec = Recording(flows=[flow], meta={"source": "mitmproxy"})
         out = tmp_path / "rec.json"
         rec.save(str(out))
         assert Recording.load(str(out)).to_dict() == rec.to_dict()
 
-    def test_non_http_flows_skipped_and_order_by_timestamp(self, tmp_path: Path):
-        late = tflow.tflow(resp=True)
-        late.request.path = "/late"
-        late.request.timestamp_start = 2000.0
-        early = tflow.tflow(resp=True)
-        early.request.path = "/early"
-        early.request.timestamp_start = 1000.0
-        p = tmp_path / "mixed.mitm"
-        _write_flows(p, [late, tflow.ttcpflow(), early, tflow.tudpflow()])
-        rec = load_mitm(str(p))
-        assert [f.request.path for f in rec.flows] == ["/early", "/late"]
-        assert [f.id for f in rec.flows] == ["f0001", "f0002"]
-        assert rec.meta["flows_total"] == 4 and rec.meta["skipped_flows"] == 2
-
-    def test_flow_without_response(self, tmp_path: Path):
-        p = tmp_path / "noresp.mitm"
-        _write_flows(p, [tflow.tflow(resp=False)])
-        rec = load_mitm(str(p))
-        assert rec.flows[0].response is None
-
-    def test_truncated_file_keeps_flows_read_so_far(self, tmp_path: Path):
-        buf = io.BytesIO()
-        w = mio.FlowWriter(buf)
-        w.add(tflow.tflow(resp=True))
-        w.add(tflow.tflow(resp=True))
-        data = buf.getvalue()
-        p = tmp_path / "trunc.mitm"
-        p.write_bytes(data[:-50])  # killed mid-write
-        rec = load_mitm(str(p))
-        assert len(rec.flows) == 1
-        assert rec.meta["read_error"]
-
-    def test_import_error_hint_when_mitmproxy_missing(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setitem(sys.modules, "mitmproxy", None)
-        monkeypatch.setitem(sys.modules, "mitmproxy.io", None)
-        monkeypatch.setitem(sys.modules, "mitmproxy.http", None)
-        with pytest.raises(ImportError) as info:
-            load_mitm(str(tmp_path / "x.mitm"))
-        assert 'pip install "reqrec[record]"' in str(info.value)
-        assert "mitmproxy" in str(info.value)
-        assert MITMPROXY_INSTALL_HINT in str(info.value)
-
-
-@needs_mitmproxy
-class TestFlowFromMitm:
     def test_non_utf8_header_bytes(self):
         f = tflow.tflow(resp=True)
         f.request.headers.fields = ((b"X-Weird", b"\xff\xfe\x80abc"), (b"Host", b"example.test"), (b"X-Utf8", "日本".encode("utf-8")))

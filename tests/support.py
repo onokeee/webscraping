@@ -321,10 +321,6 @@ class MockAdapter(HTTPAdapter):
         pass
 
     # -- helpers for assertions --------------------------------------------------------------
-    def calls_to(self, path_or_url: str) -> list[Call]:
-        """Calls whose URL (or path) equals the argument, ignoring the query string."""
-        return [c for c in self.calls if c.url_without_query == path_or_url or c.path == path_or_url]
-
     def reset(self) -> None:
         self.calls.clear()
         self.unmatched.clear()

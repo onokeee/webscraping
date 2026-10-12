@@ -18,10 +18,9 @@ from pathlib import Path
 
 import pytest
 
-from reqrec import MITMPROXY_INSTALL_HINT
 from reqrec import Recording
 import reqrec as run_mod
-from reqrec import ADDON_PATH, MITMDUMP_PYTHON_STUB, build_command, format_instructions, run_record, stop_child
+from reqrec import ADDON_PATH, HTTPS_PASSTHROUGH_ARGS, MITMDUMP_PYTHON_STUB, RECORD_LISTEN_HOST, build_command
 
 from reqrec import DEFAULT_OUT, ReqRecAddon, addons, parse_hosts, write_recording_atomic
 
@@ -318,15 +317,25 @@ class TestScriptMode:
 class TestBuildCommand:
     def test_prefers_mitmdump_executable(self, monkeypatch, tmp_path: Path):
         monkeypatch.setattr(shutil, "which", lambda name: "/opt/venv/bin/mitmdump" if name == "mitmdump" else None)
-        cmd = build_command(str(tmp_path / "rec.json"), port=8081, hosts=["Shop.example.test", "api.example.test"], listen_host="0.0.0.0", quiet=True)
+        cmd = build_command(str(tmp_path / "rec.json"), port=8081, hosts=["Shop.example.test", "api.example.test"])
         assert cmd[0] == "/opt/venv/bin/mitmdump"
         assert cmd[1:3] == ["-s", ADDON_PATH]
         assert cmd[3:5] == ["--set", f"reqrec_out={tmp_path / 'rec.json'}"]
         assert cmd[5:7] == ["--set", "reqrec_hosts=shop.example.test,api.example.test"]
         assert cmd[7:9] == ["-p", "8081"]
-        assert cmd[9:11] == ["--listen-host", "0.0.0.0"]
+        assert cmd[9:11] == ["--listen-host", "127.0.0.1"]
         assert cmd[11:13] == ["--set", "flow_detail=0"]
         assert len(cmd) == 13
+
+    def test_proxy_only_ever_listens_on_this_pc(self, monkeypatch):
+        """The recording proxy's only client is the recording browser on this PC: no listen-host knob."""
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/mitmdump")
+        assert RECORD_LISTEN_HOST == "127.0.0.1"
+        cmd = build_command("rec.json", port=8090, extra_args=list(HTTPS_PASSTHROUGH_ARGS))
+        assert cmd.count("--listen-host") == 1 and cmd[cmd.index("--listen-host") + 1] == "127.0.0.1"
+        assert cmd[-2:] == ["--ignore-hosts", ".*"]  # the GUI's always-on https:// pass-through
+        with pytest.raises(TypeError):
+            build_command("rec.json", listen_host="0.0.0.0")
 
     def test_falls_back_to_python_entry_point(self, monkeypatch, tmp_path: Path):
         monkeypatch.setattr(shutil, "which", lambda name: None)
@@ -338,11 +347,11 @@ class TestBuildCommand:
         assert cmd[cmd.index("--listen-host") + 1] == "127.0.0.1"
         assert not any(a.startswith("reqrec_hosts=") for a in cmd)  # no hosts -> option omitted (= all)
 
-    def test_hosts_as_string_quiet_false_and_extra_args(self, monkeypatch):
+    def test_hosts_as_string_and_extra_args(self, monkeypatch):
         monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/mitmdump")
-        cmd = build_command("rec.json", port="9000", hosts="a.com, b.com", quiet=False, extra_args=["--ssl-insecure", "--set", "connection_strategy=lazy"])
+        cmd = build_command("rec.json", port="9000", hosts="a.com, b.com", extra_args=["--ssl-insecure", "--set", "connection_strategy=lazy"])
         assert "reqrec_hosts=a.com,b.com" in cmd
-        assert "flow_detail=0" not in cmd
+        assert cmd[cmd.index("flow_detail=0") - 1] == "--set"  # mitmdump's own per-flow dump is always off
         assert cmd[-3:] == ["--ssl-insecure", "--set", "connection_strategy=lazy"]
         assert cmd[cmd.index("-p") + 1] == "9000"
         assert os.path.isabs(cmd[cmd.index("--set") + 1].split("=", 1)[1])  # out made absolute
@@ -354,158 +363,6 @@ class TestBuildCommand:
         proc = subprocess.run(launcher + ["--version"], capture_output=True, text=True, timeout=60)
         assert proc.returncode == 0
         assert "Mitmproxy" in proc.stdout
-
-
-class TestInstructions:
-    def test_japanese_instructions_mention_everything(self):
-        text = format_instructions("/tmp/out/rec.json", 8081, ["shop.example.test"], "127.0.0.1")
-        assert "http://127.0.0.1:8081" in text
-        assert "/tmp/out/rec.json" in text
-        assert "shop.example.test" in text
-        assert "mitmproxy-ca-cert.pem" in text
-        assert "http://mitm.it" in text
-        assert "Ctrl+C" in text
-        assert "プロキシ" in text and "証明書" in text
-
-    def test_wildcard_listen_host(self):
-        text = format_instructions("rec.json", 8080, [], "0.0.0.0")
-        assert "IPアドレス" in text
-        assert "すべてのホスト" in text
-
-
-# =========================================================================== run_record (fake child)
-
-class _FakeProc:
-    """Stand-in for subprocess.Popen whose wait() behaviour is scripted."""
-
-    def __init__(self, script, on_start=None):
-        self._script = list(script)  # each item: int return code, or an exception instance to raise
-        self.signals: list = []
-        self.terminated = False
-        self.killed = False
-        self.returncode = None
-        if on_start:
-            on_start()
-
-    def wait(self, timeout=None):
-        item = self._script.pop(0) if self._script else 0
-        if isinstance(item, BaseException):
-            raise item
-        self.returncode = item
-        return item
-
-    def send_signal(self, sig):
-        self.signals.append(sig)
-
-    def terminate(self):
-        self.terminated = True
-
-    def kill(self):
-        self.killed = True
-
-
-class TestRunRecord:
-    def test_missing_mitmproxy_prints_hint_and_returns_1(self, monkeypatch, capsys, tmp_path: Path):
-        monkeypatch.setattr(run_mod, "mitmproxy_available", lambda: False)
-        rc = run_record(str(tmp_path / "rec.json"))
-        assert rc == 1
-        err = capsys.readouterr().err
-        assert 'pip install "reqrec[record]"' in err
-        assert MITMPROXY_INSTALL_HINT in err
-
-    def test_popen_failure_returns_1(self, monkeypatch, capsys, tmp_path: Path):
-        monkeypatch.setattr(run_mod, "mitmproxy_available", lambda: True)
-
-        def fail(cmd):
-            raise FileNotFoundError("mitmdump")
-
-        monkeypatch.setattr(run_mod.subprocess, "Popen", fail)
-        assert run_record(str(tmp_path / "rec.json")) == 1
-        assert "mitmdump" in capsys.readouterr().err
-
-    def test_ctrl_c_is_translated_to_graceful_stop(self, monkeypatch, capsys, tmp_path: Path):
-        out = tmp_path / "deep" / "dir" / "rec.json"
-        monkeypatch.setattr(run_mod, "mitmproxy_available", lambda: True)
-        captured: dict = {}
-
-        def fake_popen(cmd):
-            captured["cmd"] = cmd
-
-            def child_flushes():  # the addon writes the recording before the child exits
-                Recording(meta={"source": "mitmproxy"}).save(str(out))
-
-            proc = _FakeProc([KeyboardInterrupt(), 0], on_start=child_flushes)
-            captured["proc"] = proc
-            return proc
-
-        monkeypatch.setattr(run_mod.subprocess, "Popen", fake_popen)
-        rc = run_record(str(out), port=8090, hosts=["shop.example.test"], listen_host="127.0.0.1")
-        assert rc == 0
-        assert out.parent.is_dir()  # output directory created up front
-        cmd = captured["cmd"]
-        assert "-s" in cmd and ADDON_PATH in cmd
-        assert f"reqrec_out={out}" in cmd
-        assert "reqrec_hosts=shop.example.test" in cmd
-        assert cmd[cmd.index("-p") + 1] == "8090"
-        printed = capsys.readouterr().out
-        assert "http://127.0.0.1:8090" in printed
-        assert "Ctrl+C" in printed and "mitm.it" in printed and "mitmproxy-ca-cert.pem" in printed
-        assert str(out) in printed
-        assert "0 件" in printed  # summary after stop
-
-    def test_ctrl_c_without_recording_file_returns_1(self, monkeypatch, capsys, tmp_path: Path):
-        monkeypatch.setattr(run_mod, "mitmproxy_available", lambda: True)
-        monkeypatch.setattr(run_mod.subprocess, "Popen", lambda cmd: _FakeProc([KeyboardInterrupt(), 0]))
-        assert run_record(str(tmp_path / "never.json")) == 1
-        assert "記録ファイル" in capsys.readouterr().err
-
-    def test_child_exit_code_is_returned(self, monkeypatch, tmp_path: Path):
-        monkeypatch.setattr(run_mod, "mitmproxy_available", lambda: True)
-        monkeypatch.setattr(run_mod.subprocess, "Popen", lambda cmd: _FakeProc([3]))
-        assert run_record(str(tmp_path / "rec.json")) == 3
-        monkeypatch.setattr(run_mod.subprocess, "Popen", lambda cmd: _FakeProc([0]))
-        assert run_record(str(tmp_path / "rec.json")) == 0
-
-    def test_hosts_none_and_string_accepted(self, monkeypatch, tmp_path: Path):
-        monkeypatch.setattr(run_mod, "mitmproxy_available", lambda: True)
-        seen = []
-        monkeypatch.setattr(run_mod.subprocess, "Popen", lambda cmd: seen.append(cmd) or _FakeProc([0]))
-        run_record(str(tmp_path / "a.json"), hosts=None)
-        run_record(str(tmp_path / "b.json"), hosts="x.test,y.test")
-        assert not any(a.startswith("reqrec_hosts=") for a in seen[0])
-        assert "reqrec_hosts=x.test,y.test" in seen[1]
-
-
-class TestStopChild:
-    def test_child_already_exiting(self):
-        proc = _FakeProc([0])
-        assert stop_child(proc) == 0
-        assert proc.signals == [] and not proc.terminated and not proc.killed
-
-    def test_escalation_sigint_then_terminate_then_kill(self, monkeypatch):
-        monkeypatch.setattr(run_mod, "_GRACE_FIRST_WAIT", 0.01)
-        monkeypatch.setattr(run_mod, "_GRACE_AFTER_TERMINATE", 0.01)
-        expired = subprocess.TimeoutExpired(cmd="mitmdump", timeout=0.01)
-        proc = _FakeProc([expired, expired, expired, -9])
-        assert stop_child(proc, grace=0.01) == -9
-        if os.name != "nt":
-            assert proc.signals == [signal.SIGINT]
-        assert proc.terminated and proc.killed
-
-    def test_sigint_is_enough(self, monkeypatch):
-        monkeypatch.setattr(run_mod, "_GRACE_FIRST_WAIT", 0.01)
-        expired = subprocess.TimeoutExpired(cmd="mitmdump", timeout=0.01)
-        proc = _FakeProc([expired, 0])
-        assert stop_child(proc, grace=0.01) == 0
-        if os.name == "nt":  # Windows has no reliable Ctrl+C for a child: terminate() is the "SIGINT" step
-            assert proc.terminated and not proc.killed
-        else:
-            assert proc.signals == [signal.SIGINT] and not proc.terminated and not proc.killed
-
-    def test_second_ctrl_c_kills(self, monkeypatch):
-        proc = _FakeProc([KeyboardInterrupt(), 137])
-        assert stop_child(proc) == 137
-        assert proc.killed
 
 
 # =========================================================================== real mitmdump end-to-end
@@ -546,14 +403,15 @@ def _wait_for_port(port: int, proc: subprocess.Popen, timeout: float = 30.0) -> 
 @needs_mitmproxy
 @pytest.mark.skipif(os.name == "nt", reason="SIGINT handling differs on Windows")
 def test_real_mitmdump_records_proxied_request(tmp_path: Path):
-    """Spawn the exact command run_record uses, proxy one request through it, Ctrl+C it."""
+    """Spawn the command RecorderManager uses (with the GUI's always-on https:// pass-through),
+    proxy one plain http:// request through it, Ctrl+C it."""
     requests = pytest.importorskip("requests")
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     server_port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     proxy_port = _free_port()
     out = tmp_path / "live.json"
-    cmd = build_command(str(out), port=proxy_port, hosts=["127.0.0.1"], listen_host="127.0.0.1", quiet=True)
+    cmd = build_command(str(out), port=proxy_port, hosts=["127.0.0.1"], extra_args=list(HTTPS_PASSTHROUGH_ARGS))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         _wait_for_port(proxy_port, proc)

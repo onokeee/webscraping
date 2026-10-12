@@ -267,7 +267,6 @@ def testsite_main(argv: Optional[Sequence[str]] = None) -> None:
 DEFAULT_PORT = 8098
 DEFAULT_LOG = "factory_site.log"
 
-CHARSET = "Shift_JIS"
 CODEC = "cp932"
 HTML_CONTENT_TYPE = "text/html; charset=Shift_JIS"
 XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"

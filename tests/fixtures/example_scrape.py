@@ -3,7 +3,7 @@
 これは ``reqrec generate tests/fixtures/login_flow_chrome.har -o scrape.py`` が出力するものと
 同じ構成で手書きした「例」です。実際の出力はヘッダの中身やコメントの文言など細部が異なります。
 読み方は README の「生成コードの読み方」を参照してください。
-（VERIFY_TLS と session.verify、バイト列を渡す _soup はフェーズ 2 の生成コードに合わせたものです。）
+（バイト列を渡す _soup はフェーズ 2 の生成コードに合わせたものです。）
 
 generated-by: reqrec 0.1.0
 source: har tests/fixtures/login_flow_chrome.har (WebInspector/537.36)
@@ -26,7 +26,6 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------- 設定
 TIMEOUT = 30.0  # 各リクエストのタイムアウト（秒）
 DELAY = 0.0  # ステップ間の待ち時間（秒）。サーバーに負荷をかけないよう必要に応じて増やす
-VERIFY_TLS = True  # 自己署名証明書のサイトなら False か CA 証明書 (.pem) のパスに
 
 # ---------------------------------------------------------------- 定数 / 秘密情報
 # 秘密情報: 記録した値はコードに埋め込まず、環境変数から読み込みます（step 2 の form `password`）
@@ -223,8 +222,7 @@ def main():
         print("警告: 環境変数 REQREC_PASSWORD が設定されていません", file=sys.stderr)
 
     session = requests.Session()
-    session.verify = VERIFY_TLS
-    # 統合 Windows 認証のサイトならここに session.auth = ... が、--legacy-tls なら session.mount("https://", ...) が入る
+    # 統合 Windows 認証のサイトならここに session.auth = ... が入る
     session.headers.update(BASE_HEADERS)
     for c in INITIAL_COOKIES:
         session.cookies.set(c["name"], c["value"], domain=c["domain"], path=c["path"])

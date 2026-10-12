@@ -1,5 +1,5 @@
-"""Tests for the gui section of ``reqrec.py`` (+ ``GUI_HTML``): the Flask GUI's endpoints, かんたんモード, the IE-engine
-recording browser endpoints and the Windows proxy / certificate helpers.
+"""Tests for the gui section of ``reqrec.py`` (+ ``GUI_HTML``): the Flask GUI's endpoints, かんたんモード and the
+IE-engine recording browser endpoints.
 
 One section per former test module (headed ``# ===== former tests/<name>.py ... =====``).  The
 ``workdir`` / ``app`` / ``client`` / ``H`` / ``loaded`` fixtures, identical in several of them, are
@@ -14,25 +14,21 @@ import json
 import os
 import re
 import socket
-import subprocess
 import sys
 import textwrap
-import threading
 import time
 from pathlib import Path
 
 import flask
 import pytest
 
-import reqrec as launch, reqrec as routes_mod, reqrec as webapp, reqrec as winsupport
+import reqrec as launch, reqrec as routes_mod, reqrec as webapp
 from reqrec import iehost
 from reqrec import PlanOptions
 from reqrec import (
-    ApiError, AppState, DEFAULT_PROXY_OVERRIDE, INTERNET_SETTINGS_KEY, NOT_WINDOWS_MESSAGE, ScriptRunner,
-    TOKEN_HEADER, cert_installed, create_app, exclude_netlocs, find_free_port, gen_options_from_json,
-    get_system_proxy, host_allowed, install_ca_cert, is_windows, mitmproxy_ca_cert_path, normalise_netloc,
-    origin_allowed, plan_options_from_json, proxy_server_for, refresh_proxy_settings, restore_system_proxy,
-    run_gui, safe_name, sanitise_upload_name, set_system_proxy, status_summary,
+    ApiError, AppState, ScriptRunner, TOKEN_HEADER, create_app, exclude_netlocs, find_free_port,
+    gen_options_from_json, host_allowed, is_windows, normalise_netloc, origin_allowed, plan_options_from_json,
+    run_gui, safe_name, sanitise_upload_name,
 )
 from reqrec import IEHostError
 from reqrec import load_recording
@@ -50,7 +46,6 @@ LOGIN_HAR = FIXTURES / "login_flow_chrome.har"
 API_HAR = FIXTURES / "api_firefox.har"
 
 IS_WINDOWS = sys.platform == "win32"
-not_on_windows = pytest.mark.skipif(IS_WINDOWS, reason="behaviour differs on Windows")
 
 
 # --------------------------------------------------------------------------- stub "mitmdump"
@@ -108,7 +103,7 @@ def stub_script(tmp_path: Path) -> Path:
 
 
 def _stub_builder(stub: Path, n: int = 3, self_url: str = ""):
-    def builder(out, port=8080, hosts=None, listen_host="127.0.0.1", **_kw):
+    def builder(out, port=8080, hosts=None, **_kw):
         return [sys.executable, str(stub), out, str(n), self_url]
 
     return builder
@@ -369,7 +364,8 @@ class TestOptions:
     def test_gen_options_coercion(self):
         g = gen_options_from_json({"html_parser": "lxml", "delay": "0.5", "timeout": 10, "comments": "false", "legacy_tls": True, "strict_status": "on"})
         assert g.html_parser == "lxml" and g.delay == 0.5 and g.timeout == 10.0
-        assert g.comments is False and g.legacy_tls is True and g.strict_status is True
+        assert g.comments is False and g.strict_status is True
+        assert not hasattr(g, "legacy_tls")  # the removed option is an unknown key now: ignored
         with pytest.raises(ApiError):
             gen_options_from_json({"html_parser": "regex"})
         with pytest.raises(ApiError):
@@ -388,7 +384,7 @@ class TestStateEndpoint:
         assert s["run"]["running"] is False
         assert s["plan_options"]["collapse_redirects"] is True
         assert s["gen_options"]["html_parser"] == "html.parser"
-        assert s["windows"]["is_windows"] == IS_WINDOWS
+        assert "windows" not in s and "record_browser_kind" not in s  # no system proxy / recording-mode state any more
         assert isinstance(s["mitmproxy_available"], bool)
 
     def test_workdir_subfolders_created(self, app, workdir):
@@ -439,9 +435,11 @@ class TestRecordings:
         names = sorted(p.name for p in (workdir / "uploads").iterdir())
         assert names == ["login_flow_chrome.har", "login_flow_chrome_2.har"]
 
-    def test_upload_rejects_unknown_extension(self, client, H):
-        r = client.post("/api/recordings/upload", data={"files": (io.BytesIO(b"x"), "notes.txt")}, headers=H, content_type="multipart/form-data")
+    @pytest.mark.parametrize("name", ["notes.txt", "flows.mitm", "x.flows", "x.flow"])  # mitmproxy files are not read any more
+    def test_upload_rejects_unknown_extension(self, client, H, name):
+        r = client.post("/api/recordings/upload", data={"files": (io.BytesIO(b"x"), name)}, headers=H, content_type="multipart/form-data")
         assert r.status_code == 400 and "形式" in r.get_json()["error"]
+        assert r.get_json()["error"].endswith("(対応: .har / .json)")
 
     def test_upload_rejects_garbage_json(self, client, H):
         r = client.post("/api/recordings/upload", data={"files": (io.BytesIO(b"{\"nothing\": 1}"), "x.json")}, headers=H, content_type="multipart/form-data")
@@ -637,7 +635,8 @@ class TestGenerate:
         assert j["env_vars"] == ["REQREC_PASSWORD"]
         assert "ステップ" in j["summary"] and isinstance(j["warnings"], list)
         assert j["steps"] == 5 and j["suggested_name"] == "scrape_shop_example_test"
-        assert j["gen_options"]["legacy_tls"] is True
+        assert "legacy_tls" not in j["gen_options"]  # removed option: ignored, never echoed back
+        assert "VERIFY_TLS" not in j["code"] and "_LegacyTLSAdapter" not in j["code"]
         s = client.get("/api/state").get_json()
         assert s["gen_options"]["delay"] == 0.5 and s["secrets"] == j["secrets"]
 
@@ -792,34 +791,19 @@ class TestRun:
         assert st["stdout_truncated"] is True and len(runner.last_stdout().encode()) <= 2000
 
 
-# =========================================================================== Windows endpoints
+# =========================================================================== removed Windows endpoints
 
-@not_on_windows
-class TestWindowsEndpointsOffWindows:
-    def test_status(self, client):
-        j = client.get("/api/win/status").get_json()
-        assert j["is_windows"] is False and j["proxy"] is None and j["cert"]["installed"] is None
+class TestNoWindowsSettingsEndpoints:
+    """The system proxy / CA certificate endpoints are gone: the GUI never changes Windows settings."""
 
-    @pytest.mark.parametrize("path, body", [
-        ("/api/win/proxy", {"enable": True, "server": "127.0.0.1:8080"}),
-        ("/api/win/proxy/restore", {}),
-        ("/api/win/cert/install", {}),
-    ])
-    def test_posts_are_400(self, client, H, path, body):
-        r = client.post(path, json=body, headers=H)
-        assert r.status_code == 400
-        assert r.get_json()["error"] == "Windows 以外では使えません"
+    def test_status_is_not_routed(self, client):
+        r = client.get("/api/win/status")
+        assert r.status_code == 404 and r.is_json
 
-    def test_record_start_with_system_proxy_is_400(self, client, H, stub_script):
-        state = client.application.extensions["reqrec"]
-        state.recorder.command_builder = _stub_builder(stub_script)
-        r = client.post("/api/record/start", json={"port": 18080, "set_system_proxy": True}, headers=H)
-        assert r.status_code == 400 and r.get_json()["error"] == "Windows 以外では使えません"
-        assert state.recorder.running is False
-
-    def test_state_windows_block(self, client):
-        w = client.get("/api/state").get_json()["windows"]
-        assert w["is_windows"] is False and w["proxy_backup_active"] is False
+    @pytest.mark.parametrize("path", ["/api/win/proxy", "/api/win/proxy/restore", "/api/win/cert/install"])
+    def test_posts_are_not_routed(self, client, H, path):
+        r = client.post(path, json={"enable": True, "server": "127.0.0.1:8080"}, headers=H)
+        assert r.status_code == 404 and "error" in r.get_json()
 
 
 # =========================================================================== RecorderManager
@@ -829,10 +813,11 @@ class TestRecorderManager:
         out = tmp_path / "recs" / "rec.json"
         m = RecorderManager(command_builder=_stub_builder(stub_script, n=4))
         assert m.running is False and m.status()["running"] is False and m.flow_count() == 0
-        st = m.start(str(out), port=18080, hosts="example.test, b.test", listen_host="127.0.0.1")
+        st = m.start(str(out), port=18080, hosts="example.test, b.test")
         try:
             assert st["running"] is True and st["out"] == str(out) and st["pid"]
             assert st["hosts"] == ["example.test", "b.test"] and st["port"] == 18080
+            assert "listen_host" not in st  # always 127.0.0.1 (RECORD_LISTEN_HOST)
             assert m.running is True
             assert _wait_until(lambda: m.flow_count() == 4, 15)
             assert m.status()["flows"] == 4
@@ -846,6 +831,22 @@ class TestRecorderManager:
         assert st["running"] is False and st["exit_code"] == 0 and st["error"] is None and st["flows"] == 4
         assert m.load_recording().flows[0].request.url == "https://example.test/page0"
         assert m.stop() == 0  # idempotent
+
+    def test_command_builder_gets_port_hosts_and_extra_args_only(self, tmp_path, stub_script):
+        seen = []
+
+        def builder(out, **kw):
+            seen.append((out, kw))
+            return _stub_builder(stub_script)(out, **kw)
+
+        m = RecorderManager(command_builder=builder)
+        out = str(tmp_path / "r.json")
+        m.start(out, port=18081, hosts=["a.test"], extra_args=("--ignore-hosts", ".*"))
+        m.stop()
+        m.start(out, port=18082)
+        m.stop()
+        assert seen == [(os.path.abspath(out), {"port": 18081, "hosts": ["a.test"], "extra_args": ["--ignore-hosts", ".*"]}),
+                        (os.path.abspath(out), {"port": 18082, "hosts": []})]  # no listen_host: always 127.0.0.1
 
     def test_start_twice_is_an_error(self, tmp_path, stub_script):
         m = RecorderManager(command_builder=_stub_builder(stub_script))
@@ -931,8 +932,6 @@ class TestRecorderManager:
         assert count_flows_in_file(str(p), default=5) == 5
         p.write_text(json.dumps({"version": 1, "meta": {}, "flows": [{"id": "f0001"}, {"id": "f0002"}]}), encoding="utf-8")
         assert count_flows_in_file(str(p)) == 2
-        p.write_text(json.dumps({"log": {"entries": [1, 2, 3]}}), encoding="utf-8")
-        assert count_flows_in_file(str(p)) == 3
 
     def test_flow_count_keeps_last_good_value_while_file_broken(self, tmp_path):
         out = tmp_path / "r.json"
@@ -951,31 +950,41 @@ class TestRecorderManager:
 
 # =========================================================================== recorder endpoints
 
+def _proxy_ready(state) -> None:
+    """The stub mitmdump never binds its port: report the proxy as listening at once (else 500 kind=proxy)."""
+    state.recorder.wait_until_listening = lambda timeout=None: True
+
+
 class TestRecordEndpoints:
+    """The real ``RecorderManager`` with the stub mitmdump; the recording browser is faked (``win`` / ``launched``)."""
+
     @pytest.fixture
-    def stubbed(self, client, H, stub_script):
+    def stubbed(self, client, H, stub_script, win, launched):
         state = client.application.extensions["reqrec"]
         state.recorder.command_builder = _stub_builder(stub_script, n=3, self_url="http://localhost/api/record/status")
+        _proxy_ready(state)
         yield state
         state.recorder.close()
 
-    def test_full_cycle(self, client, H, stubbed, workdir):
-        r = client.post("/api/record/start", json={"port": 18080, "hosts": "example.test", "listen_host": "127.0.0.1"}, headers=H)
+    def test_full_cycle(self, client, H, stubbed, workdir, launched):
+        r = client.post("/api/record/start", json={"hosts": "example.test"}, headers=H)
         assert r.status_code == 200, r.get_json()
         j = r.get_json()
         assert re.match(r"rec_\d{8}_\d{6}\.json$", j["out"])
-        assert "プロキシ" in j["instructions"] and "127.0.0.1:18080" in j["instructions"] and "example.test" in j["instructions"]
-        assert j["proxy_address"] == "127.0.0.1:18080"
-        assert j["status"]["running"] is True and j["system_proxy"] is None
+        assert j["proxy_address"] == f"127.0.0.1:{j['port']}" and j["status"]["port"] == j["port"]
+        assert j["status"]["running"] is True and j["status"]["hosts"] == ["example.test"]
+        assert j["browser"]["kind"] == "iehost" and launched.calls[0]["proxy_address"] == j["proxy_address"]
         assert "localhost" in j["self_excluded_hosts"]
         # status polling: flows appear (3 + the GUI's own request)
         assert _wait_until(lambda: client.get("/api/record/status").get_json()["flows"] == 4, 15)
         st = client.get("/api/record/status").get_json()
         assert st["running"] is True and st["error"] is None and "stub" in st["stdout_tail"]
+        assert "listen_host" not in st and "proxy_backup_active" not in st and "browser_kind" not in st
+        assert st["browser"]["kind"] == "iehost" and st["browser"]["running"] is True
         assert client.get("/api/state").get_json()["recorder"]["running"] is True
         # a second start is refused
-        r = client.post("/api/record/start", json={"port": 18081}, headers=H)
-        assert r.status_code == 409
+        r = client.post("/api/record/start", json={}, headers=H)
+        assert r.status_code == 409 and len(launched.calls) == 1
         # stop -> loaded, GUI's own traffic excluded
         r = client.post("/api/record/stop", json={}, headers=H)
         assert r.status_code == 200, r.get_json()
@@ -995,13 +1004,13 @@ class TestRecordEndpoints:
         assert r.status_code == 200 and r.get_json()["flows"] == 3
 
     def test_stop_with_append_merges(self, client, H, stubbed, loaded):
-        client.post("/api/record/start", json={"port": 18080}, headers=H)
+        assert client.post("/api/record/start", json={}, headers=H).status_code == 200
         assert _wait_until(lambda: client.get("/api/record/status").get_json()["flows"] == 4, 15)
         r = client.post("/api/record/stop", json={"append": True}, headers=H)
         assert r.status_code == 200 and r.get_json()["flows"] == 14 + 3
 
     def test_append_flag_from_start_is_remembered(self, client, H, stubbed, loaded):
-        client.post("/api/record/start", json={"port": 18080, "append": True}, headers=H)
+        assert client.post("/api/record/start", json={"append": True}, headers=H).status_code == 200
         assert _wait_until(lambda: client.get("/api/record/status").get_json()["flows"] == 4, 15)
         r = client.post("/api/record/stop", json={}, headers=H)
         assert r.get_json()["flows"] == 17
@@ -1011,7 +1020,7 @@ class TestRecordEndpoints:
         assert r.status_code == 409
 
     def test_discard_with_the_real_recorder_forgets_the_file(self, client, H, stubbed, workdir):
-        r = client.post("/api/record/start", json={"port": 18080}, headers=H)
+        r = client.post("/api/record/start", json={}, headers=H)
         assert r.status_code == 200
         out = workdir / "recordings" / r.get_json()["out"]
         assert _wait_until(lambda: out.is_file(), 15)
@@ -1021,27 +1030,26 @@ class TestRecordEndpoints:
         assert st["out"] is None and st["running"] is False  # the panel shows 「停止中」, not 「記録は保存されました」
         assert client.post("/api/record/stop", json={}, headers=H).status_code == 409
 
-    def test_start_validation(self, client, H, stubbed):
-        assert client.post("/api/record/start", json={"port": "abc"}, headers=H).status_code == 400
-        assert client.post("/api/record/start", json={"port": 0}, headers=H).status_code == 400
+    def test_start_validation(self, client, H, stubbed, launched):
         assert client.post("/api/record/start", json={"hosts": 5}, headers=H).status_code == 400
-        r = client.post("/api/record/start", json={"port": 8765}, headers=H)  # the GUI's own port
-        assert r.status_code == 400 and "GUI" in r.get_json()["error"]
-        assert stubbed.recorder.running is False
+        assert client.post("/api/record/start", json={"start_url": "javascript:alert(1)"}, headers=H).status_code == 400
+        assert stubbed.recorder.running is False and launched.calls == []
 
-    def test_stop_with_empty_recording_is_400(self, client, H, stub_script):
+    def test_stop_with_empty_recording_is_400(self, client, H, stub_script, win, launched):
         state = client.application.extensions["reqrec"]
         state.recorder.command_builder = _stub_builder(stub_script, n=0)
-        client.post("/api/record/start", json={"port": 18080}, headers=H)
+        _proxy_ready(state)
+        assert client.post("/api/record/start", json={}, headers=H).status_code == 200
         assert _wait_until(lambda: "wrote 0 flows" in client.get("/api/record/status").get_json()["stdout_tail"], 15)
         r = client.post("/api/record/stop", json={}, headers=H)
         assert r.status_code == 400 and "何も記録されませんでした" in r.get_json()["error"] and r.get_json()["empty"] is True
         assert client.get("/api/state").get_json()["recording"]["loaded"] is False
 
-    def test_stop_when_no_file_written_is_400(self, client, H):
+    def test_stop_when_no_file_written_is_400(self, client, H, win, launched):
         state = client.application.extensions["reqrec"]
         state.recorder.command_builder = lambda out, **kw: [sys.executable, "-c", "import time\ntime.sleep(30)"]
-        client.post("/api/record/start", json={"port": 18080}, headers=H)
+        _proxy_ready(state)
+        assert client.post("/api/record/start", json={}, headers=H).status_code == 200
         r = client.post("/api/record/stop", json={}, headers=H)
         # no file at all = nothing was recorded (the addon writes after the first response only)
         assert r.status_code == 400 and "何も記録されませんでした" in r.get_json()["error"] and r.get_json()["empty"] is True
@@ -1049,7 +1057,7 @@ class TestRecordEndpoints:
 
     def test_missing_mitmproxy_is_reported(self, client, H, monkeypatch):
         monkeypatch.setattr(routes_mod, "mitmproxy_available", lambda: False)
-        r = client.post("/api/record/start", json={"port": 18080}, headers=H)
+        r = client.post("/api/record/start", json={}, headers=H)
         assert r.status_code == 400 and "mitmproxy" in r.get_json()["error"] and "reqrec[record]" in r.get_json()["error"]
 
 
@@ -1136,10 +1144,10 @@ class _FakeClock:
 # ===== former tests/test_webapp_easy.py: かんたんモード (easy mode) =====
 # Tests for the かんたんモード (easy mode) of the GUI.  Contract: DESIGN.md §13.11.
 #
-# * ``find_free_port`` / ``port: "auto"`` on ``/api/record/start``
+# * ``find_free_port`` and the automatic proxy port of ``/api/record/start``
 # * ``/api/easy/build`` (analyse + generate + save in one call)
-# * ``/api/browser/open`` and ``/api/folder/open`` (with the launchers stubbed)
-# * the launch helpers of ``reqrec.gui`` with injected fakes
+# * ``/api/folder/open`` (with the opener stubbed) and the address check of ``/api/browser/open``
+# * ``validate_url`` / ``open_folder`` with injected fakes
 # * 「保存されるファイル」 (shared download rule), plan warnings in Japanese, static checks of the page script (former app.js)
 
 # --------------------------------------------------------------------------- fixtures
@@ -1182,51 +1190,17 @@ class TestFindFreePort:
         port = find_free_port("127.0.0.1", preferred=65535, attempts=1)
         assert 1 <= port <= 65535
 
-    def test_wildcard_host_binds_loopback(self):
-        assert 1 <= find_free_port("0.0.0.0", preferred=8080) <= 65535
-
 
 class TestAutoPort:
-    def test_record_start_with_auto_port(self, app, client, H, monkeypatch):
-        state = app.extensions["reqrec"]
-        seen = {}
-
-        class FakeRecorder:
-            running = False
-            out = None
-            command_builder = object()
-
-            def start(self, out, port=8080, hosts=None, listen_host="127.0.0.1"):
-                seen.update(out=out, port=port, hosts=hosts, listen_host=listen_host)
-                self.running = True
-                self.out = out
-                return self.status()
-
-            def status(self):
-                return {"running": self.running, "flows": 0, "out": self.out, "port": seen.get("port"),
-                        "listen_host": "127.0.0.1", "hosts": [], "stdout_tail": "", "stderr_tail": "", "error": None, "pid": 1}
-
-            def stop(self, timeout=None):
-                self.running = False
-                return 0
-
-            def close(self):
-                pass
-
-        state.recorder = FakeRecorder()
-        monkeypatch.setattr(routes_mod, "mitmproxy_available", lambda: True)
-        r = client.post("/api/record/start", json={"port": "auto", "hosts": [], "listen_host": "127.0.0.1"}, headers=H)
+    @pytest.mark.parametrize("port", [8765, "auto", "abc"])  # a ``port`` in the body is ignored (no port input any more)
+    def test_record_start_picks_a_free_loopback_port(self, client, H, recorder, win, launched, port):
+        r = client.post("/api/record/start", json={"port": port, "hosts": []}, headers=H)
         assert r.status_code == 200, r.get_json()
         data = r.get_json()
-        assert data["auto_port"] is True
-        assert data["port"] == seen["port"]
-        assert 1 <= data["port"] <= 65535 and data["port"] != 8765
-        assert data["proxy_address"].endswith(f":{data['port']}")
-
-    def test_bad_port_still_rejected(self, client, H):
-        r = client.post("/api/record/start", json={"port": "abc"}, headers=H)
-        assert r.status_code == 400
-        assert "ポート" in r.get_json()["error"]
+        assert data["port"] == recorder.start_calls[0]["port"]
+        assert 1 <= data["port"] <= 65535 and data["port"] != 8765  # never the GUI's own port
+        assert data["proxy_address"] == f"127.0.0.1:{data['port']}" == launched.calls[0]["proxy_address"]
+        assert "auto_port" not in data
 
 
 # --------------------------------------------------------------------------- /api/easy/build
@@ -1282,25 +1256,11 @@ class TestEasyBuild:
 # --------------------------------------------------------------------------- /api/browser/open, /api/folder/open
 
 class TestOpenEndpoints:
-    def test_browser_open_calls_launcher(self, client, H, monkeypatch):
-        calls = []
-        monkeypatch.setattr(routes_mod, "open_url", lambda url, prefer_edge=True: calls.append((url, prefer_edge)) or {"url": "http://x", "browser": "edge", "path": "msedge.exe"})
-        r = client.post("/api/browser/open", json={"url": "intra.example.test/"}, headers=H)
-        assert r.status_code == 200, r.get_json()
-        assert r.get_json()["browser"] == "edge"
-        assert calls == [("intra.example.test/", True)]
-
-    def test_browser_open_rejects_bad_url(self, client, H):
-        r = client.post("/api/browser/open", json={"url": "javascript:alert(1)"}, headers=H)
+    @pytest.mark.parametrize("url", ["javascript:alert(1)", "edge://newtab", "file:///C:/x"])
+    def test_browser_open_rejects_bad_url(self, client, H, url):
+        r = client.post("/api/browser/open", json={"url": url}, headers=H)  # checked before anything else
         assert r.status_code == 400
         assert "http" in r.get_json()["error"]
-
-    def test_browser_open_failure_is_500(self, client, H, monkeypatch):
-        def boom(url, prefer_edge=True):
-            raise RuntimeError("ブラウザを開けませんでした")
-        monkeypatch.setattr(routes_mod, "open_url", boom)
-        r = client.post("/api/browser/open", json={}, headers=H)
-        assert r.status_code == 500 and "ブラウザ" in r.get_json()["error"]
 
     def test_folder_open(self, client, H, workdir, monkeypatch):
         opened = []
@@ -1322,58 +1282,16 @@ class TestOpenEndpoints:
 
 class TestLaunchHelpers:
     def test_validate_url(self):
-        assert launch.validate_url("") == launch.DEFAULT_START_URL
         assert launch.validate_url("intra.example.co.jp/top") == "http://intra.example.co.jp/top"
         assert launch.validate_url("https://a.b/c?x=1&y=2") == "https://a.b/c?x=1&y=2"
-        assert launch.validate_url("edge://newtab") == "edge://newtab"
-        for bad in ("javascript:alert(1)", "file:///C:/x", "ftp://host/", "http://", "http://a\nb"):
-            with pytest.raises(ValueError):
+        for empty in ("", "   ", None):
+            with pytest.raises(ValueError, match="サイトのアドレスを入力してください"):
+                launch.validate_url(empty)
+        for bad in ("javascript:alert(1)", "edge://newtab", "file:///C:/x", "ftp://host/", "http://"):
+            with pytest.raises(ValueError, match="http:// で始まる形で入力してください"):
                 launch.validate_url(bad)
-
-    def test_find_edge_known_paths_and_registry(self):
-        assert launch.find_edge(exists=lambda p: p.endswith("Application\\msedge.exe") and "Program Files\\" in p, winreg=None, env={}) is not None
-
-        class FakeKey:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        class FakeReg:
-            HKEY_LOCAL_MACHINE = 1
-            HKEY_CURRENT_USER = 2
-
-            def OpenKey(self, hive, key):
-                if hive == 1:
-                    raise OSError("no")
-                return FakeKey()
-
-            def QueryValueEx(self, key, name):
-                return ('"D:\\Edge\\msedge.exe"', 1)
-
-        assert launch.find_edge(exists=lambda p: p == "D:\\Edge\\msedge.exe", winreg=FakeReg(), env={}) == "D:\\Edge\\msedge.exe"
-        assert launch.find_edge(exists=lambda p: False, winreg=FakeReg(), env={}) is None
-
-    def test_open_url_prefers_edge(self):
-        spawned = []
-        res = launch.open_url("intra.example.test", popen=lambda args, **kw: spawned.append(args), edge_path="E:\\msedge.exe")
-        assert spawned == [["E:\\msedge.exe", "http://intra.example.test"]]
-        assert res == {"url": "http://intra.example.test", "browser": "edge", "path": "E:\\msedge.exe"}
-
-    def test_open_url_falls_back_to_default_browser(self):
-        opened = []
-        res = launch.open_url("", edge_path="", browser_open=lambda u: opened.append(u) or True)
-        assert res["browser"] == "default" and opened == ["about:blank"]
-        with pytest.raises(RuntimeError):
-            launch.open_url("http://a/", edge_path="", browser_open=lambda u: False)
-
-    def test_open_url_edge_spawn_failure_falls_back(self):
-        def bad_spawn(args, **kw):
-            raise OSError("nope")
-        opened = []
-        res = launch.open_url("http://a/", popen=bad_spawn, edge_path="E:\\msedge.exe", browser_open=lambda u: opened.append(u) or True)
-        assert res["browser"] == "default" and opened == ["http://a/"]
+        with pytest.raises(ValueError):
+            launch.validate_url("http://a\nb")
 
     def test_open_folder(self, tmp_path):
         calls = []
@@ -1576,23 +1494,47 @@ class TestEasyScreenScript:
         assert "kind === 'iehost'" in iehost_branch and "RecBrowser.exe" in iehost_branch and "lastIEError = e.message" in iehost_branch
         assert "RecBrowser.exe" not in rest and "lastIEError" not in rest and "kind === 'emulation'" in rest
 
+    def test_every_recording_goes_through_the_recording_browser(self):
+        js = APP_JS
+        # the easy screen can start only with mitmproxy and the recording browser (no manual-proxy fallback)
+        assert "function canStart() { return MITM_AVAILABLE && IEHOST; }" in js
+        assert "const IEHOST = body.dataset.iehostAvailable === 'true'" in js
+        # 詳細設定 [記録開始] keeps the server-rendered disabled state: it needs mitmproxy as well
+        assert "const CAN_RECORD = IEHOST_AVAILABLE && body.dataset.mitmAvailable === 'true';" in js
+        assert "btnStart.disabled = running || !CAN_RECORD;" in js and "btnStart.disabled = !CAN_RECORD;" in js
+        assert "btnStart.disabled = false;" not in js.split("const Record = (() => {")[1].split("const Load = (() => {")[0]
+        # [ブラウザをもう一度開く] always (re)opens the recording browser: only the address is sent
+        assert "api('/api/browser/open', { method: 'POST', json: { url } })" in js
+        assert "if (!st.browser || st.browser.kind !== 'iehost') return;" in js
+        # neither start request sends a port, a listen address, a browser kind or a pass-through switch
+        starts = re.findall(r"api\('/api/record/start', \{ method: 'POST', json: \{(.*?)\} \}\)", js, re.S)
+        assert len(starts) == 2, starts  # 詳細設定 [記録開始] and かんたん画面 [記録をはじめる]
+        for start in starts:
+            keys = re.findall(r"\b(\w+):", re.sub(r"//[^\n]*", "", start))
+            assert {"hosts", "append", "start_url", "emulation", "origin"} == set(keys), keys
+        for removed in ("/api/win/", "listen_host", "set_system_proxy", "https_passthrough", "IS_WINDOWS",
+                        "EASY_BLOCKED", "recMode", "GUIDE_EDGE", "browser_kind", "legacy_tls", "mitm.it"):
+            assert removed not in js, removed
+
 
 # ===== former tests/test_webapp_iehost.py: GUI endpoints of the IE-engine recording browser =====
 # GUI integration of the in-app IE-engine recording browser.  Contract: DESIGN.md §13.12.
 #
-# Everything runs with fakes (no mitmdump, no csc.exe, no RecBrowser.exe, no registry):
+# Every recording goes through the recording browser.  Everything runs with fakes (no mitmdump, no
+# csc.exe, no RecBrowser.exe, no registry), so these tests pass on every OS:
 #
-# * a ``FakeRecorder`` in the style of the easy-mode section's ``TestAutoPort`` that records the
-#   ``extra_args`` it was started with and serves a real recording on ``load_recording``;
-# * ``reqrec.iehost.availability`` / ``launch`` / ``set_emulation`` monkeypatched on the module the
-#   routes call (``routes_mod.iehost``), ``launch`` returning a ``FakeBrowser`` (``pid`` / ``running``
-#   / ``poll()`` / ``close()``);
-# * ``winsupport.is_windows`` monkeypatched so the Windows-only checks pass on every OS.
+# * a ``FakeRecorder`` (enough of ``RecorderManager``) that records the arguments it was started with
+#   (``extra_args`` included) and serves a real recording on ``load_recording``;
+# * ``reqrec.iehost.availability`` / ``launch`` / ``set_emulation`` / ``get_emulation`` monkeypatched on
+#   the class the routes call (``routes_mod.iehost``), ``launch`` returning a ``FakeBrowser`` (``pid`` /
+#   ``running`` / ``poll()`` / ``close()``).  ``availability`` is the only platform check of the routes.
 
 AVAILABLE = {"available": True, "reason": None, "exe": "X:\\work\\bin\\RecBrowser.exe", "built": True,
              "source": "src.cs", "csc": "csc.exe", "prebuilt": None}
 UNAVAILABLE = {"available": False, "reason": "記録用ブラウザを作成するためのコンパイラ (csc.exe) が見つかりません。", "exe": None,
                "built": False, "source": "src.cs", "csc": None, "prebuilt": None}
+#: The real ``iehost.availability`` (the ``win`` fixture replaces it).
+_REAL_AVAILABILITY = iehost.availability
 
 
 # --------------------------------------------------------------------------- fakes
@@ -1606,24 +1548,22 @@ class FakeRecorder:
         self.running = False
         self.out = None
         self.port = None
-        self.listen_host = None
         self.hosts = []
         self.command_builder = object()  # not the default builder -> the mitmproxy check is skipped
         self.start_calls = []
 
-    def start(self, out, port=8080, hosts=None, listen_host="127.0.0.1", **kwargs):
-        self.start_calls.append({"out": out, "port": port, "hosts": hosts, "listen_host": listen_host, **kwargs})
+    def start(self, out, port=8080, hosts=None, **kwargs):
+        self.start_calls.append({"out": out, "port": port, "hosts": hosts, **kwargs})
         self.running = True
         self.out = out
         self.port = port
-        self.listen_host = listen_host
         self.hosts = list(hosts or [])
         self.events.append("recorder.start")
         return self.status()
 
     def status(self):
         return {"running": self.running, "flows": 0, "out": self.out, "out_name": os.path.basename(self.out) if self.out else None,
-                "port": self.port, "listen_host": self.listen_host, "hosts": list(self.hosts), "stdout_tail": "",
+                "port": self.port, "hosts": list(self.hosts), "stdout_tail": "",
                 "stderr_tail": "", "error": None, "pid": 1 if self.running else None, "exit_code": None if self.running else 0,
                 "started_at": None, "stopped_at": None, "command": []}
 
@@ -1722,9 +1662,8 @@ class _Levels(list):
 
 @pytest.fixture
 def win(monkeypatch):
-    """Pretend to be on Windows with a usable recording browser (fakes only)."""
+    """mitmproxy and a usable recording browser on any OS (fakes only; the registry is never touched)."""
     monkeypatch.setattr(routes_mod, "mitmproxy_available", lambda: True)
-    monkeypatch.setattr(winsupport, "is_windows", lambda: True)
     monkeypatch.setattr(routes_mod.iehost, "availability", lambda workdir, **kw: dict(AVAILABLE))
     levels = _Levels()
     levels.current = {"value": None}  # what get_emulation() reports (the real registry is never read)
@@ -1741,9 +1680,16 @@ def launched(monkeypatch, events):
 
 
 def _start(client, H, **extra):
-    body = {"port": "auto", "hosts": [], "listen_host": "127.0.0.1", "browser": "iehost", "append": False}
+    body = {"hosts": [], "append": False}
     body.update(extra)
     return client.post("/api/record/start", json=body, headers=H)
+
+
+def _disabled_button(html: str, button_id: str) -> bool:
+    """Whether the page renders ``<button id="...">`` with the ``disabled`` attribute."""
+    tag = re.search(r'<button[^>]*\bid="%s"[^>]*>' % re.escape(button_id), html)
+    assert tag, button_id
+    return re.search(r"\sdisabled(?=[\s>=])", tag.group(0)) is not None
 
 
 # --------------------------------------------------------------------------- start
@@ -1756,14 +1702,16 @@ class TestStart:
         # recorder: extra args tunnel HTTPS on every port (no certificate needed)
         call = recorder.start_calls[0]
         assert call["extra_args"] == ["--ignore-hosts", ".*"] == list(routes_mod.HTTPS_PASSTHROUGH_ARGS)
-        assert call["port"] == j["port"] and j["auto_port"] is True
+        assert call["port"] == j["port"] and j["port"] != 8765 and set(call) == {"out", "port", "hosts", "extra_args"}
         # browser: launched after the recorder, against the recorder's proxy address, with the typed URL
         assert launched.calls == [{"workdir": str(workdir), "proxy_address": f"127.0.0.1:{j['port']}",
                                    "url": "http://kanri/top.aspx", "title": "reqrec 記録用ブラウザ"}]
         assert launched.calls[0]["proxy_address"] == j["proxy_address"]
         assert win == [EMULATION_LEVELS["ie11"]]
         assert j["browser"] == {"kind": "iehost", "pid": 1000, "running": True, "exit_code": None, "log": launched.browsers[0].log_path}
-        assert j["https_passthrough"] is True and j["emulation"] == "ie11" and j["system_proxy"] is None
+        assert j["emulation"] == "ie11" and j["origin"] == "advanced" and j["warnings"] == []
+        # the fields of the removed manual / system-proxy / https modes are gone from the response
+        assert not {"instructions", "auto_port", "system_proxy", "browser_kind", "https_passthrough"} & set(j)
         state = app.extensions["reqrec"]
         assert state.browser is launched.browsers[0]
         assert ["recorder.start", "browser.launch"] == [e for e in recorder.events if e != "browser.close"]
@@ -1806,11 +1754,6 @@ class TestStart:
         assert r.status_code == 400 and "表示モード" in r.get_json()["error"]
         assert recorder.start_calls == [] and launched.calls == []
 
-    def test_bad_browser_kind_is_400(self, client, H, recorder, win, launched):
-        r = _start(client, H, browser="firefox")
-        assert r.status_code == 400 and "記録方式" in r.get_json()["error"]
-        assert recorder.start_calls == []
-
     def test_bad_start_url_is_400(self, client, H, recorder, win, launched):
         for bad in ("javascript:alert(1)", "edge://newtab", "file:///C:/x"):
             r = _start(client, H, start_url=bad)
@@ -1825,15 +1768,11 @@ class TestStart:
         assert recorder.running is False and recorder.start_calls == [] and launched.calls == []
 
     def test_non_windows_is_400(self, client, H, recorder, win, launched, monkeypatch):
-        monkeypatch.setattr(winsupport, "is_windows", lambda: False)
+        # the real availability check, as it answers off Windows: there is no other way to record
+        monkeypatch.setattr(routes_mod.iehost, "availability", lambda workdir, **kw: _REAL_AVAILABILITY(workdir, platform="linux"))
         r = _start(client, H)
-        assert r.status_code == 400 and r.get_json()["error"] == winsupport.NOT_WINDOWS_MESSAGE
+        assert r.status_code == 400 and r.get_json()["error"] == "記録用ブラウザ (IE エンジン) は Windows でのみ使えます。"
         assert recorder.start_calls == [] and launched.calls == []
-
-    def test_system_proxy_with_iehost_is_400(self, client, H, recorder, win, launched):
-        r = _start(client, H, set_system_proxy=True)
-        assert r.status_code == 400 and "システムプロキシ" in r.get_json()["error"]
-        assert recorder.start_calls == []
 
     def test_launch_failure_stops_recorder_and_reports_compiler_output(self, app, client, H, recorder, win, monkeypatch, events):
         boom = IEHostError("記録用ブラウザの作成 (コンパイル) に失敗しました。\nRecBrowser.cs(12,3): error CS1002: ; が必要です")
@@ -1853,19 +1792,18 @@ class TestStart:
         assert r.status_code == 500 and "表示モード" in r.get_json()["error"]
         assert recorder.running is False and launched.calls == []
 
-    def test_none_browser_keeps_the_classic_flow(self, client, H, recorder, win, launched):
-        r = _start(client, H, browser="none")
+    def test_fields_of_the_removed_modes_are_ignored(self, client, H, recorder, win, launched):
+        # manual proxy (browser "none"), a chosen port / listen address, the system proxy and recorded
+        # https no longer exist: such keys change nothing, HTTPS is always passed through untouched
+        r = _start(client, H, browser="none", port=8765, listen_host="0.0.0.0", set_system_proxy=True, https_passthrough=False)
         assert r.status_code == 200, r.get_json()
-        assert r.get_json()["browser"] is None and r.get_json()["https_passthrough"] is False
-        assert "extra_args" not in recorder.start_calls[0]  # a FakeRecorder without that keyword keeps working
-        assert launched.calls == [] and win == []
-
-    def test_https_passthrough_is_independent_of_the_browser(self, client, H, recorder, win, launched):
-        r = _start(client, H, browser="none", https_passthrough=True)
-        assert r.status_code == 200 and recorder.start_calls[0]["extra_args"] == list(routes_mod.HTTPS_PASSTHROUGH_ARGS)
-        recorder.stop()
-        r = _start(client, H, browser="iehost", https_passthrough=False)
-        assert r.status_code == 200 and "extra_args" not in recorder.start_calls[1]
+        j = r.get_json()
+        call = recorder.start_calls[0]
+        assert call["extra_args"] == list(routes_mod.HTTPS_PASSTHROUGH_ARGS) and call["port"] == j["port"] != 8765
+        assert "listen_host" not in call
+        assert j["proxy_address"] == f"127.0.0.1:{j['port']}" and j["browser"]["kind"] == "iehost"
+        assert len(launched.calls) == 1 and "https_recorded" not in launched.calls[0]
+        assert launched.calls[0]["proxy_address"] == j["proxy_address"] and win == []
 
     def test_browser_not_launched_when_recorder_died_immediately(self, client, H, recorder, win, launched):
         def start(out, **kw):
@@ -1876,6 +1814,22 @@ class TestStart:
         recorder.start = start
         r = _start(client, H)
         assert r.status_code == 200 and r.get_json()["browser"] is None and launched.calls == []
+
+    def test_stop_after_recorder_died_explains_without_proxy_or_certificate(self, client, H, recorder, win, launched):
+        # the no-browser branch of the empty-recording message: the recorder died before the browser opened
+        def start(out, **kw):
+            recorder.start_calls.append(kw)
+            recorder.out = out
+            recorder.running = False
+            return recorder.status()
+        recorder.start = start
+        recorder.with_flows = False
+        assert _start(client, H).status_code == 200
+        r = client.post("/api/record/stop", json={}, headers=H)
+        j = r.get_json()
+        assert r.status_code == 400 and j["empty"] is True and launched.calls == []
+        assert "記録用ブラウザが開く前に記録が止まった" in j["error"] and "http://" in j["error"]
+        assert "プロキシ" not in j["error"] and "証明書" not in j["error"]
 
 
 # --------------------------------------------------------------------------- status / stop
@@ -1940,7 +1894,7 @@ class TestStatusAndStop:
 class TestBrowserOpen:
     def test_running_browser_is_not_relaunched(self, client, H, recorder, win, launched):
         _start(client, H)
-        r = client.post("/api/browser/open", json={"browser": "iehost", "url": "http://kanri/"}, headers=H)
+        r = client.post("/api/browser/open", json={"url": "http://kanri/"}, headers=H)
         assert r.status_code == 200, r.get_json()
         assert r.get_json()["running"] is True and r.get_json()["relaunched"] is False
         assert len(launched.calls) == 1
@@ -1948,40 +1902,55 @@ class TestBrowserOpen:
     def test_closed_browser_is_relaunched_against_the_recorder(self, app, client, H, recorder, win, launched):
         j = _start(client, H).get_json()
         launched.browsers[0].exit(0)
-        r = client.post("/api/browser/open", json={"browser": "iehost", "url": "kanri/"}, headers=H)
+        r = client.post("/api/browser/open", json={"url": "kanri/"}, headers=H)
         assert r.status_code == 200, r.get_json()
         assert r.get_json()["running"] is True and r.get_json()["relaunched"] is True
         assert len(launched.calls) == 2
-        assert launched.calls[1]["proxy_address"] == winsupport.proxy_server_for(recorder.listen_host, recorder.port) == j["proxy_address"]
+        assert launched.calls[1]["proxy_address"] == f"127.0.0.1:{recorder.port}" == j["proxy_address"]
         assert launched.calls[1]["url"] == "http://kanri/" and launched.calls[1]["title"] == "reqrec 記録用ブラウザ"
         assert app.extensions["reqrec"].browser is launched.browsers[1]
         assert r.get_json()["browser"]["pid"] == 1001
 
+    def test_browser_field_is_ignored(self, client, H, recorder, win, launched):
+        # there is no other browser to open: a ``browser`` key (formerly "none" = normal Edge) changes nothing
+        _start(client, H)
+        launched.browsers[0].exit(0)
+        r = client.post("/api/browser/open", json={"browser": "none", "url": "a.b/"}, headers=H)
+        assert r.status_code == 200 and r.get_json()["relaunched"] is True and r.get_json()["browser"]["kind"] == "iehost"
+        assert len(launched.calls) == 2 and launched.calls[1]["url"] == "http://a.b/"
+
+    def test_blank_url_opens_an_empty_page(self, client, H, recorder, win, launched):
+        _start(client, H)
+        launched.browsers[0].exit(0)
+        r = client.post("/api/browser/open", json={}, headers=H)
+        assert r.status_code == 200 and r.get_json()["relaunched"] is True and launched.calls[1]["url"] is None
+
     def test_without_recording_is_409(self, client, H, recorder, win, launched):
-        r = client.post("/api/browser/open", json={"browser": "iehost"}, headers=H)
+        r = client.post("/api/browser/open", json={}, headers=H)
         assert r.status_code == 409 and r.get_json()["error"] == "記録が開始されていません"
         assert launched.calls == []
+
+    def test_unavailable_iehost_is_400_with_reason(self, client, H, recorder, win, launched, monkeypatch):
+        _start(client, H)
+        launched.browsers[0].exit(0)
+        monkeypatch.setattr(routes_mod.iehost, "availability", lambda workdir, **kw: dict(UNAVAILABLE))
+        r = client.post("/api/browser/open", json={}, headers=H)
+        assert r.status_code == 400 and r.get_json()["error"] == UNAVAILABLE["reason"]
+        assert len(launched.calls) == 1
 
     def test_relaunch_failure_is_500(self, client, H, recorder, win, launched, monkeypatch, events):
         _start(client, H)
         launched.browsers[0].exit(0)
         monkeypatch.setattr(routes_mod.iehost, "launch", LaunchSpy(events, fail=IEHostError("記録用ブラウザを起動できません: x")))
-        r = client.post("/api/browser/open", json={"browser": "iehost"}, headers=H)
+        r = client.post("/api/browser/open", json={}, headers=H)
         assert r.status_code == 500 and "記録用ブラウザ" in r.get_json()["error"]
-
-    def test_edge_flow_unchanged(self, client, H, monkeypatch):
-        calls = []
-        monkeypatch.setattr(routes_mod, "open_url", lambda url, prefer_edge=True: calls.append(url) or {"url": "http://x", "browser": "edge", "path": "msedge.exe"})
-        r = client.post("/api/browser/open", json={"url": "intra.example.test/"}, headers=H)
-        assert r.status_code == 200 and r.get_json()["browser"] == "edge" and calls == ["intra.example.test/"]
-        r = client.post("/api/browser/open", json={"browser": "none", "url": "a.b/"}, headers=H)
-        assert r.status_code == 200 and calls == ["intra.example.test/", "a.b/"]
 
 
 # --------------------------------------------------------------------------- page / state
 
 class TestPageAndState:
     def test_state_and_page_expose_availability(self, client, monkeypatch):
+        monkeypatch.setattr(routes_mod, "mitmproxy_available", lambda: True)
         monkeypatch.setattr(routes_mod.iehost, "availability", lambda workdir, **kw: dict(AVAILABLE))
         monkeypatch.setattr(routes_mod.iehost, "get_emulation", lambda *a, **kw: 11000)
         st = client.get("/api/state").get_json()
@@ -1990,22 +1959,44 @@ class TestPageAndState:
         assert st["browser"] == {"kind": None, "running": False, "pid": None, "exit_code": None}
         html = client.get("/").get_data(as_text=True)
         assert 'data-iehost-available="true"' in html and 'data-iehost-reason=""' in html
+        assert 'id="rec-unavailable"' not in html
+        assert not _disabled_button(html, "easy-start") and not _disabled_button(html, "btn-rec-start")
 
     def test_page_carries_reason_when_unavailable(self, client, monkeypatch):
+        monkeypatch.setattr(routes_mod, "mitmproxy_available", lambda: True)
         monkeypatch.setattr(routes_mod.iehost, "availability", lambda workdir, **kw: dict(UNAVAILABLE))
         html = client.get("/").get_data(as_text=True)
         assert 'data-iehost-available="false"' in html
         assert f'data-iehost-reason="{UNAVAILABLE["reason"]}"' in html
+        # no fallback: both start buttons are disabled on the server and 1 記録 says why
+        assert _disabled_button(html, "easy-start") and _disabled_button(html, "btn-rec-start")
+        notice = html[html.index('id="rec-unavailable"'):]
+        assert UNAVAILABLE["reason"] in notice[:notice.index("</div>")]
         st = client.get("/api/state").get_json()["iehost"]
         assert st["available"] is False and st["reason"] == UNAVAILABLE["reason"] and st["exe"] is None
 
+    def test_start_buttons_need_mitmproxy_too(self, client, monkeypatch):
+        monkeypatch.setattr(routes_mod, "mitmproxy_available", lambda: False)
+        monkeypatch.setattr(routes_mod.iehost, "availability", lambda workdir, **kw: dict(AVAILABLE))
+        html = client.get("/").get_data(as_text=True)
+        assert _disabled_button(html, "easy-start") and _disabled_button(html, "btn-rec-start")
+        assert 'data-mitm-available="false"' in html
+
     def test_page_has_the_new_record_controls(self, client):
         html = client.get("/").get_data(as_text=True)
-        for marker in ('id="rec-browser"', 'value="iehost"', 'value="none"', 'id="rec-emulation"', 'value="ie11_force"',
-                       'id="rec-https-passthrough"', 'id="rec-start-url"', 'id="easy-guide"', 'id="easy-hint-1"', 'id="easy-hint-3"',
-                       "記録方式", "表示モード (記録用ブラウザ)", "https:// の通信は記録せず素通しする", "最初に開くアドレス",
-                       "開くサイトのアドレス"):
+        for marker in ('id="rec-emulation"', 'value="ie11_force"', 'id="rec-start-url"', 'id="rec-proxy-address"',
+                       'id="rec-browser-state"',
+                       'id="easy-browser-note"', 'accept=".har,.json"', "IEChooser.exe",
+                       "表示モード (記録用ブラウザ)", "最初に開くアドレス", "開くサイトのアドレス"):
             assert marker in html, marker
+        # the manual-proxy / system-proxy / certificate / https controls are gone
+        for removed in ('id="rec-port"', 'id="rec-listen"', 'id="rec-sysproxy"', 'id="rec-browser"', 'id="rec-browser-hint"',
+                        'id="rec-https-passthrough"', 'id="rec-instructions"', 'id="howto-proxy"', 'id="howto-chrome"',
+                        'id="btn-win-cert"', 'id="btn-win-proxy-restore"', 'id="win-proxy-status"', 'id="win-cert-status"',
+                        'id="easy-cert-note"', 'id="easy-manual-proxy"', 'value="iehost"', "/api/win/", "mitm.it",
+                        "mitmproxy-ca-cert", "data-is-windows", "win-only", "howto-chrome", "記録方式", "自分でブラウザを設定する",
+                        "ブラウザ側の手順", "https:// の通信は記録せず素通しする", "legacy_tls"):
+            assert removed not in html, removed
 
     def test_real_availability_is_used_by_default(self, client, workdir):
         info = client.get("/api/state").get_json()["iehost"]
@@ -2050,22 +2041,14 @@ class TestReviewFixes:
         r = _start(client, H)
         assert r.status_code == 409 and launched.calls == []
 
-    def test_start_url_is_ignored_for_the_manual_flow(self, client, H, recorder, win, launched):
-        r = _start(client, H, browser="none", start_url="edge://newtab")
-        assert r.status_code == 200, r.get_json()
-        assert r.get_json()["browser_kind"] == "none"
-
-    def test_status_reports_the_recording_mode(self, client, H, recorder, win, launched):
+    def test_status_reports_the_recording_browser(self, client, H, recorder, win, launched):
         assert _start(client, H).status_code == 200
-        assert client.get("/api/record/status").get_json()["browser_kind"] == "iehost"
-        assert client.get("/api/state").get_json()["record_browser_kind"] == "iehost"
+        st = client.get("/api/record/status").get_json()
+        assert st["browser"]["kind"] == "iehost" and "browser_kind" not in st
+        state = client.get("/api/state").get_json()
+        assert state["browser"]["kind"] == "iehost" and "record_browser_kind" not in state
         client.post("/api/record/stop", json={}, headers=H)
-        assert client.get("/api/record/status").get_json()["browser_kind"] is None
-
-    def test_browser_open_refuses_a_manual_recording(self, client, H, recorder, win, launched):
-        assert _start(client, H, browser="none").status_code == 200
-        r = client.post("/api/browser/open", json={"browser": "iehost"}, headers=H)
-        assert r.status_code == 409 and launched.calls == []
+        assert client.get("/api/record/status").get_json()["browser"]["kind"] is None
 
     def test_discard_stop_loads_nothing_and_removes_the_file(self, client, H, recorder, win, launched, app):
         state = app.extensions["reqrec"]
@@ -2098,7 +2081,6 @@ class TestLaunchJobAndEmulation:
         (workdir / "bin").mkdir(parents=True)
         exe = workdir / "bin" / iehost.EXE_NAME
         exe.write_bytes(b"MZ")
-        import hashlib
         (workdir / "bin" / iehost.HASH_NAME).write_text(iehost._build_digest(), encoding="utf-8")
         proc = iehost.launch(str(workdir), "127.0.0.1:8080", popen=lambda argv, **kw: P(), run=lambda *a, **k: None,
                              job=lambda p: bound.append(p) or 1234)
@@ -2149,7 +2131,6 @@ class TestWaitUntilListening:
 
         m = RecorderManager(command_builder=lambda *a, **k: ["x"])
         m.port = 18080
-        m.listen_host = "0.0.0.0"
         m.out = "o.json"
 
         class Proc:
@@ -2161,7 +2142,7 @@ class TestWaitUntilListening:
         m._proc = Proc()
         return m
 
-    def test_returns_true_once_connectable_and_maps_wildcard_to_loopback(self):
+    def test_returns_true_once_connectable_on_loopback(self):
         m = self._manager()
         tried = []
 
@@ -2214,7 +2195,7 @@ class TestSecondReviewFixes:
         assert win == [] and calls == []
 
     def test_missing_emulation_means_keep(self, client, H, recorder, win, launched):
-        body = {"port": "auto", "hosts": [], "listen_host": "127.0.0.1", "browser": "iehost", "append": False}
+        body = {"hosts": [], "append": False}
         r = client.post("/api/record/start", json=body, headers=H)
         assert r.status_code == 200 and r.get_json()["emulation"] == "keep" and win == []
 
@@ -2229,13 +2210,6 @@ class TestSecondReviewFixes:
         assert r.status_code == 500 and r.get_json()["kind"] == "iehost"
         assert "1260" in client.get("/api/state").get_json()["iehost"]["last_error"]
 
-    def test_https_mode_reaches_the_browser(self, client, H, recorder, win, launched):
-        assert _start(client, H, https_passthrough=False).status_code == 200
-        assert launched.calls[0].get("https_recorded") is True
-        client.post("/api/record/stop", json={}, headers=H)
-        assert _start(client, H).status_code == 200
-        assert "https_recorded" not in launched.calls[1]
-
 
 # =========================================================================== third review (error kinds, forget, origin)
 
@@ -2244,8 +2218,8 @@ def _assert_start_undone(client, recorder, events):
     assert recorder.running is False and recorder.out is None
     assert events[-2:] == ["recorder.stop", "recorder.forget"]
     st = client.get("/api/record/status").get_json()
-    assert st["out"] is None and st["browser_kind"] is None and st["origin"] is None
-    assert client.get("/api/state").get_json()["record_browser_kind"] is None
+    assert st["out"] is None and st["browser"]["kind"] is None and st["origin"] is None
+    assert client.get("/api/state").get_json()["record_origin"] is None
 
 
 class TestErrorKinds:
@@ -2341,7 +2315,7 @@ class TestRecordOrigin:
         state = app.extensions["reqrec"]
         state.set_recording(load_recording(str(LOGIN_HAR)), ["x.har"], append=False)
         before = state.recording_summary()["flows"]
-        assert _start(client, H, browser="none", append=True, origin="advanced").status_code == 200
+        assert _start(client, H, append=True, origin="advanced").status_code == 200
         r = client.post("/api/record/stop", json={}, headers=H)  # what the easy screen's [記録をおわる] sends now
         assert r.status_code == 200 and r.get_json()["appended"] is True
         assert r.get_json()["flows"] > before
@@ -2464,7 +2438,7 @@ class TestHttpsPassthroughWithRealMitmdump:
         out = tmp_path / "rec.json"
         proxy_port = find_free_port("127.0.0.1", preferred=18300, avoid=(8765,))
         try:
-            manager.start(str(out), port=proxy_port, listen_host="127.0.0.1", extra_args=routes_mod.HTTPS_PASSTHROUGH_ARGS)
+            manager.start(str(out), port=proxy_port, extra_args=routes_mod.HTTPS_PASSTHROUGH_ARGS)
             assert manager.wait_until_listening(timeout=60), manager.status()["stderr_tail"]
             # 1) plain http:// through the proxy (absolute-form request, what WinINet sends)
             import socket
@@ -2510,76 +2484,9 @@ def _wait(predicate, timeout: float = 10.0) -> bool:
     return bool(predicate())
 
 
-# ===== former tests/test_winsupport.py: Windows proxy / certificate helpers (former reqrec/winsupport.py) =====
-# Tests for the Windows-support section of reqrec.gui with fake winreg / certutil (pure logic, runs on every OS).  Contract: DESIGN.md §13.7.
-
-# --------------------------------------------------------------------------- fakes
-
-class FakeKey:
-    def __init__(self, reg, write):
-        self.reg = reg
-        self.write = write
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.reg.closed += 1
-        return False
-
-
-class FakeWinreg:
-    """Just enough of ``winreg`` for the Internet Settings key."""
-
-    HKEY_CURRENT_USER = "HKCU"
-    KEY_READ = 0x20019
-    KEY_SET_VALUE = 0x0002
-    REG_DWORD = 4
-    REG_SZ = 1
-
-    def __init__(self, values=None):
-        self.values = dict(values or {})  # name -> (value, type)
-        self.opened = []
-        self.closed = 0
-        self.writes = []
-        self.deletes = []
-
-    def OpenKey(self, hive, path, reserved, access):
-        assert hive == self.HKEY_CURRENT_USER
-        assert path == INTERNET_SETTINGS_KEY
-        self.opened.append(access)
-        return FakeKey(self, bool(access & self.KEY_SET_VALUE))
-
-    def QueryValueEx(self, key, name):
-        if name not in self.values:
-            raise FileNotFoundError(2, "The system cannot find the file specified")
-        return self.values[name]
-
-    def SetValueEx(self, key, name, reserved, type_, value):
-        assert key.write, "SetValueEx on a read-only key"
-        self.values[name] = (value, type_)
-        self.writes.append((name, value, type_))
-
-    def DeleteValue(self, key, name):
-        assert key.write
-        if name not in self.values:
-            raise FileNotFoundError(2, "no such value")
-        del self.values[name]
-        self.deletes.append(name)
-
-
-def fake_run_factory(stdout="", stderr="", returncode=0, raises=None, log=None):
-    def run(cmd):
-        if log is not None:
-            log.append(cmd)
-        if raises is not None:
-            raise raises
-        return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
-
-    return run
-
-
-# --------------------------------------------------------------------------- platform
+# =========================================================================== platform helpers
+# ``is_windows`` (core).  The Windows system proxy / CA certificate helpers of the former winsupport
+# section are gone: the recording browser sets its own per-process proxy and tunnels https untouched.
 
 def test_is_windows_matches_platform():
     assert is_windows() is IS_WINDOWS
@@ -2587,236 +2494,15 @@ def test_is_windows_matches_platform():
 
 
 def test_module_imports_without_winreg():
-    assert "winreg" not in sys.modules or IS_WINDOWS or True  # import side effects only; the real check is below
     import importlib.util
 
-    # winsupport is a section of reqrec.py now: import a fresh copy of the whole file instead of
-    # reloading the shared module (a reload would replace every class the other tests hold)
+    # import a fresh copy of the whole reqrec.py instead of reloading the shared module (a reload would
+    # replace every class the other tests hold): winreg is only ever imported lazily
     name = "reqrec_fresh_copy"
-    spec = importlib.util.spec_from_file_location(name, winsupport.__file__)
+    spec = importlib.util.spec_from_file_location(name, routes_mod.__file__)
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
     finally:
         sys.modules.pop(name, None)
     assert "winreg" not in vars(module)
-
-
-# --------------------------------------------------------------------------- proxy
-
-class TestGetSystemProxy:
-    def test_missing_values_mean_disabled(self):
-        reg = FakeWinreg()
-        assert get_system_proxy(winreg=reg) == {"enabled": False, "server": "", "override": ""}
-        assert reg.opened == [FakeWinreg.KEY_READ]
-
-    def test_reads_values(self):
-        reg = FakeWinreg({"ProxyEnable": (1, 4), "ProxyServer": ("proxy.corp:3128", 1), "ProxyOverride": ("<local>", 1)})
-        assert get_system_proxy(winreg=reg) == {"enabled": True, "server": "proxy.corp:3128", "override": "<local>"}
-
-    def test_odd_enable_value(self):
-        reg = FakeWinreg({"ProxyEnable": ("garbage", 1)})
-        assert get_system_proxy(winreg=reg)["enabled"] is False
-
-
-class TestSetAndRestore:
-    def test_set_returns_backup_and_writes(self):
-        reg = FakeWinreg({"ProxyEnable": (0, 4), "ProxyServer": ("old:1", 1)})
-        refreshed = []
-        backup = set_system_proxy("127.0.0.1:8080", winreg=reg, refresh=lambda: refreshed.append(1))
-        assert backup == {"ProxyEnable": 0, "ProxyServer": "old:1", "ProxyOverride": None}
-        assert reg.values["ProxyEnable"] == (1, FakeWinreg.REG_DWORD)
-        assert reg.values["ProxyServer"] == ("127.0.0.1:8080", FakeWinreg.REG_SZ)
-        assert reg.values["ProxyOverride"] == (DEFAULT_PROXY_OVERRIDE, FakeWinreg.REG_SZ)
-        assert refreshed == [1]
-        assert get_system_proxy(winreg=reg) == {"enabled": True, "server": "127.0.0.1:8080", "override": DEFAULT_PROXY_OVERRIDE}
-
-    def test_set_disable(self):
-        reg = FakeWinreg({"ProxyEnable": (1, 4), "ProxyServer": ("old:1", 1), "ProxyOverride": ("x", 1)})
-        set_system_proxy("", enable=False, winreg=reg, refresh=lambda: None)
-        assert reg.values["ProxyEnable"][0] == 0
-        assert reg.values["ProxyServer"][0] == "old:1"  # untouched when no server given
-
-    def test_set_requires_server_when_enabling(self):
-        with pytest.raises(ValueError):
-            set_system_proxy("   ", winreg=FakeWinreg(), refresh=lambda: None)
-
-    def test_custom_override(self):
-        reg = FakeWinreg()
-        set_system_proxy("127.0.0.1:8080", override="<local>;*.corp", winreg=reg, refresh=lambda: None)
-        assert reg.values["ProxyOverride"][0] == "<local>;*.corp"
-
-    def test_restore_puts_everything_back(self):
-        original = {"ProxyEnable": (0, 4), "ProxyServer": ("old:1", 1)}
-        reg = FakeWinreg(original)
-        backup = set_system_proxy("127.0.0.1:8080", winreg=reg, refresh=lambda: None)
-        refreshed = []
-        restore_system_proxy(backup, winreg=reg, refresh=lambda: refreshed.append(1))
-        assert reg.values == {"ProxyEnable": (0, 4), "ProxyServer": ("old:1", 1)}  # override deleted again
-        assert reg.deletes == ["ProxyOverride"] and refreshed == [1]
-
-    def test_restore_tolerates_missing_value_to_delete(self):
-        reg = FakeWinreg()
-        restore_system_proxy({"ProxyEnable": None, "ProxyServer": None, "ProxyOverride": None}, winreg=reg, refresh=lambda: None)
-        assert reg.values == {} and reg.deletes == []
-
-    def test_restore_partial_backup(self):
-        reg = FakeWinreg({"ProxyServer": ("x", 1)})
-        restore_system_proxy({"ProxyEnable": 1}, winreg=reg, refresh=lambda: None)
-        assert reg.values == {"ProxyServer": ("x", 1), "ProxyEnable": (1, 4)}
-
-    def test_restore_rejects_garbage(self):
-        with pytest.raises(ValueError):
-            restore_system_proxy("nope", winreg=FakeWinreg(), refresh=lambda: None)
-
-    def test_refresh_not_called_on_wininet_with_fake_winreg(self, monkeypatch):
-        # without an injected refresh and with a fake winreg nothing may touch ctypes
-        monkeypatch.setattr(winsupport, "refresh_proxy_settings", lambda *a, **k: pytest.fail("must not call wininet"))
-        set_system_proxy("127.0.0.1:8080", winreg=FakeWinreg())
-
-
-class TestRefresh:
-    def test_calls_both_options(self):
-        calls = []
-        refresh_proxy_settings(set_option=lambda h, opt, buf, size: calls.append((h, opt, buf, size)))
-        assert calls == [(None, 39, None, 0), (None, 37, None, 0)]
-
-
-def test_proxy_server_for():
-    assert proxy_server_for("127.0.0.1", 8080) == "127.0.0.1:8080"
-    assert proxy_server_for("0.0.0.0", 8080) == "127.0.0.1:8080"
-    assert proxy_server_for("::", 8080) == "127.0.0.1:8080"
-    assert proxy_server_for("", 9000) == "127.0.0.1:9000"
-    assert proxy_server_for("::1", 8080) == "[::1]:8080"
-    assert proxy_server_for("myhost", "8081") == "myhost:8081"
-
-
-# --------------------------------------------------------------------------- certificate
-
-class TestCertPath:
-    def test_none_when_missing(self, tmp_path):
-        assert mitmproxy_ca_cert_path(home=str(tmp_path)) is None
-
-    def test_prefers_cer(self, tmp_path):
-        d = tmp_path / ".mitmproxy"
-        d.mkdir()
-        (d / "mitmproxy-ca-cert.pem").write_text("pem")
-        assert mitmproxy_ca_cert_path(home=str(tmp_path)) == str(d / "mitmproxy-ca-cert.pem")
-        (d / "mitmproxy-ca-cert.cer").write_text("cer")
-        assert mitmproxy_ca_cert_path(home=str(tmp_path)) == str(d / "mitmproxy-ca-cert.cer")
-
-    def test_default_home_does_not_raise(self):
-        result = mitmproxy_ca_cert_path()
-        assert result is None or result.endswith((".cer", ".pem"))
-
-
-class TestCertInstalled:
-    def test_found(self):
-        log = []
-        run = fake_run_factory(stdout="Root\n================ Certificate 3 ================\nSubject: CN=mitmproxy, O=mitmproxy\n", log=log)
-        assert cert_installed(run=run) is True
-        assert log == [["certutil", "-user", "-store", "Root"]]
-
-    def test_not_found(self):
-        assert cert_installed(run=fake_run_factory(stdout="Root\nSubject: CN=DigiCert\n")) is False
-
-    def test_certutil_missing(self):
-        assert cert_installed(run=fake_run_factory(raises=FileNotFoundError("certutil"))) is None
-
-    def test_certutil_failure_without_output(self):
-        assert cert_installed(run=fake_run_factory(stdout="", returncode=1)) is None
-
-    def test_certutil_timeout(self):
-        assert cert_installed(run=fake_run_factory(raises=subprocess.TimeoutExpired("certutil", 60))) is None
-
-
-class TestInstallCert:
-    def test_no_cert_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(winsupport, "mitmproxy_ca_cert_path", lambda home=None: None)
-        ok, msg = install_ca_cert(run=fake_run_factory())
-        assert ok is False and "見つかりません" in msg and "記録開始" in msg
-
-    def test_given_path_missing(self, tmp_path):
-        ok, msg = install_ca_cert(str(tmp_path / "nope.cer"), run=fake_run_factory())
-        assert ok is False and "ありません" in msg
-
-    def test_success(self, tmp_path):
-        cert = tmp_path / "mitmproxy-ca-cert.cer"
-        cert.write_text("cert")
-        log = []
-        ok, out = install_ca_cert(str(cert), run=fake_run_factory(stdout="CertUtil: -addstore command completed successfully.\n", log=log))
-        assert ok is True
-        assert "completed successfully" in out and str(cert) in out
-        assert log == [["certutil", "-user", "-addstore", "Root", str(cert)]]
-
-    def test_failure(self, tmp_path):
-        cert = tmp_path / "c.cer"
-        cert.write_text("cert")
-        ok, out = install_ca_cert(str(cert), run=fake_run_factory(stdout="", stderr="CertUtil: -addstore command FAILED: 0x80070005", returncode=1))
-        assert ok is False and "FAILED" in out
-
-    def test_certutil_missing(self, tmp_path):
-        cert = tmp_path / "c.cer"
-        cert.write_text("cert")
-        ok, out = install_ca_cert(str(cert), run=fake_run_factory(raises=FileNotFoundError()))
-        assert ok is False and "certutil" in out
-
-    def test_default_path_used(self, tmp_path, monkeypatch):
-        cert = tmp_path / "mitmproxy-ca-cert.cer"
-        cert.write_text("cert")
-        monkeypatch.setattr(winsupport, "mitmproxy_ca_cert_path", lambda home=None: str(cert))
-        log = []
-        ok, _ = install_ca_cert(run=fake_run_factory(log=log))
-        assert ok and log[0][-1] == str(cert)
-
-
-# --------------------------------------------------------------------------- summary
-
-def test_status_summary_with_fakes(tmp_path, monkeypatch):
-    monkeypatch.setattr(winsupport, "mitmproxy_ca_cert_path", lambda home=None: None)
-    reg = FakeWinreg({"ProxyEnable": (1, 4), "ProxyServer": ("127.0.0.1:8080", 1)})
-    info = status_summary(winreg=reg, run=fake_run_factory(stdout="CN=mitmproxy"))
-    assert info == {
-        "is_windows": True,
-        "proxy": {"enabled": True, "server": "127.0.0.1:8080", "override": ""},
-        "cert": {"installed": True, "path": None},
-        "error": None,
-    }
-
-
-def test_status_summary_reports_registry_error():
-    class Broken(FakeWinreg):
-        def OpenKey(self, *a):
-            raise PermissionError("denied")
-
-    info = status_summary(winreg=Broken(), run=fake_run_factory(stdout=""))
-    assert info["proxy"] is None and "denied" in info["error"] and info["cert"]["installed"] is False
-
-
-@pytest.mark.skipif(IS_WINDOWS, reason="real Windows has winreg")
-def test_status_summary_off_windows():
-    info = status_summary()
-    assert info["is_windows"] is False and info["proxy"] is None and info["cert"]["installed"] is None
-
-
-# --------------------------------------------------------------------------- non-Windows guard
-
-@pytest.mark.skipif(IS_WINDOWS, reason="only meaningful off Windows")
-class TestNonWindowsGuard:
-    @pytest.mark.parametrize("call", [
-        lambda: get_system_proxy(),
-        lambda: set_system_proxy("127.0.0.1:8080"),
-        lambda: restore_system_proxy({"ProxyEnable": 0}),
-        lambda: refresh_proxy_settings(),
-        lambda: cert_installed(),
-        lambda: install_ca_cert("x.cer"),
-    ])
-    def test_raises_japanese_runtime_error(self, call):
-        with pytest.raises(RuntimeError) as exc:
-            call()
-        assert str(exc.value) == NOT_WINDOWS_MESSAGE == "Windows 以外では使えません"
-
-    def test_safe_functions_do_not_raise(self):
-        assert is_windows() is False
-        mitmproxy_ca_cert_path()
-        status_summary()

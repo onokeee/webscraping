@@ -28,7 +28,6 @@ csc_path = iehost.csc_path
 ensure_built = iehost.ensure_built
 exe_path = iehost.exe_path
 get_emulation = iehost.get_emulation
-is_available = iehost.is_available
 launch = iehost.launch
 resolve_emulation = iehost.resolve_emulation
 set_emulation = iehost.set_emulation
@@ -152,7 +151,6 @@ class FakeWinreg:
     KEY_READ = 0x20019
     KEY_SET_VALUE = 0x0002
     REG_DWORD = 4
-    REG_SZ = 1
 
     def __init__(self, keys=None):
         self.keys = {path: dict(values) for path, values in (keys or {}).items()}
@@ -232,7 +230,6 @@ def test_constants():
     assert reqrec.RECBROWSER_CS.startswith("// RecBrowser.cs") and "\r" not in reqrec.RECBROWSER_CS
     assert HASH_NAME == "RecBrowser.cs.sha256"
     assert EMULATION_LEVELS == {"default": None, "ie8": 8000, "ie11": 11000, "ie11_force": 11001}
-    assert set(iehost.EMULATION_LABELS) == set(EMULATION_LEVELS)
     assert FEATURE_BROWSER_EMULATION_KEY.endswith(r"FeatureControl\FEATURE_BROWSER_EMULATION")
     assert issubclass(IEHostError, RuntimeError)
 
@@ -282,8 +279,7 @@ class TestAvailability:
         assert info["built"] is False
         assert info["reason"] and "Windows" in info["reason"]
         assert any(ord(ch) > 0x7F for ch in info["reason"])  # Japanese text
-        assert is_available(platform="linux", exists=exists_for(CSC64), env=ENV) is False
-        assert is_available(platform="darwin", exists=lambda p: True) is False
+        assert availability(workdir, platform="darwin", exists=lambda p: True)["available"] is False
 
     def test_windows_with_csc_and_source(self, workdir, fake_source):
         info = availability(workdir, platform="win32", exists=exists_for(CSC64), env=ENV, source=fake_source)
@@ -293,7 +289,6 @@ class TestAvailability:
         assert info["built"] is False
         assert info["csc"] == CSC64
         assert info["prebuilt"] is None
-        assert is_available(platform="win32", exists=exists_for(CSC64), env=ENV) is True
 
     def test_built_exe_reported(self, workdir, fake_source):
         exe = exe_path(workdir)
@@ -308,7 +303,6 @@ class TestAvailability:
         assert info["available"] is True
         assert info["csc"] is None
         assert info["prebuilt"] == prebuilt
-        assert is_available(platform="win32", exists=exists_for(prebuilt), env=ENV) is True
 
     def test_no_csc_no_prebuilt(self, workdir, fake_source):
         info = availability(workdir, platform="win32", exists=exists_for(), env=ENV, source=fake_source)
@@ -316,7 +310,6 @@ class TestAvailability:
         assert info["exe"] is None
         assert "csc.exe" in info["reason"]
         assert any(ord(ch) > 0x7F for ch in info["reason"])
-        assert is_available(platform="win32", exists=lambda p: False, env=ENV) is False
 
     def test_csc_but_source_missing(self, workdir, tmp_path):
         # no RecBrowser.cs file exists anywhere: the C# source is part of reqrec.py (RECBROWSER_CS), so
@@ -834,7 +827,7 @@ class TestPlatformAndShippedExe:
         assert reqrec.main(["browser", "status"]) == 0 and "なし" in capsys.readouterr().out
         assert reqrec.main(["browser"]) == 2
 
-    def test_launch_passes_https_flag(self, tmp_path, monkeypatch):
+    def test_launch_runs_the_shipped_exe_in_place(self, tmp_path, monkeypatch):
         folder, exe = self._ship(tmp_path)
         monkeypatch.setattr(iehost, "SHIPPED_DIR", str(folder))
         monkeypatch.setattr(reqrec, "RECBROWSER_CS", "class A {}")
@@ -847,8 +840,11 @@ class TestPlatformAndShippedExe:
                 return None
 
         proc = iehost.launch(str(tmp_path / "work"), "127.0.0.1:8080", popen=lambda a, **k: argv.append(a) or P(),
-                             run=lambda *a, **k: None, job=lambda p: None, https_recorded=True)
-        assert argv[0][0] == str(exe) and argv[0][-1] == "--https" and proc.job_handle is None
+                             run=lambda *a, **k: None, job=lambda p: None)
+        # the whole argv: no URL / title given, and http only (there is no --https mode any more)
+        assert argv == [[str(exe), "--proxy", "127.0.0.1:8080", "--bypass", "", "--log", proc.log_path]]
+        assert proc.exe == str(exe) and proc.job_handle is None
+        assert not (tmp_path / "work" / "bin").exists()  # nothing compiled or copied under the work folder
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows job objects")
