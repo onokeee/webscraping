@@ -15,3 +15,11 @@ def _downloads_go_to_a_temp_dir(tmp_path_factory, monkeypatch):
     current directory.  Tests run them in-process with the repository as cwd, so point the default
     at a throw-away folder; a test that sets ``REQREC_OUTPUT_DIR`` itself still wins."""
     monkeypatch.setenv("REQREC_OUTPUT_DIR", str(tmp_path_factory.mktemp("downloads")))
+
+
+@pytest.fixture(autouse=True)
+def _no_gui_password_or_workdir_from_the_environment(monkeypatch):
+    """``create_app`` reads ``REQREC_GUI_PASSWORD`` / ``REQREC_WORKDIR``; a developer's own values must
+    not change what the tests see (tests that need them set them themselves)."""
+    monkeypatch.delenv("REQREC_GUI_PASSWORD", raising=False)
+    monkeypatch.delenv("REQREC_WORKDIR", raising=False)

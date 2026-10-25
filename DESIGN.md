@@ -676,7 +676,7 @@ verification.
 
 ```python
 # reqrec/webapp/__init__.py
-def create_app(workdir: str, **config) -> flask.Flask
+def create_app(workdir: str | None = None, **config) -> flask.Flask   # no arguments = the factory `flask --app reqrec run` finds
 def run_gui(host="127.0.0.1", port=8765, workdir="reqrec_work", open_browser=True) -> int
 ```
 Layout: `reqrec/webapp/__init__.py` (factory + run), `routes.py` (blueprint), `state.py` (per-process
@@ -688,8 +688,20 @@ offline). UI language: **Japanese**. Served only on the bind address; default `1
 * every state-changing request (`POST`) must carry header `X-Reqrec-Token` equal to a per-process
   random token (`secrets.token_urlsafe(32)`) that the page receives via the template; missing/wrong
   token → 403 JSON `{"error": "..."}`.
-* reject requests whose `Host` header is not `127.0.0.1[:port]` / `localhost[:port]` / the bound
-  host (DNS-rebinding guard) → 403; reject cross-origin `Origin` on POST.
+* without a GUI password: requests from any address other than this PC (loopback) → 403, and requests
+  whose `Host` header is not `127.0.0.1[:port]` / `localhost[:port]` / the bound host (DNS-rebinding
+  guard) → 403. `run_gui` refuses a non-loopback `--host` without a password.
+* with a GUI password (env `REQREC_GUI_PASSWORD`, or `create_app(..., password=...)`; added 2026-10-25 for
+  a personal GUI on a LAN server, e.g. started from a JupyterLab terminal with `flask --app reqrec run`):
+  every page and API needs a login session. `GET/POST /login` (plain form, `Referrer-Policy:
+  same-origin` so the form post carries a real `Origin`; cross-origin or `null` Origin → 403),
+  `GET /logout`. Session = Flask signed cookie `reqrec_session_<hash of workdir>`, HttpOnly,
+  SameSite=Strict, 12 h, secret key per process. 5 wrong passwords in a row lock that address for 60 s
+  (429); each wrong password waits `LOGIN_FAIL_DELAY` (1 s). Not logged in: `/api/*` and POST → 401
+  `{"error", "login": true}` (the page JS then goes to `/login`), pages → redirect to `/login`. The Host
+  check is skipped (the session cookie is the guard). The password is removed from the environment of
+  scripts run by `ScriptRunner`.
+* reject cross-origin `Origin` on POST.
 * file names from the client are reduced to a basename and must match `^[\w.\-]+$`; everything is
   read/written **inside `workdir`** (resolve + check prefix). Uploaded files are stored under
   `workdir/uploads/`. Generated scripts under `workdir/scripts/`. Recordings under `workdir/recordings/`.

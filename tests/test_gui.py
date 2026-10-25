@@ -2506,3 +2506,213 @@ def test_module_imports_without_winreg():
     finally:
         sys.modules.pop(name, None)
     assert "winreg" not in vars(module)
+
+
+# ===== GUI password (REQREC_GUI_PASSWORD) and ``flask --app reqrec run`` =====
+# A personal GUI on a LAN server (e.g. started from a JupyterLab terminal): with a password every page
+# and API needs a login; without one only this PC may use the GUI.
+
+PASSWORD = "pw-for-tests"
+
+
+@pytest.fixture
+def pw_app(workdir: Path):
+    application = create_app(str(workdir), token="test-token-123", password=PASSWORD, TESTING=True, LOGIN_FAIL_DELAY=0)
+    yield application
+    application.extensions["reqrec"].close()
+
+
+def _login(client, password=PASSWORD, origin="http://localhost", **kw):
+    return client.post("/login", data={"password": password}, headers={"Origin": origin}, **kw)
+
+
+class TestPassword:
+    def test_without_login_the_page_redirects_and_the_api_is_401(self, pw_app):
+        c = pw_app.test_client()
+        r = c.get("/")
+        assert r.status_code == 302 and r.headers["Location"].endswith("/login")
+        r = c.get("/api/state")
+        assert r.status_code == 401 and r.get_json()["login"] is True
+        assert c.post("/api/recordings/clear", json={}, headers={TOKEN_HEADER: "test-token-123"}).status_code == 401
+        assert c.get("/api/scripts/x.py/download").status_code == 401
+
+    def test_login_page(self, pw_app):
+        r = pw_app.test_client().get("/login")
+        html = r.get_data(as_text=True)
+        assert r.status_code == 200 and 'type="password"' in html and 'action="/login"' in html
+        assert "<script" not in html  # plain form: works in any browser engine
+        # the GUI's no-referrer would make browsers send ``Origin: null`` with the form post (refused)
+        assert r.headers["Referrer-Policy"] == "same-origin" and 'content="same-origin"' in html
+
+    def test_wrong_then_right_password(self, pw_app):
+        c = pw_app.test_client()
+        r = _login(c, "nope")
+        assert r.status_code == 401 and "パスワードが違います" in r.get_data(as_text=True)
+        r = _login(c)
+        assert r.status_code == 302 and r.headers["Location"].endswith("/")
+        page = c.get("/")
+        assert page.status_code == 200 and 'id="logout-link"' in page.get_data(as_text=True)
+        assert c.get("/api/state").status_code == 200
+        assert c.post("/api/recordings/clear", json={}, headers={TOKEN_HEADER: "test-token-123"}).status_code == 200
+        assert c.get("/login").status_code == 302  # already logged in: back to the GUI
+
+    def test_session_cookie(self, pw_app):
+        cookie = _login(pw_app.test_client()).headers["Set-Cookie"]
+        assert cookie.startswith("reqrec_session_") and "HttpOnly" in cookie and "SameSite=Strict" in cookie
+
+    def test_token_and_origin_still_checked_after_login(self, pw_app):
+        c = pw_app.test_client()
+        _login(c)
+        assert c.post("/api/recordings/clear", json={}).status_code == 403
+        r = c.post("/api/recordings/clear", json={}, headers={TOKEN_HEADER: "test-token-123", "Origin": "http://evil.example"})
+        assert r.status_code == 403
+
+    def test_logout(self, pw_app):
+        c = pw_app.test_client()
+        _login(c)
+        r = c.get("/logout")
+        assert r.status_code == 302 and r.headers["Location"].endswith("/login")
+        assert c.get("/api/state").status_code == 401
+
+    def test_login_posted_from_another_site_is_refused(self, pw_app):
+        c = pw_app.test_client()
+        assert _login(c, origin="http://evil.example").status_code == 403
+        assert _login(c, origin="null").status_code == 403
+        assert c.get("/api/state").status_code == 401
+
+    def test_lockout_after_wrong_passwords(self, pw_app):
+        c = pw_app.test_client()
+        for _ in range(4):
+            assert _login(c, "nope").status_code == 401
+        r = _login(c, "nope")
+        assert r.status_code == 429 and "秒間ログインできません" in r.get_data(as_text=True)
+        r = _login(c)  # even the right password has to wait until the lock ends
+        assert r.status_code == 429 and c.get("/api/state").status_code == 401
+        # the lock belongs to that address only
+        r = _login(c, environ_base={"REMOTE_ADDR": "192.168.1.30"})
+        assert r.status_code == 302
+
+    def test_lock_ends(self, pw_app, monkeypatch):
+        c = pw_app.test_client()
+        now = [1000.0]
+        monkeypatch.setattr(webapp.time, "time", lambda: now[0])
+        for _ in range(5):
+            _login(c, "nope")
+        assert _login(c).status_code == 429
+        now[0] += 61
+        assert _login(c).status_code == 302
+
+    def test_wrong_password_is_slowed_down(self, workdir, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr(webapp.time, "sleep", sleeps.append)
+        application = create_app(str(workdir), password=PASSWORD, TESTING=True)
+        try:
+            c = application.test_client()
+            _login(c, "nope")
+            assert sleeps == [1.0]
+            _login(c)
+            assert sleeps == [1.0]
+        finally:
+            application.extensions["reqrec"].close()
+
+    def test_other_pcs_and_server_names_work_after_login(self, pw_app):
+        c = pw_app.test_client()
+        env = {"REMOTE_ADDR": "192.168.1.30"}
+        r = c.post("/login", data={"password": PASSWORD}, environ_base=env,
+                   headers={"Origin": "http://jupyter-srv:8765", "Host": "jupyter-srv:8765"})
+        assert r.status_code == 302
+        assert c.get("/api/state", headers={"Host": "jupyter-srv:8765"}, environ_base=env).status_code == 200
+
+    def test_password_from_the_environment(self, workdir, monkeypatch):
+        monkeypatch.setenv("REQREC_GUI_PASSWORD", "from-env")
+        application = create_app(str(workdir), TESTING=True, LOGIN_FAIL_DELAY=0)
+        try:
+            c = application.test_client()
+            assert c.get("/").status_code == 302
+            assert _login(c, "from-env").status_code == 302
+            assert application.config["REQREC_LOGIN_ENABLED"] is True
+        finally:
+            application.extensions["reqrec"].close()
+
+    def test_the_page_goes_to_the_login_when_the_session_ends(self):
+        js = APP_JS
+        assert "if (resp.status === 401 && data.login) window.location.href = '/login';" in js
+
+
+class TestWithoutPassword:
+    def test_only_this_pc(self, client):
+        env = {"REMOTE_ADDR": "192.168.1.30"}
+        r = client.get("/", environ_base=env)
+        assert r.status_code == 403 and "REQREC_GUI_PASSWORD" in r.get_data(as_text=True)
+        r = client.get("/api/state", environ_base=env)
+        assert r.status_code == 403 and "REQREC_GUI_PASSWORD" in r.get_json()["error"]
+        assert client.get("/").status_code == 200
+        assert client.get("/api/state", environ_base={"REMOTE_ADDR": "::1"}).status_code == 200
+        assert client.get("/api/state", environ_base={"REMOTE_ADDR": "::ffff:127.0.0.1"}).status_code == 200
+
+    def test_no_login_routes_and_no_logout_link(self, client):
+        assert client.get("/login").status_code == 404 and client.get("/logout").status_code == 404
+        assert 'id="logout-link"' not in client.get("/").get_data(as_text=True)
+
+    def test_run_gui_refuses_the_lan_without_a_password(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(flask.Flask, "run", lambda self, **kw: pytest.fail("server must not start"))
+        rc = run_gui(host="0.0.0.0", port=_free_port(), workdir=str(tmp_path / "w"), open_browser=False)
+        assert rc == 1 and "REQREC_GUI_PASSWORD" in capsys.readouterr().err
+        assert not (tmp_path / "w").exists()
+
+    def test_run_gui_on_the_lan_with_a_password(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("REQREC_GUI_PASSWORD", "x")
+        calls = {}
+
+        def fake_run(self, host, port, **kw):
+            calls.update(host=host)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(flask.Flask, "run", fake_run)
+        rc = run_gui(host="0.0.0.0", port=_free_port(), workdir=str(tmp_path / "w"), open_browser=False)
+        assert rc == 0 and calls == {"host": "0.0.0.0"}
+        assert "パスワードが必要です" in capsys.readouterr().out
+
+
+class TestFlaskCli:
+    def test_flask_cli_finds_the_factory(self, tmp_path, monkeypatch, capsys):
+        from flask.cli import ScriptInfo
+        import atexit
+
+        monkeypatch.setenv("REQREC_WORKDIR", str(tmp_path / "w"))
+        registered = []
+        monkeypatch.setattr(atexit, "register", lambda fn, *a, **k: registered.append((fn, a)))
+        application = ScriptInfo(app_import_path="reqrec").load_app()  # what ``flask --app reqrec run`` does
+        state = application.extensions["reqrec"]
+        try:
+            assert isinstance(application, flask.Flask)
+            assert state.workdir == str(tmp_path / "w") and (tmp_path / "w" / "scripts").is_dir()
+            assert registered == [(webapp._shutdown, (state,))]  # children stopped at exit
+            err = capsys.readouterr().err
+            assert "作業フォルダ" in err and "ログイン: なし" in err
+            assert application.test_client().get("/").status_code == 200
+        finally:
+            state.close()
+
+    def test_flask_cli_with_a_password(self, tmp_path, monkeypatch, capsys):
+        from flask.cli import ScriptInfo
+        import atexit
+
+        monkeypatch.setenv("REQREC_WORKDIR", str(tmp_path / "w"))
+        monkeypatch.setenv("REQREC_GUI_PASSWORD", "x")
+        monkeypatch.setattr(atexit, "register", lambda fn, *a, **k: None)
+        application = ScriptInfo(app_import_path="reqrec").load_app()
+        try:
+            assert "パスワードが必要です" in capsys.readouterr().err
+            assert application.test_client().get("/").status_code == 302
+        finally:
+            application.extensions["reqrec"].close()
+
+    def test_scripts_do_not_get_the_gui_password(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("REQREC_GUI_PASSWORD", "secret-gui")
+        script = tmp_path / "env.py"
+        script.write_text("import os\nprint(os.environ.get('REQREC_GUI_PASSWORD', 'absent'))\n", encoding="utf-8")
+        runner = ScriptRunner()
+        runner.start(str(script), {})
+        assert runner.wait(30) == 0
+        assert runner.status()["stdout_tail"].strip() == "absent"

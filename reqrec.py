@@ -84,6 +84,7 @@ from flask import (
     Response,
     current_app,
     jsonify,
+    redirect,
     render_template,
     send_from_directory,
 )
@@ -92,6 +93,7 @@ from flask import (
 # ``load``, ``running``, ``done`` ...), so no top-level name may be a hook name: Flask's ``request``
 # proxy is bound as ``flask_request`` (tests/test_recorder.py checks the names against mitmproxy's hooks).
 from flask import request as flask_request
+from flask import session as flask_session
 from jinja2 import DictLoader
 from werkzeug.exceptions import HTTPException
 
@@ -133,6 +135,7 @@ __all__ = [
     "open_folder", "validate_url", "ApiError", "AppState", "ScriptRunner", "SUBDIRS", "safe_name",
     "plan_options_from_json", "gen_options_from_json", "options_to_plain", "load_sources", "exclude_netlocs",
     "normalise_netloc", "RECORDING_EXTENSIONS", "bp", "get_state", "create_app", "run_gui", "TOKEN_HEADER",
+    "GUI_PASSWORD_ENV", "WORKDIR_ENV", "LOGIN_HTML",
     "GUI_HTML",
     # cli
     "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "main", "build_parser", "add_filter_options",
@@ -8916,6 +8919,12 @@ def open_folder(
 #: Sub-folders of ``workdir`` (created on start-up).
 SUBDIRS = ("recordings", "uploads", "scripts", "outputs")
 
+#: Environment variable with the GUI password (``reqrec gui`` / ``flask --app reqrec run``).  It is not
+#: ``REQREC_PASSWORD``: generated scripts read that name for the site's own password.
+GUI_PASSWORD_ENV = "REQREC_GUI_PASSWORD"
+#: Environment variable with the work folder when the app is built without arguments (Flask CLI).
+WORKDIR_ENV = "REQREC_WORKDIR"
+
 #: What the upload / open endpoints accept (``importers.load_recording`` dispatches on these).
 RECORDING_EXTENSIONS = frozenset({".har", ".json"})
 
@@ -9239,6 +9248,7 @@ class ScriptRunner:
             if not os.path.isfile(script_path):
                 raise ApiError(f"スクリプトが見つかりません: {os.path.basename(script_path)}", status=404)
             child_env = dict(os.environ)
+            child_env.pop(GUI_PASSWORD_ENV, None)  # the GUI's own password never reaches a script
             child_env["PYTHONIOENCODING"] = "utf-8"
             child_env["PYTHONUNBUFFERED"] = "1"
             for key, value in (env or {}).items():
@@ -10051,6 +10061,7 @@ def index() -> str:
         workdir=state.workdir,
         mitmproxy_available=mitmproxy_available(),
         iehost=_iehost_info(state),
+        login_enabled=bool(current_app.config.get("REQREC_LOGIN_ENABLED")),
     )
 
 
@@ -10757,14 +10768,20 @@ def easy_build() -> Response:
 # Flask based no-code GUI for reqrec.  Contract: DESIGN.md §13.6.
 #
 # ``create_app(workdir)`` builds the Flask application; ``run_gui`` starts it (and opens a browser).
+# ``create_app()`` without arguments is the factory ``flask --app reqrec run`` finds (for example on a
+# LAN server started from a JupyterLab terminal).
 #
 # Security model (the user's browser visits arbitrary sites while this GUI runs):
 #
+# * without a password (environment variable ``REQREC_GUI_PASSWORD``) only this PC may use the GUI:
+#   requests from any other address are refused, and every request's ``Host`` must be the bound
+#   address / ``127.0.0.1`` / ``localhost`` / ``::1`` (DNS-rebinding guard);
+# * with a password every page and API needs a login session (``/login``: a signed HttpOnly,
+#   SameSite=Strict cookie; wrong passwords in a row lock the address out for a while), so the GUI may
+#   be opened from other PCs on the LAN;
 # * every ``POST`` / ``PUT`` / ``DELETE`` must carry ``X-Reqrec-Token`` equal to a per-process random
-#   token the page receives through the template (``<body data-token>``);
-# * every request's ``Host`` must be the bound address / ``127.0.0.1`` / ``localhost`` / ``::1``
-#   (DNS-rebinding guard), and a state-changing request with an ``Origin`` header must come from the
-#   page itself;
+#   token the page receives through the template (``<body data-token>``), and a state-changing request
+#   with an ``Origin`` header must come from the page itself;
 # * file names from the browser only ever map to files inside ``workdir`` (``safe_name``).
 
 TOKEN_HEADER = "X-Reqrec-Token"
@@ -10779,6 +10796,62 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _DEFAULT_MAX_UPLOAD = 1024 * 1024 * 1024
 
 _BROWSER_OPEN_DELAY = 0.8
+
+#: Template name of the login page (:data:`LOGIN_HTML`), shown only when a GUI password is set.
+_LOGIN_TEMPLATE = "login.html"
+#: Session key that marks a logged-in browser.
+_SESSION_AUTH_KEY = "reqrec_auth"
+#: Wrong passwords in a row from one address before it is locked out, and for how long (seconds).
+_LOGIN_MAX_FAILURES = 5
+_LOGIN_LOCK_SECONDS = 60.0
+#: Pause after a wrong password (slows down guessing); tests pass ``LOGIN_FAIL_DELAY=0``.
+_LOGIN_FAIL_DELAY = 1.0
+#: How long a login lasts (seconds): one work shift.
+_LOGIN_LIFETIME = 12 * 60 * 60
+
+#: The login page (Jinja template; plain HTML and CSS, no script, so it also works in the IE engine).
+LOGIN_HTML = r'''<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>reqrec — ログイン</title>
+<style>
+body { margin: 0; background: #f4f6f9; color: #1f2933; font-family: "Segoe UI", "Yu Gothic UI", Meiryo, sans-serif; }
+main { max-width: 22rem; margin: 12vh auto 0; padding: 1.6rem 1.8rem; background: #fff; border: 1px solid #d9dee5; border-radius: 10px; }
+h1 { margin: 0 0 .3rem; font-size: 1.25rem; }
+p { margin: .2rem 0 1rem; color: #52606d; font-size: .9rem; }
+label { display: block; margin-bottom: .35rem; font-weight: 600; }
+input { box-sizing: border-box; width: 100%; padding: .55rem .6rem; font-size: 1rem; border: 1px solid #b8c2cc; border-radius: 6px; }
+button { width: 100%; margin-top: 1rem; padding: .6rem; color: #fff; background: #2563eb; border: 0; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+.error { margin-bottom: 1rem; padding: .5rem .7rem; color: #9b1c1c; background: #fdecec; border: 1px solid #f5c2c2; border-radius: 6px; font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>reqrec</h1>
+  <p>パスワードを入力してください。</p>
+  {% if error %}<div class="error" id="login-error" role="alert">{{ error }}</div>{% endif %}
+  <form method="post" action="/login">
+    <label for="password">パスワード</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+    <button type="submit">ログイン</button>
+  </form>
+</main>
+</body>
+</html>
+'''
+
+
+def _is_loopback_addr(addr: Optional[str]) -> bool:
+    """``127.x.x.x`` / ``::1`` (also as an IPv4-mapped IPv6 address): a request from this PC itself."""
+    try:
+        ip = ipaddress.ip_address((addr or "").split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return bool(ip.is_loopback or (mapped is not None and mapped.is_loopback))
 
 
 # --------------------------------------------------------------------------- host / origin checks
@@ -10846,17 +10919,28 @@ def _normalise_netloc(netloc: str, scheme: str) -> str:
 
 # --------------------------------------------------------------------------- factory
 
-def create_app(workdir: str, **config: Any) -> Flask:
+def create_app(workdir: Optional[str] = None, **config: Any) -> Flask:
     """Build the Flask app.
 
-    ``config`` may hold ``host`` / ``port`` (what the server binds; used for the Host check and
-    for excluding the GUI's own traffic from recordings), ``token`` (per-process CSRF token;
-    generated when omitted), ``recorder`` / ``runner`` (test doubles) and any upper-case Flask
-    config key (``MAX_CONTENT_LENGTH``, ``TESTING``, ...).
+    ``workdir`` defaults to the environment variable ``REQREC_WORKDIR`` or ``reqrec_work``; called
+    without arguments this is the factory ``flask --app reqrec run`` finds, and the children it starts
+    (recorder, recording browser, script run) are then stopped at exit.  ``config`` may hold
+    ``host`` / ``port`` (what the server binds; used for the Host check and for excluding the GUI's
+    own traffic from recordings), ``token`` (per-process CSRF token; generated when omitted),
+    ``password`` (the GUI password; defaults to the environment variable ``REQREC_GUI_PASSWORD``;
+    empty = no login and this PC only), ``recorder`` / ``runner`` (test doubles) and any upper-case
+    Flask config key (``MAX_CONTENT_LENGTH``, ``TESTING``, ``LOGIN_FAIL_DELAY`` ...).
     """
+    from_cli = workdir is None
+    if workdir is None:
+        workdir = os.environ.get(WORKDIR_ENV) or "reqrec_work"
     host = str(config.pop("host", "127.0.0.1") or "127.0.0.1")
     port = int(config.pop("port", 8765) or 8765)
     token = config.pop("token", None)
+    password = config.pop("password", None)
+    if password is None:
+        password = os.environ.get(GUI_PASSWORD_ENV, "")
+    password = str(password or "")
     recorder = config.pop("recorder", None)
     runner = config.pop("runner", None)
 
@@ -10865,12 +10949,13 @@ def create_app(workdir: str, **config: Any) -> Flask:
     # template is served by name from memory, so Jinja compiles it once per app and caches it
     # (``render_template_string`` would compile the 140 KB page again on every ``GET /``).
     app = Flask("reqrec.gui", root_path=os.path.dirname(os.path.abspath(__file__)), template_folder=None, static_folder=None)
-    app.jinja_loader = DictLoader({_GUI_TEMPLATE: GUI_HTML})
+    app.jinja_loader = DictLoader({_GUI_TEMPLATE: GUI_HTML, _LOGIN_TEMPLATE: LOGIN_HTML})
     app.config.update(
         MAX_CONTENT_LENGTH=_DEFAULT_MAX_UPLOAD,
         JSON_SORT_KEYS=False,
         SEND_FILE_MAX_AGE_DEFAULT=0,
         TEMPLATES_AUTO_RELOAD=False,
+        LOGIN_FAIL_DELAY=_LOGIN_FAIL_DELAY,
     )
     for key, value in config.items():
         app.config[key.upper()] = value
@@ -10879,15 +10964,96 @@ def create_app(workdir: str, **config: Any) -> Flask:
 
     state = AppState(workdir, host=host, port=port, token=token, recorder=recorder, runner=runner)
     app.extensions["reqrec"] = state
-    app.config.update(REQREC_WORKDIR=state.workdir, REQREC_TOKEN=state.token, REQREC_HOST=host, REQREC_PORT=port)
+    app.config.update(REQREC_WORKDIR=state.workdir, REQREC_TOKEN=state.token, REQREC_HOST=host, REQREC_PORT=port,
+                      REQREC_LOGIN_ENABLED=bool(password))
+    # Login sessions: a signed cookie that is valid for this process only (a restart logs everyone
+    # out).  Its name carries the work folder, so another web app on the same server never overwrites
+    # it (browsers keep cookies per host, not per port).
+    app.secret_key = secrets.token_bytes(32)
+    app.config.update(
+        SESSION_COOKIE_NAME="reqrec_session_" + hashlib.sha256(state.workdir.encode("utf-8")).hexdigest()[:8],
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Strict",
+        PERMANENT_SESSION_LIFETIME=_LOGIN_LIFETIME,
+    )
 
     app.register_blueprint(bp)
+
+    # ---------------------------------------------------------------- login (only with a password)
+    failures: dict[str, tuple[int, float]] = {}  # address -> (wrong passwords in a row, locked until)
+    failures_lock = threading.Lock()
+
+    def _login():  # type: ignore[no-untyped-def]
+        error: Optional[str] = None
+        status = 200
+        if flask_request.method == "POST":
+            addr = flask_request.remote_addr or "?"
+            now = time.time()
+            with failures_lock:
+                count, locked_until = failures.get(addr, (0, 0.0))
+            if locked_until > now:
+                error = f"パスワードを続けて間違えたため、あと {int(locked_until - now) + 1} 秒はログインできません。"
+                status = 429
+            elif hmac.compare_digest(flask_request.form.get("password", "").encode("utf-8"), password.encode("utf-8")):
+                with failures_lock:
+                    failures.pop(addr, None)
+                flask_session.clear()
+                flask_session.permanent = True
+                flask_session[_SESSION_AUTH_KEY] = True
+                return redirect("/")
+            else:
+                delay = float(app.config.get("LOGIN_FAIL_DELAY") or 0)
+                if delay > 0:
+                    time.sleep(delay)
+                count += 1
+                if count >= _LOGIN_MAX_FAILURES:
+                    with failures_lock:
+                        failures[addr] = (0, now + _LOGIN_LOCK_SECONDS)
+                    error = (f"パスワードを {_LOGIN_MAX_FAILURES} 回続けて間違えたため、"
+                             f"{int(_LOGIN_LOCK_SECONDS)} 秒間ログインできません。")
+                    status = 429
+                else:
+                    with failures_lock:
+                        failures[addr] = (count, 0.0)
+                    error = "パスワードが違います。"
+                    status = 401
+        elif flask_session.get(_SESSION_AUTH_KEY):
+            return redirect("/")
+        # ``same-origin``, not the GUI's ``no-referrer``: under ``no-referrer`` browsers send
+        # ``Origin: null`` with the form post, which the CSRF check rejects.
+        return render_template(_LOGIN_TEMPLATE, error=error), status, {"Referrer-Policy": "same-origin"}
+
+    def _logout():  # type: ignore[no-untyped-def]
+        flask_session.clear()
+        return redirect("/login")
+
+    if password:
+        app.add_url_rule("/login", "login", _login, methods=["GET", "POST"])
+        app.add_url_rule("/logout", "logout", _logout, methods=["GET"])
 
     # ---------------------------------------------------------------- security hook
     @app.before_request
     def _guard():  # type: ignore[no-untyped-def]
-        if not host_allowed(flask_request.host, host):
-            return jsonify({"error": f"この Host ヘッダーからのアクセスは許可されていません: {flask_request.host}"}), 403
+        api_like = flask_request.path.startswith("/api/") or flask_request.method in _UNSAFE_METHODS
+        if password:
+            if flask_request.path == "/login":
+                if flask_request.method in _UNSAFE_METHODS and not origin_allowed(
+                        flask_request.headers.get("Origin"), flask_request.host, flask_request.scheme):
+                    return jsonify({"error": "別のオリジンからのリクエストは拒否しました (CSRF 対策)"}), 403
+                return None
+            if not flask_session.get(_SESSION_AUTH_KEY):
+                if api_like:
+                    return jsonify({"error": "ログインしていません。ページを再読み込みしてログインしてください。", "login": True}), 401
+                return redirect("/login")
+        else:
+            if not _is_loopback_addr(flask_request.remote_addr):
+                message = (f"パスワードが設定されていないため、この PC 以外からは使えません。"
+                           f"環境変数 {GUI_PASSWORD_ENV} にパスワードを設定して起動し直してください。")
+                if api_like:
+                    return jsonify({"error": message}), 403
+                return Response(message, status=403, mimetype="text/plain")
+            if not host_allowed(flask_request.host, host):
+                return jsonify({"error": f"この Host ヘッダーからのアクセスは許可されていません: {flask_request.host}"}), 403
         if flask_request.method in _UNSAFE_METHODS:
             if not origin_allowed(flask_request.headers.get("Origin"), flask_request.host, flask_request.scheme):
                 return jsonify({"error": "別のオリジンからのリクエストは拒否しました (CSRF 対策)"}), 403
@@ -10930,6 +11096,15 @@ def create_app(workdir: str, **config: Any) -> Flask:
         app.logger.exception("unhandled error")
         return jsonify({"error": f"内部エラーが発生しました: {exc.__class__.__name__}: {exc}"}), 500
 
+    if from_cli:
+        # ``flask --app reqrec run``: nobody calls run_gui, so stop the children at exit and say where
+        # the files go and whether a login is needed.
+        import atexit
+
+        atexit.register(_shutdown, state)
+        login = ("ログイン: パスワードが必要です" if password else
+                 f"ログイン: なし (この PC の中からだけ使えます。他の PC から使うときは {GUI_PASSWORD_ENV} を設定)")
+        print(f"reqrec: 作業フォルダ: {state.workdir} / {login}", file=sys.stderr, flush=True)
     return app
 
 
@@ -10985,6 +11160,11 @@ def _open_browser_later(url: str, host: str, port: int, delay: float = _BROWSER_
 def run_gui(host: str = "127.0.0.1", port: int = 8765, workdir: str = "reqrec_work", open_browser: bool = True) -> int:
     """Start the GUI server (blocking) and return a process exit code (``0`` after Ctrl+C)."""
     port = int(port)
+    password = os.environ.get(GUI_PASSWORD_ENV, "")
+    if (host or "").strip().lower() not in _LOCAL_HOSTS and not password:
+        print(f"GUI を起動できません: --host {host} で他の PC から使えるようにするときは、パスワードが必要です。"
+              f"環境変数 {GUI_PASSWORD_ENV} にパスワードを設定してから起動してください。", file=sys.stderr)
+        return 1
     try:
         app = create_app(workdir, host=host, port=port)
     except (RuntimeError, OSError) as exc:
@@ -10997,6 +11177,8 @@ def run_gui(host: str = "127.0.0.1", port: int = 8765, workdir: str = "reqrec_wo
         return 1
     print(f"GUI を起動しました: {url}  (Ctrl+C で終了)", flush=True)
     print(f"作業フォルダ: {app.extensions['reqrec'].workdir}", flush=True)
+    if password:
+        print(f"ログイン: パスワードが必要です (環境変数 {GUI_PASSWORD_ENV})", flush=True)
     if open_browser:
         _open_browser_later(url, _display_host(host), port)
     state: AppState = app.extensions["reqrec"]
@@ -11429,6 +11611,7 @@ select.w-full { width: 100%; max-width: 100%; }
       <span id="status-text">準備完了。</span>
     </div>
     <button type="button" id="mode-toggle" class="btn tiny ghost mode-toggle" title="フィルタ設定や通信の一覧など、細かい設定を表示します">詳細設定を表示</button>
+    {% if login_enabled %}<a href="/logout" id="logout-link" class="btn tiny ghost" title="ログアウトします">ログアウト</a>{% endif %}
   </div>
   <nav class="steps-nav" id="nav" aria-label="作業の流れ">
     <button type="button" class="nav-step active" data-panel="record"><span class="nav-num">1</span><span class="nav-label">記録</span><span class="nav-badge" id="badge-record" hidden></span></button>
@@ -11958,6 +12141,7 @@ select.w-full { width: 100%; max-width: 100%; }
     const text = await resp.text();
     let data;
     try { data = text ? JSON.parse(text) : {}; } catch (e) { data = { error: text.slice(0, 300) || resp.statusText }; }
+    if (resp.status === 401 && data.login) window.location.href = '/login';  // the login session ended
     if (!resp.ok) throw new ApiError(data.error || `エラー (HTTP ${resp.status})`, resp.status, data);
     return data;
   }
@@ -13729,7 +13913,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "記録の開始/停止、HAR 等の読み込み（複数可）、ステップの取捨選択、コード生成、生成コードの実行を\n"
                     "コードを書かずに行えます。",
     )
-    p_gui.add_argument("--host", default="127.0.0.1", metavar="HOST", help="待ち受けアドレス（既定: 127.0.0.1。他の端末からは使わせない）")
+    p_gui.add_argument("--host", default="127.0.0.1", metavar="HOST", help="待ち受けアドレス（既定: 127.0.0.1。他の PC から使わせるときは 0.0.0.0 などにし、"
+                            "環境変数 REQREC_GUI_PASSWORD でパスワードを設定する）")
     p_gui.add_argument("--port", type=_port, default=8765, metavar="PORT", help="待ち受けポート（既定: 8765）")
     p_gui.add_argument("--workdir", default="reqrec_work", metavar="DIR",
                        help="記録ファイルや生成スクリプトを保存する作業フォルダ（既定: ./reqrec_work）")
