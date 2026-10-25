@@ -135,7 +135,7 @@ __all__ = [
     # codegen
     "generate", "CodegenError", "MAX_INLINE_BODY",
     # recorder
-    "ReqRecAddon", "addons", "parse_hosts", "write_recording_atomic", "OPT_OUT", "OPT_HOSTS", "DEFAULT_OUT",
+    "ReqRecAddon", "addons", "write_recording_atomic", "OPT_OUT", "DEFAULT_OUT",
     "ADDON_PATH", "MITMDUMP_PYTHON_STUB", "RECORD_LISTEN_HOST", "mitmproxy_available", "mitmdump_launcher",
     "build_command", "RecorderError", "RecorderManager", "count_flows_in_file",
     # iehost
@@ -3362,6 +3362,8 @@ def clear_cache() -> None:
 
 _REGEX_UNSAFE_RE = re.compile(r"""["'<>\s]""")
 _MIN_REGEX_VALUE_LEN = 6
+#: How many matches of a candidate pattern ``build_pattern`` checks for ambiguity.
+_MAX_PATTERN_MATCHES = 200
 _WORD_CHAR_RE = re.compile(r"\w")
 _LEADING_WORD_RE = re.compile(r"^\w+")
 
@@ -3382,18 +3384,28 @@ def _stable_prefix(prefix: str, haystack: str, win_start: int, cut_at_newline: b
     return trimmed or prefix
 
 
-def build_pattern(haystack: str, value: str, context: int = 24) -> Optional[str]:
+def build_pattern(haystack: str, value: str, context: int = 24, allow_ambiguous: bool = True) -> Optional[str]:
     """A verified regex with exactly one capture group that extracts ``value`` from ``haystack``.
 
     Up to ``context`` characters of literal (escaped) context are used on each side, trimmed at
-    line boundaries; the capture group matches token-like text.  Returns None when the value
-    contains quotes / whitespace / angle brackets or no verifiable pattern can be built."""
+    line boundaries and at other occurrences of ``value`` (a context that contains the value would only
+    ever match the recorded one); the capture group matches token-like text.
+
+    ``allow_ambiguous`` (the callers pass it for random-looking tokens): the first pattern whose
+    first match is ``value`` is returned, as always.  Without it (a code or a number, e.g. a customer
+    chosen in a picker) a pattern that also matches other values is refused - finding the value as the
+    *first* match only means "the first row", and a new row listed first would silently replace the
+    user's choice - and only the shortest context is tried, so the pattern is anchored by what stands
+    right next to the value (its name on the same row), never by the neighbouring rows.  Returns None
+    when the value contains quotes / whitespace / angle brackets or no acceptable pattern exists (the
+    caller then keeps the recorded value)."""
     if not value or not haystack or _REGEX_UNSAFE_RE.search(value):
         return None
     # A short suffix first: the capture group is delimited by its character class, so a few
     # characters suffice and trailing context (often other dynamic values) is less likely to
     # break the pattern on the next run.  Longer context is tried only when needed.
-    for before, after in ((context, 4), (context, context), (context * 2, context * 2), (context * 4, context * 4)):
+    windows = ((context, 4), (context, context), (context * 2, context * 2), (context * 4, context * 4))
+    for before, after in windows if allow_ambiguous else windows[:1]:
         start = 0
         tries = 0
         while tries < 12:
@@ -3409,8 +3421,13 @@ def build_pattern(haystack: str, value: str, context: int = 24) -> Optional[str]
             if cut >= 0:
                 prefix = prefix[cut + 1:]
             prefix = _stable_prefix(prefix, haystack, win_start, cut_at_newline=cut >= 0)
+            own = prefix.rfind(value)
+            if own >= 0:  # an earlier occurrence of the value is never context
+                prefix = prefix[own + len(value):]
+                if not prefix:
+                    continue
             suffix = haystack[end:end + after]
-            cut = min([p for p in (suffix.find("\n"), suffix.find("\r")) if p >= 0], default=-1)
+            cut = min([p for p in (suffix.find("\n"), suffix.find("\r"), suffix.find(value)) if p >= 0], default=-1)
             if cut >= 0:
                 suffix = suffix[:cut]
             group = _capture_group(value, greedy=not suffix)
@@ -3418,10 +3435,10 @@ def build_pattern(haystack: str, value: str, context: int = 24) -> Optional[str]
             if not prefix or not suffix:
                 pattern = "(?m)" + pattern
             try:
-                m = re.search(pattern, haystack)
+                found = [m.group(1) for m, _ in zip(re.finditer(pattern, haystack), range(_MAX_PATTERN_MATCHES))]
             except re.error:  # pragma: no cover - re.escape makes this unreachable
                 continue
-            if m and m.group(1) == value:
+            if found and found[0] == value and (allow_ambiguous or all(f == value for f in found)):
                 return pattern
     return None
 
@@ -3451,6 +3468,27 @@ def _attr_ok(val: Any, forbidden: list[str]) -> bool:
     if any(f in val for f in forbidden):
         return False
     return not is_dynamic_looking(val)
+
+
+#: How many elements carrying the same value ``_locate_html`` compares for the stablest selector.
+_MAX_LOCATE_ELEMENTS = 30
+
+
+def _stablest(candidates: Iterable[tuple[str, Any]]) -> Optional[tuple[str, Any]]:
+    """The first ``(selector, payload)`` whose selector has the fewest digits: ``#o_10009`` /
+    ``#row17`` name a record that may be gone on the next run, ``#lnkCsv`` does not.  Document order
+    breaks ties; a digit-free selector ends the search."""
+    best: Optional[tuple[str, Any]] = None
+    best_digits = 0
+    for n, (selector, payload) in enumerate(candidates):
+        digits = sum(ch.isdigit() for ch in selector)
+        if best is None or digits < best_digits:
+            best, best_digits = (selector, payload), digits
+            if not digits:
+                break
+        if n + 1 >= _MAX_LOCATE_ELEMENTS:
+            break
+    return best
 
 
 def _id_selector(el_id: str) -> str:
@@ -3563,55 +3601,63 @@ def _locate_html(view: _ResponseView, variants: list[str], allow: Callable[[str]
             name = idx.meta_by_content.get(v)
             if name and v not in name:
                 return Extractor(var="", kind="html_meta", name=name, sample=v)
+    # When several elements carry the value (a session id in every link), the one with the stablest
+    # selector is used (``_stablest``).
     if allow("html_attr"):
         for v in variants:
-            for el, attr in idx.attr_index.get(v, []):
-                sel = _selector_for(el, soup, variants, exclude_attr=attr)
-                if sel:
-                    return Extractor(var="", kind="html_attr", selector=sel, attr=attr, sample=v)
+            best = _stablest((sel, attr) for el, attr in idx.attr_index.get(v, [])
+                             for sel in [_selector_for(el, soup, variants, exclude_attr=attr)] if sel)
+            if best:
+                return Extractor(var="", kind="html_attr", selector=best[0], attr=best[1], sample=v)
     if allow("html_text"):
         for v in variants:
-            for el in idx.text_index.get(v, []):
-                if el.get_text(strip=True) != v:
-                    continue
-                sel = _selector_for(el, soup, variants)
-                if sel:
-                    return Extractor(var="", kind="html_text", selector=sel, sample=v)
+            best = _stablest((sel, None) for el in idx.text_index.get(v, []) if el.get_text(strip=True) == v
+                             for sel in [_selector_for(el, soup, variants)] if sel)
+            if best:
+                return Extractor(var="", kind="html_text", selector=best[0], sample=v)
     if allow("html_attr"):
         for v in variants:
-            if _REGEX_UNSAFE_RE.search(v):
-                continue
-            for el, attr, val in idx.attr_items:
-                if v not in val or val == v:
-                    continue
-                sel = _selector_for(el, soup, variants, exclude_attr=attr)
-                if not sel:
-                    continue
-                pattern = build_pattern(val, v)
-                if pattern:
-                    return Extractor(var="", kind="html_attr", selector=sel, attr=attr, pattern=pattern, sample=v)
+            if not _REGEX_UNSAFE_RE.search(v):
+                best = _stablest(_attr_patterns(idx, soup, variants, v))
+                if best:
+                    return Extractor(var="", kind="html_attr", selector=best[0], attr=best[1][0],
+                                     pattern=best[1][1], sample=v)
     if allow("html_text"):
         for v in variants:
-            if _REGEX_UNSAFE_RE.search(v):
-                continue
-            for stripped, el in idx.text_nodes:
-                if v not in stripped or stripped == v:
-                    continue
-                full = el.get_text(strip=True)
-                sel = _selector_for(el, soup, variants)
-                if not sel:
-                    continue
-                pattern = build_pattern(full, v)
-                if pattern:
-                    return Extractor(var="", kind="html_text", selector=sel, pattern=pattern, sample=v)
+            if not _REGEX_UNSAFE_RE.search(v):
+                best = _stablest(_text_patterns(idx, soup, variants, v))
+                if best:
+                    return Extractor(var="", kind="html_text", selector=best[0], pattern=best[1], sample=v)
     return None
+
+
+def _attr_patterns(idx: _SoupIndex, soup: BeautifulSoup, variants: list[str], v: str) -> Iterator[tuple[str, tuple[str, str]]]:
+    """``(selector, (attribute, pattern))`` for every attribute that contains ``v`` among other text."""
+    for el, attr, val in idx.attr_items:
+        if v not in val or val == v:
+            continue
+        sel = _selector_for(el, soup, variants, exclude_attr=attr)
+        pattern = build_pattern(val, v, allow_ambiguous=is_dynamic_looking(v)) if sel else None
+        if pattern:
+            yield sel, (attr, pattern)
+
+
+def _text_patterns(idx: _SoupIndex, soup: BeautifulSoup, variants: list[str], v: str) -> Iterator[tuple[str, str]]:
+    """``(selector, pattern)`` for every element whose text contains ``v`` among other text."""
+    for stripped, el in idx.text_nodes:
+        if v not in stripped or stripped == v:
+            continue
+        sel = _selector_for(el, soup, variants)
+        pattern = build_pattern(el.get_text(strip=True), v, allow_ambiguous=is_dynamic_looking(v)) if sel else None
+        if pattern:
+            yield sel, pattern
 
 
 def _locate_regex(text: str, variants: list[str]) -> Optional[Extractor]:
     for v in variants:
         if len(v) < _MIN_REGEX_VALUE_LEN or v not in text:
             continue
-        pattern = build_pattern(text, v)
+        pattern = build_pattern(text, v, allow_ambiguous=is_dynamic_looking(v))
         if pattern:
             return Extractor(var="", kind="regex", pattern=pattern, sample=v)
     return None
@@ -3628,7 +3674,7 @@ def _locate_url(flow: Flow, variants: list[str]) -> Optional[Extractor]:
         return None
     for v in variants:
         if v in resolved:
-            pattern = build_pattern(resolved, v)
+            pattern = build_pattern(resolved, v, allow_ambiguous=is_dynamic_looking(v))
             if pattern:
                 return Extractor(var="", kind="url", name="Location", pattern=pattern, sample=v)
     return None
@@ -4002,14 +4048,15 @@ def _referer_token(token: str, swaps: dict[str, Ref], plus: bool) -> Optional[st
 
 def _referer_with_fresh_values(value: str, refs: dict, secrets: Optional[dict[str, Ref]] = None) -> Ref:
     """``Referer: .../Search.aspx?key=<recorded key>`` -> the same URL built with the key traced for
-    this step, so the header never carries a stale session value.
+    this step or an earlier one (the Referer is usually the URL of an earlier step), so the header
+    never carries a stale session value.
 
     Only whole tokens are replaced: a whole path segment (or the value of a ``;name=value`` path
     parameter such as ``;jsessionid=``) and a whole query value (or a query item without ``=``),
     each either verbatim or in its percent-encoded spelling.  ``scheme://host`` and the fragment
-    stay literal, and a value is never replaced inside a longer token.  Only non-literal refs of
-    this step whose recorded value has at least ``_REFERER_MIN_VALUE`` characters are used;
-    anything else stays literal.
+    stay literal, and a value is never replaced inside a longer token.  Only non-literal refs in
+    ``refs`` (this step's first, then the earlier steps' extractor variables) whose recorded value
+    has at least ``_REFERER_MIN_VALUE`` characters are used; anything else stays literal.
 
     ``secrets`` (recorded value -> Ref of a secret constant) is used, whatever the value's length,
     for query items whose name looks like a credential (``Login.aspx?pw=abc`` as the previous
@@ -4166,6 +4213,9 @@ class _Builder:
         self.func_names: set[str] = set()
         self.built: list[_Built] = []
         self.earlier_flows: list[Flow] = []
+        #: values traced for the steps built so far -> their extractor variable, for the Referer of a later
+        #: step (usually the URL of an earlier step: ``/search?tk=<the token of that step>``)
+        self.traced_refs: dict[tuple[str, str, str], Ref] = {}
         self.value_units: dict[str, set[int]] = {}
         self.base_headers = []
         self.base_set: set[tuple[str, str]] = set()
@@ -4689,8 +4739,15 @@ class _Builder:
                     ref = _with_prefix(prefix, hidden)
             if lname == "referer" and ref.is_literal:
                 secrets = {c.value: Ref.var(c.name) for c in self.secret_by_value.values()}
-                ref = _referer_with_fresh_values(value, refs, secrets)
+                known = dict(refs)  # this step's values first, then those traced for earlier steps
+                for key, earlier in self.traced_refs.items():
+                    known.setdefault(key, earlier)
+                ref = _referer_with_fresh_values(value, known, secrets)
             headers.append((name, ref))
+        constant_names = {c.name for c in self.constants}
+        for key, resolved in refs.items():
+            if resolved is not None and resolved.kind == "var" and resolved.value not in constant_names:
+                self.traced_refs.setdefault(key, resolved)
 
         status = resp.status if resp else 200
         mime = (resp.mime_type or "") if resp else ""
@@ -6688,9 +6745,9 @@ def generate(plan: Plan, opts: Optional[GenOptions] = None) -> str:
 # ``reqrec_out``
 #     Path of the recording JSON file.  Rewritten **atomically after every response** (temp file in
 #     the same directory + ``os.replace``) so a killed session still leaves a valid file.
-# ``reqrec_hosts``
-#     Comma-separated host names to record; a host matches itself and its sub-domains
-#     (``host_matches``).  Empty = record everything.
+#
+# Every HTTP flow is recorded (the recording browser is the proxy's only client; https:// is tunnelled
+# untouched by ``HTTPS_PASSTHROUGH_ARGS``).  The host filter ``reqrec_hosts`` was removed on 2026-10-25.
 #
 # The addon works both when reqrec is imported normally and when mitmproxy exec's reqrec.py directly
 # (script mode).
@@ -6705,30 +6762,7 @@ except ImportError:  # pragma: no cover - exercised only when mitmproxy is absen
 log = logging.getLogger("reqrec.recorder")
 
 OPT_OUT = "reqrec_out"
-OPT_HOSTS = "reqrec_hosts"
 DEFAULT_OUT = "reqrec_recording.json"
-
-HostsSpec = Union[None, str, Iterable[str]]
-
-
-def parse_hosts(spec: HostsSpec) -> list[str]:
-    """``"a.com, B.com;c.com"`` / ``["a.com", ...]`` -> ``["a.com", "b.com", "c.com"]`` (lower-case,
-    de-duplicated, order kept).  ``None`` / ``""`` -> ``[]`` (= record every host)."""
-    if spec is None:
-        return []
-    if isinstance(spec, str):
-        items: Iterable[str] = spec.replace(";", ",").replace("\n", ",").split(",")
-    else:
-        items = []
-        for item in spec:
-            items.extend(str(item).replace(";", ",").split(","))
-    out: list[str] = []
-    for item in items:
-        for token in item.split():
-            host = token.strip().lower().rstrip(".")
-            if host and host not in out:
-                out.append(host)
-    return out
 
 
 def write_recording_atomic(recording: Recording, path: str) -> str:
@@ -6760,20 +6794,18 @@ class ReqRecAddon:
 
     The addon can also be used programmatically without mitmproxy's option machinery::
 
-        addon = ReqRecAddon(out="rec.json", hosts=["example.com"])
+        addon = ReqRecAddon(out="rec.json")
         addon.response(flow)      # flow: mitmproxy.http.HTTPFlow
         addon.done()
 
-    Options set through mitmproxy (``--set reqrec_out=...``) take precedence once ``configure`` runs.
+    The option set through mitmproxy (``--set reqrec_out=...``) takes precedence once ``configure`` runs.
     """
 
-    def __init__(self, out: Optional[str] = None, hosts: HostsSpec = None) -> None:
-        # Constructor arguments are the baseline; mitmproxy options set to a non-default value
-        # override them in ``configure`` (and fall back to these when reset to the default).
+    def __init__(self, out: Optional[str] = None) -> None:
+        # The constructor argument is the baseline; the mitmproxy option set to a non-default value
+        # overrides it in ``configure`` (and falls back to it when reset to the default).
         self._init_out: Optional[str] = out
-        self._init_hosts: list[str] = parse_hosts(hosts)
         self.out: Optional[str] = out
-        self.hosts: list[str] = list(self._init_hosts)
         self.started_at: str = now_iso()
         self.errors: int = 0  # flows recorded through the error hook (no response)
         self.flush_count: int = 0
@@ -6785,18 +6817,12 @@ class ReqRecAddon:
     # ------------------------------------------------------------------ mitmproxy option hooks
 
     def load(self, loader: Any) -> None:
-        """Declare the ``reqrec_out`` / ``reqrec_hosts`` options."""
+        """Declare the ``reqrec_out`` option."""
         loader.add_option(
             name=OPT_OUT,
             typespec=str,
             default=DEFAULT_OUT,
             help="reqrec: path of the recording JSON file (rewritten atomically after every response)",
-        )
-        loader.add_option(
-            name=OPT_HOSTS,
-            typespec=str,
-            default="",
-            help="reqrec: comma-separated hosts to record (sub-domains included); empty = every host",
         )
 
     def configure(self, updated: Iterable[str]) -> None:
@@ -6808,14 +6834,7 @@ class ReqRecAddon:
                 self.out = value.strip()
             else:
                 self.out = self._init_out  # option at its default -> constructor value / DEFAULT_OUT
-        if OPT_HOSTS in updated:
-            value = self._option(OPT_HOSTS)
-            self.hosts = parse_hosts(str(value)) if value is not None else []
-            if not self.hosts:
-                self.hosts = list(self._init_hosts)
-        if updated & {OPT_OUT, OPT_HOSTS}:
-            scope = ", ".join(self.hosts) if self.hosts else "all hosts"
-            log.info("[reqrec] recording %s -> %s", scope, self.output_path)
+            log.info("[reqrec] recording -> %s", self.output_path)
 
     def _option(self, name: str) -> Any:
         """Read a mitmproxy option, or ``None`` when no master is running (plain Python use)."""
@@ -6865,15 +6884,11 @@ class ReqRecAddon:
     # ------------------------------------------------------------------ core
 
     def wants(self, flow: Any) -> bool:
-        """Should this flow be recorded?  HTTP only, host filter applied."""
+        """Should this flow be recorded?  Every HTTP flow."""
         if _mitm_http is not None and not isinstance(flow, _mitm_http.HTTPFlow):
             return False
         request = getattr(flow, "request", None)
-        if request is None or not hasattr(request, "method"):
-            return False
-        if not self.hosts:
-            return True
-        return host_matches(_host_of(request), self.hosts)
+        return request is not None and hasattr(request, "method")
 
     def _record(self, flow: Any, errored: bool) -> None:
         if not self.wants(flow):
@@ -6909,7 +6924,6 @@ class ReqRecAddon:
                 "source": "mitmproxy",
                 "started_at": self.started_at,
                 "updated_at": now_iso(),
-                "hosts": list(self.hosts),
                 "flows_total": len(ordered),
                 "errors": self.errors,
             }
@@ -6940,22 +6954,11 @@ class ReqRecAddon:
         return len(self._flows)
 
 
-def _host_of(request: Any) -> str:
-    for attr in ("pretty_host", "host"):
-        try:
-            host = getattr(request, attr)
-        except Exception:
-            continue
-        if host:
-            return str(host)
-    return ""
-
-
 addons = [ReqRecAddon()]
 
 
 # ===== former reqrec/recorder/run.py: the mitmdump command line =====
-# ``mitmdump -s reqrec.py --set reqrec_out=... [--set reqrec_hosts=...] -p PORT --listen-host 127.0.0.1``.
+# ``mitmdump -s reqrec.py --set reqrec_out=... -p PORT --listen-host 127.0.0.1``.
 # Contract: DESIGN.md §3.  The proxy only ever listens on this PC (:data:`RECORD_LISTEN_HOST`): its
 # only client is the recording browser started by the GUI.
 
@@ -6993,26 +6996,16 @@ def mitmdump_launcher() -> list[str]:
 
 # --------------------------------------------------------------------------- command line
 
-def build_command(
-    out: str,
-    port: int = 8080,
-    hosts: Union[None, str, Iterable[str]] = None,
-    extra_args: Sequence[str] = (),
-) -> list[str]:
+def build_command(out: str, port: int = 8080, extra_args: Sequence[str] = ()) -> list[str]:
     """Full ``mitmdump`` argument vector for a recording session.
 
     * ``out`` is made absolute (mitmdump's cwd is ours, but absolute paths survive ``--set`` quoting).
-    * ``hosts`` (list or comma-separated string) becomes ``--set reqrec_hosts=a,b``; omitted when empty
-      (= record every host).
     * mitmdump's own per-flow dump is off (``flow_detail=0``); the addon's one-line-per-recorded-flow
       log and mitmproxy warnings stay visible.
     * ``extra_args`` are appended verbatim (the GUI passes :data:`HTTPS_PASSTHROUGH_ARGS`).
     """
     cmd = mitmdump_launcher()
     cmd += ["-s", ADDON_PATH, "--set", f"reqrec_out={os.path.abspath(out)}"]
-    host_list = parse_hosts(hosts)
-    if host_list:
-        cmd += ["--set", "reqrec_hosts=" + ",".join(host_list)]
     cmd += ["-p", str(int(port)), "--listen-host", RECORD_LISTEN_HOST]
     cmd += ["--set", "flow_detail=0"]
     cmd += [str(a) for a in extra_args]
@@ -7088,8 +7081,8 @@ def count_flows_in_file(path: str, default: int = 0) -> int:
 class RecorderManager:
     """Lifecycle of one recording child process (see module docstring).
 
-    ``command_builder(out, port=..., hosts=[...])`` must return the argument
-    vector to run; it is called with the absolute output path.  ``popen`` is injectable too.
+    ``command_builder(out, port=...)`` (plus ``extra_args=[...]`` when there are any) must return the
+    argument vector to run; it is called with the absolute output path.  ``popen`` is injectable too.
     """
 
     def __init__(
@@ -7113,7 +7106,6 @@ class RecorderManager:
         self.command: list[str] = []
         self.out: Optional[str] = None
         self.port: Optional[int] = None
-        self.hosts: list[str] = []
         self.started_at: Optional[float] = None
         self.stopped_at: Optional[float] = None
         self.exit_code: Optional[int] = None
@@ -7127,13 +7119,7 @@ class RecorderManager:
 
     # ------------------------------------------------------------------ start
 
-    def start(
-        self,
-        out: str,
-        port: int = 8080,
-        hosts: Union[None, str, Iterable[str]] = None,
-        extra_args: Sequence[str] = (),
-    ) -> dict[str, Any]:
+    def start(self, out: str, port: int = 8080, extra_args: Sequence[str] = ()) -> dict[str, Any]:
         """Spawn the recording process; returns :meth:`status`.
 
         Raises :class:`RecorderError` when a session is already running, the output directory
@@ -7148,7 +7134,6 @@ class RecorderManager:
                 raise RecorderError(f"ポート番号が不正です: {port!r}") from None
             if not 1 <= port_int <= 65535:
                 raise RecorderError(f"ポート番号は 1〜65535 で指定してください: {port_int}")
-            host_list = parse_hosts(hosts)
             out_abs = os.path.abspath(out)
             try:
                 os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
@@ -7157,7 +7142,7 @@ class RecorderManager:
             kwargs: dict[str, Any] = {}
             if extra_args:
                 kwargs["extra_args"] = list(extra_args)
-            cmd = [str(c) for c in self.command_builder(out_abs, port=port_int, hosts=host_list, **kwargs)]
+            cmd = [str(c) for c in self.command_builder(out_abs, port=port_int, **kwargs)]
             popen_kwargs: dict[str, Any] = dict(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -7177,7 +7162,6 @@ class RecorderManager:
             self.command = cmd
             self.out = out_abs
             self.port = port_int
-            self.hosts = host_list
             self.started_at = time.time()
             self.stopped_at = None
             self.exit_code = None
@@ -7367,7 +7351,6 @@ class RecorderManager:
                 "started_at": self.started_at,
                 "stopped_at": self.stopped_at,
                 "port": self.port,
-                "hosts": list(self.hosts),
                 "stdout_tail": stdout_tail,
                 "stderr_tail": stderr_tail,
                 "error": error,
@@ -9529,11 +9512,6 @@ class AppState:
         self.last_script_name: Optional[str] = None
         self.recorder = recorder or RecorderManager()
         self.runner = runner or ScriptRunner()
-        self.record_append = False
-        #: Screen that started the running recording: ``"easy"`` (かんたん画面) or ``"advanced"``
-        #: (詳細設定); ``None`` when idle.  Only an easy-started recording may be stopped automatically
-        #: by the easy screen when its recording browser is closed (survives a page reload).
-        self.record_origin: Optional[str] = None
         #: Last ``iehost.launch`` failure of this session (e.g. the exe blocked by AppLocker), for the page.
         self.iehost_error: Optional[str] = None
         #: The in-app recording browser (``iehost.BrowserProcess``) of the current / last
@@ -9589,31 +9567,24 @@ class AppState:
 
     # ------------------------------------------------------------------ recording
 
-    def set_recording(self, recording: Recording, sources: list[str], append: bool) -> Recording:
-        """Replace or merge the current recording; invalidates the plan."""
+    def set_recording(self, recording: Recording, sources: list[str]) -> Recording:
+        """Replace the current recording.  A new recording starts over: the plan, the options of
+        詳細設定 (flow ids belong to one recording) and the current script are forgotten."""
         with self.lock:
-            if append and self.recording is not None and self.recording.flows:
-                merged = Recording.merge([self.recording, recording])
-                self.recording = merged
-                self.sources = list(self.sources) + [s for s in sources if s not in self.sources]
-            else:
-                self.recording = recording
-                self.sources = list(sources)
+            self.recording = recording
+            self.sources = list(sources)
             self.plan = None
-            return self.recording
-
-    def clear_recording(self) -> None:
-        with self.lock:
-            self.recording = None
-            self.sources = []
-            self.plan = None
+            self.plan_options = PlanOptions()
+            self.gen_options = GenOptions()
             self.last_code = None
             self.last_secrets = []
+            self.last_script_name = None
+            return self.recording
 
     def require_recording(self) -> Recording:
         with self.lock:
             if self.recording is None or not self.recording.flows:
-                raise ApiError("記録が読み込まれていません。先に「記録」または「読み込み」で記録ファイルを読み込んでください。", status=409)
+                raise ApiError("記録が読み込まれていません。かんたん画面で記録するか、HAR ファイルを読み込んでください。", status=409)
             return self.recording
 
     def recording_summary(self) -> dict[str, Any]:
@@ -9713,8 +9684,6 @@ bp = Blueprint("reqrec", __name__, root_path=os.path.dirname(os.path.abspath(__f
 
 #: Response / request bodies returned by ``/api/flow/<id>`` are cut here (characters).
 BODY_LIMIT = 200 * 1024
-#: Flow count is only computed for listed files up to this size (it means parsing the file).
-CHEAP_COUNT_MAX_BYTES = 3 * 1024 * 1024
 _GUI_FLOW_ID_RE = re.compile(r"^f\d{4,}$")
 
 #: Window title of the in-app recording browser (DESIGN.md §13.12); the host appends 「— 記録中」.
@@ -9731,8 +9700,6 @@ BROWSER_TITLE = "reqrec 記録用ブラウザ"
 HTTPS_PASSTHROUGH_ARGS = ("--ignore-hosts", ".*")
 #: Seconds ``record_start`` waits for mitmdump to accept connections before opening the recording browser.
 PROXY_READY_TIMEOUT = 20.0
-#: Accepted values of ``origin`` on ``POST /api/record/start``: the screen that started the recording.
-_ORIGINS = ("advanced", "easy")
 
 
 # --------------------------------------------------------------------------- helpers
@@ -9857,6 +9824,10 @@ def _plan_payload(state: AppState, plan: Plan) -> dict[str, Any]:
     report["plan_options"] = options_to_plain(state.plan_options)
     report["sources"] = list(state.sources)
     report["excluded_self_flows"] = int(recording.meta.get("excluded_self_flows", 0) or 0)
+    # plain Japanese for 詳細設定, split like the easy screen: 確認してください / お知らせ
+    actionable, notes = _split_warnings(list(plan.warnings))
+    report["warning_details"] = _warning_details(actionable)
+    report["note_details"] = _warning_details(notes)
     return report
 
 
@@ -9967,43 +9938,6 @@ def _script_name(raw: Any) -> str:
     return name
 
 
-def _file_entry_with_flows(entry: dict[str, Any]) -> dict[str, Any]:
-    out = {k: v for k, v in entry.items() if k != "path"}
-    out["flows"] = None
-    if entry["size"] <= CHEAP_COUNT_MAX_BYTES:  # list_files only returns .har / .json
-        try:
-            with open(entry["path"], "rb") as fh:
-                data = json.loads(fh.read().decode("utf-8-sig", errors="replace"))
-            if isinstance(data, dict):
-                if isinstance(data.get("flows"), list):
-                    out["flows"] = len(data["flows"])
-                elif isinstance(data.get("log"), dict) and isinstance(data["log"].get("entries"), list):
-                    out["flows"] = len(data["log"]["entries"])
-        except (OSError, ValueError):
-            out["flows"] = None
-    return out
-
-
-def _resolve_recording_name(state: AppState, item: Any) -> tuple[str, str]:
-    """``"x.har"`` / ``{"folder": "uploads", "name": "x.har"}`` -> ``(path, display name)``."""
-    folder: Optional[str] = None
-    name: Any = item
-    if isinstance(item, dict):
-        folder = item.get("folder")
-        name = item.get("name")
-    clean = safe_name(name, "記録ファイル名")
-    if os.path.splitext(clean)[1].lower() not in RECORDING_EXTENSIONS:
-        raise ApiError(f"対応していないファイル形式です: {clean} (対応: {', '.join(sorted(RECORDING_EXTENSIONS))})")
-    folders = [folder] if folder else ["recordings", "uploads"]
-    for sub in folders:
-        if sub not in ("recordings", "uploads"):
-            raise ApiError(f"不正なフォルダです: {sub}")
-        path = state.path_in(sub, clean, "記録ファイル名")
-        if os.path.isfile(path):
-            return path, f"{sub}/{clean}"
-    raise ApiError(f"ファイルが見つかりません: {clean}", status=404)
-
-
 def _iehost_info(state: AppState) -> dict[str, Any]:
     """``iehost.availability`` reduced to what the page / ``/api/state`` expose, plus the
     current 表示モード (preset name of the HKCU value, ``"default"`` when unset) and the last launch
@@ -10097,8 +10031,8 @@ def _forget_recording(state: AppState) -> None:
 def _abandon_start(state: AppState, out: str) -> None:
     """Undo a ``record_start`` that failed after mitmdump was spawned (proxy never listened, 表示モード
     or the recording browser failed): stop the recorder, delete the half-made file (normally absent:
-    no browser ever used the proxy) and forget it, so 詳細設定 does not report 「記録は保存されました」
-    and [記録停止] is not left enabled.  Does nothing when another recording owns the recorder by now."""
+    no browser ever used the proxy) and forget it.  Does nothing when another recording owns the
+    recorder by now."""
     with state.lock:
         current = getattr(state.recorder, "out", out)
         if current and os.path.abspath(current) != os.path.abspath(out):
@@ -10106,7 +10040,6 @@ def _abandon_start(state: AppState, out: str) -> None:
         state.recorder.stop()
         _remove_quietly(out)
         _forget_recording(state)
-        state.record_origin = None
 
 
 def _proxy_address(port: int) -> str:
@@ -10131,14 +10064,16 @@ def _launch_iehost(state: AppState, proxy_address: str, start_url: Optional[str]
     return proc
 
 
-def _apply_loaded(state: AppState, recording: Recording, sources: list[str], append: bool, from_gui_recorder: bool) -> dict[str, Any]:
+def _apply_loaded(state: AppState, recording: Recording, sources: list[str], from_gui_recorder: bool) -> dict[str, Any]:
+    """Load ``recording`` as the new current one; the summary also carries the (reset) options."""
     excluded = 0
     if from_gui_recorder:
         recording, excluded = exclude_netlocs(recording, gui_netlocs(state.host, state.port, flask_request.host))
-    state.set_recording(recording, sources, append)
+    state.set_recording(recording, sources)
     summary = state.recording_summary()
     summary["excluded_self"] = excluded
-    summary["appended"] = bool(append)
+    summary["plan_options"] = options_to_plain(state.plan_options)
+    summary["gen_options"] = options_to_plain(state.gen_options)
     return summary
 
 
@@ -10151,7 +10086,6 @@ def index() -> str:
         _GUI_TEMPLATE,
         token=state.token,
         version=__version__,
-        gui_address=f"{flask_request.host}",
         workdir=state.workdir,
         mitmproxy_available=mitmproxy_available(),
         iehost=_iehost_info(state),
@@ -10175,7 +10109,6 @@ def api_state() -> Response:
         "run": state.runner.status(),
         "iehost": _iehost_info(state),
         "browser": _browser_status(state),
-        "record_origin": state.record_origin,
         "last_script": state.last_script_name,
         "secrets": list(state.last_secrets),
     })
@@ -10189,28 +10122,15 @@ def record_start() -> Response:
 
     The proxy listens on ``127.0.0.1`` on a free port and tunnels every HTTPS connection untouched
     (:data:`HTTPS_PASSTHROUGH_ARGS`), so only ``http://`` is recorded and no certificate is needed.
-    Body (all optional): ``{"hosts": [...], "append": bool, "start_url": "...", "emulation": "keep" |
-    <preset>, "origin": "easy" | "advanced"}``.
+    Every site opened in the recording browser is recorded.
+    Body (all optional): ``{"start_url": "...", "emulation": "keep" | <preset>}``.
     """
     state = get_state()
     body = _json_body(required=False)
-    hosts_raw = body.get("hosts", [])
-    if isinstance(hosts_raw, str):
-        hosts = [h for h in re.split(r"[,\s;]+", hosts_raw) if h]
-    elif isinstance(hosts_raw, list):
-        hosts = [str(h).strip() for h in hosts_raw if str(h).strip()]
-    else:
-        raise ApiError("対象ホストは配列か文字列で指定してください")
-    append = _bool(body.get("append"), False)
     start_url = _iehost_start_url(body.get("start_url"))
     emulation = str(body.get("emulation") or "keep").strip().lower()
     if emulation != "keep" and emulation not in iehost.EMULATION_LEVELS:
         raise ApiError(f"表示モード (emulation) は keep / {' / '.join(iehost.EMULATION_LEVELS)} のいずれかで指定してください")
-    # which screen started it: only an easy-started recording is stopped automatically by the easy
-    # screen when its recording browser closes (kept on the server so a page reload knows it too)
-    origin = str(body.get("origin") or "advanced").strip().lower()
-    if origin not in _ORIGINS:
-        raise ApiError(f"origin は {' / '.join(_ORIGINS)} のどちらかで指定してください")
 
     if state.recorder.running:
         raise ApiError("すでに記録中です。先に [記録停止] を押してください。", status=409)
@@ -10230,11 +10150,9 @@ def record_start() -> Response:
     with state.lock:
         state.close_browser()  # a browser left over from an earlier session must not record into the new one
         try:
-            status = state.recorder.start(out, port=port, hosts=hosts, extra_args=list(HTTPS_PASSTHROUGH_ARGS))
+            status = state.recorder.start(out, port=port, extra_args=list(HTTPS_PASSTHROUGH_ARGS))
         except RecorderError as exc:
             raise ApiError(str(exc), status=400) from exc
-        state.record_append = append
-        state.record_origin = origin
     time.sleep(0.15)  # give an immediately failing child (port in use) the chance to report
     status = state.recorder.status()
     browser_result: Optional[dict[str, Any]] = None
@@ -10256,7 +10174,7 @@ def record_start() -> Response:
                 raise ApiError("記録用ブラウザを開く前に記録が止まりました。もう一度 [記録をはじめる] を押してください。", status=409)
             level = iehost.EMULATION_LEVELS.get(emulation)
             if emulation == "keep":
-                pass  # かんたん画面: whatever 表示モード was chosen in 詳細設定 stays; the registry is not touched
+                pass  # the 表示モード chosen earlier stays; the registry is not touched
             elif level is None:
                 # 既定 (IE7 相当): nothing to write.  Only a value left by an earlier non-default
                 # choice is removed, and failing to remove it never blocks the recording.
@@ -10286,7 +10204,6 @@ def record_start() -> Response:
         status=status,
         browser=browser_result,
         emulation=emulation,
-        origin=origin,
         warnings=warnings,
         self_excluded_hosts=sorted(gui_netlocs(state.host, state.port, flask_request.host)),
     )
@@ -10302,7 +10219,6 @@ def record_status() -> Response:
     status = state.recorder.status()
     status["mitmproxy_available"] = mitmproxy_available()
     status["browser"] = _browser_status(state)
-    status["origin"] = state.record_origin
     return jsonify(status)
 
 
@@ -10310,7 +10226,6 @@ def record_status() -> Response:
 def record_stop() -> Response:
     state = get_state()
     body = _json_body(required=False)
-    append = _bool(body.get("append"), state.record_append)
     discard = _bool(body.get("discard"), False)
     with state.lock:
         was_running = state.recorder.running
@@ -10321,11 +10236,9 @@ def record_stop() -> Response:
         had_browser = state.browser is not None
         browser_exit_code = state.close_browser(timeout=5.0)
         exit_code = state.recorder.stop()
-        state.record_origin = None
         if discard:
-            # [やめる]: nothing is loaded (the recording already loaded stays as it was) and the
-            # half-made file is removed so it does not show up in 「作業フォルダ内のファイル」; the
-            # recorder forgets it so 詳細設定 does not say 「記録は保存されました」 for a deleted file.
+            # [やめる]: nothing is loaded (the recording already loaded stays as it was), the
+            # half-made file is removed and the recorder forgets it.
             removed = _remove_quietly(state.recorder.out)
             _forget_recording(state)
             return _ok(discarded=True, removed=removed, exit_code=exit_code,
@@ -10357,7 +10270,7 @@ def record_stop() -> Response:
                 status=400, exit_code=exit_code, browser_exit_code=browser_exit_code,
                 out=os.path.basename(state.recorder.out or ""), empty=True,
             )
-        summary = _apply_loaded(state, recording, [f"recordings/{os.path.basename(state.recorder.out or '')}"], append, from_gui_recorder=True)
+        summary = _apply_loaded(state, recording, [f"recordings/{os.path.basename(state.recorder.out or '')}"], from_gui_recorder=True)
     summary.update(out=os.path.basename(state.recorder.out or ""), out_path=state.recorder.out, exit_code=exit_code,
                    browser_exit_code=browser_exit_code)
     return _ok(**summary)
@@ -10372,7 +10285,6 @@ def recordings_upload() -> Response:
     files = [f for f in files if f and f.filename]
     if not files:
         raise ApiError("ファイルが選択されていません (.har / .json)")
-    append = _bool(flask_request.form.get("append"), False)
     saved: list[str] = []
     display: list[str] = []
     for storage in files:
@@ -10387,48 +10299,11 @@ def recordings_upload() -> Response:
             raise ApiError(f"ファイルを保存できません: {exc}", status=500) from exc
         saved.append(target)
         display.append(f"uploads/{os.path.basename(target)}")
-    recording = load_sources(saved)
+    recording = load_sources(saved)  # several files (one HAR per tab) are merged by time stamp
     with state.lock:
-        summary = _apply_loaded(state, recording, display, append, from_gui_recorder=False)
+        summary = _apply_loaded(state, recording, display, from_gui_recorder=False)
     summary["saved"] = [os.path.basename(p) for p in saved]
     return _ok(**summary)
-
-
-@bp.get("/api/recordings")
-def recordings_list() -> Response:
-    state = get_state()
-    files = [_file_entry_with_flows(e) for sub in ("recordings", "uploads") for e in state.list_files(sub, RECORDING_EXTENSIONS)]
-    return jsonify({"files": files, "current": state.recording_summary()})
-
-
-@bp.post("/api/recordings/open")
-def recordings_open() -> Response:
-    state = get_state()
-    body = _json_body()
-    names = body.get("names")
-    if isinstance(names, (str, dict)):
-        names = [names]
-    if not isinstance(names, list) or not names:
-        raise ApiError("開くファイルを選択してください")
-    append = _bool(body.get("append"), False)
-    paths: list[str] = []
-    display: list[str] = []
-    for item in names:
-        path, label = _resolve_recording_name(state, item)
-        paths.append(path)
-        display.append(label)
-    recording = load_sources(paths)
-    from_recorder = all(label.startswith("recordings/") for label in display)
-    with state.lock:
-        summary = _apply_loaded(state, recording, display, append, from_gui_recorder=from_recorder)
-    return _ok(**summary)
-
-
-@bp.post("/api/recordings/clear")
-def recordings_clear() -> Response:
-    state = get_state()
-    state.clear_recording()
-    return _ok(recording=state.recording_summary())
 
 
 # --------------------------------------------------------------------------- analysis
@@ -10495,39 +10370,6 @@ def api_flow(flow_id: str) -> Response:
 
 # --------------------------------------------------------------------------- generation
 
-@bp.post("/api/generate")
-def api_generate() -> Response:
-    state = get_state()
-    body = _json_body(required=False)
-    plan_opts, gen_opts = _options_from_body(body)
-    with state.lock:
-        plan = _rebuild_plan(state, plan_opts)
-        try:
-            code = generate(plan, gen_opts)
-        except Exception as exc:
-            current_app.logger.exception("generate failed")
-            raise ApiError(f"コード生成に失敗しました: {exc}", status=500) from exc
-        state.gen_options = gen_opts
-        state.last_code = code
-        secrets = _secrets_of(plan)
-        state.last_secrets = secrets
-        recording = state.require_recording()
-        payload = {
-            "code": code,
-            "summary": format_plan_summary(plan, flows_total=len(recording.flows)),
-            "warnings": list(plan.warnings),
-            "secrets": secrets,
-            "env_vars": [s["env_var"] for s in secrets],
-            "steps": len(plan.steps),
-            "final_step_index": plan.final_step_index,
-            "auth": to_plain(plan.auth) if plan.auth is not None else None,
-            "suggested_name": _suggest_script_name(plan),
-            "plan_options": options_to_plain(plan_opts),
-            "gen_options": options_to_plain(gen_opts),
-        }
-    return jsonify(payload)
-
-
 def _suggest_script_name(plan: Plan) -> str:
     host = ""
     for step in plan.steps:
@@ -10577,7 +10419,7 @@ _WARNING_TRANSLATIONS: tuple[tuple[Any, Any], ...] = (
                 f"書き込まず、実行するときに入力します (環境変数 {m.group(3)})。")),
     (re.compile(r"recording has (\d+) steps; truncated to --max-steps (\d+) \((\d+) step\(s\) ignored\)", re.S),
      lambda m: (f"記録には {m.group(1)} 手順ありましたが、上限の {m.group(2)} 手順で打ち切りました "
-                f"(残りの {m.group(3)} 手順は使っていません)。詳細設定の「ステップ数の上限」で変えられます。")),
+                f"(残りの {m.group(3)} 手順は使っていません)。詳細設定の「手順の数の上限」で変えられます。")),
     (re.compile(r"(\d+) cookie\(s\) existed before the recording started \((.*)\); they are replayed as "
                 r"INITIAL_COOKIES and may have expired", re.S),
      lambda m: (f"記録を始める前からあった Cookie が {m.group(1)} 個あります ({m.group(2)})。スクリプトは"
@@ -10648,7 +10490,7 @@ def scripts_save() -> Response:
     if code is None:
         code = state.last_code
     if not isinstance(code, str) or not code.strip():
-        raise ApiError("保存するコードがありません。先に [生成] を押してください。")
+        raise ApiError("保存するコードがありません。")
     name = _script_name(body.get("name"))
     path = state.path_in("scripts", name, "スクリプト名")
     try:
@@ -10658,13 +10500,6 @@ def scripts_save() -> Response:
         raise ApiError(f"スクリプトを保存できません: {exc}", status=500) from exc
     state.last_script_name = name
     return _ok(name=name, path=path, size=os.path.getsize(path), download_url=f"/api/scripts/{name}/download")
-
-
-@bp.get("/api/scripts")
-def scripts_list() -> Response:
-    state = get_state()
-    files = [{k: v for k, v in e.items() if k != "path"} for e in state.list_files("scripts", {".py"})]
-    return jsonify({"files": files, "last": state.last_script_name})
 
 
 @bp.get("/api/scripts/<name>/download")
@@ -10781,12 +10616,14 @@ def folder_open() -> Response:
 
 @bp.post("/api/easy/build")
 def easy_build() -> Response:
-    """One shot for the easy mode: analyse the loaded recording with the current (or given)
-    options, generate the script and save it under ``scripts/``.
+    """Analyse the loaded recording with the current (or given) options, generate the script and
+    save it under ``scripts/``: the easy screen after a recording, and 詳細設定 [設定から作り直す]
+    (which passes the current script's ``name`` and its options, so the file is replaced).
 
     Body (all optional): ``{"name": "...", "plan_options": {...}, "gen_options": {...}}``.
-    Returns what the easy screen shows: file name / path / download URL, step count, the final
-    step's URL, warnings, the secrets the user must type before running, and the code itself.
+    Returns what both screens show: file name / path / download URL, step count, the final
+    step's URL, warnings, the secrets the user must type before running, the options used and the
+    code itself.
     """
     state = get_state()
     body = _json_body(required=False)
@@ -10854,6 +10691,8 @@ def easy_build() -> Response:
             "summary": format_plan_summary(plan, flows_total=len(recording.flows)),
             "code": code,
             "sources": list(state.sources),
+            "plan_options": options_to_plain(plan_opts),
+            "gen_options": options_to_plain(gen_opts),
         }
     return _ok(**payload)
 
@@ -11411,32 +11250,8 @@ button, input, select { font: inherit; color: inherit; }
 .status-bar.busy .status-dot { background: var(--primary); animation: pulse 1s infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
 
-.steps-nav {
-  display: flex; align-items: center; gap: .25rem;
-  padding: .25rem 1.25rem .6rem; overflow-x: auto;
-}
-.nav-step {
-  display: inline-flex; align-items: center; gap: .5rem;
-  padding: .4rem .9rem; border-radius: 999px;
-  border: 1px solid transparent; background: transparent; cursor: pointer;
-  color: var(--text-muted); font-weight: 600; white-space: nowrap;
-}
-.nav-step:hover { background: var(--surface-2); color: var(--text); }
-.nav-step.active { background: var(--primary-soft); color: var(--primary); border-color: #c7d9f6; }
-.nav-step.done .nav-num { background: var(--ok); }
-.nav-num {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 22px; height: 22px; border-radius: 50%;
-  background: var(--text-faint); color: #fff; font-size: .8rem; font-weight: 700;
-}
-.nav-step.active .nav-num { background: var(--primary); }
-.nav-badge { font-size: .75rem; background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 0 .5em; color: var(--text-muted); }
-.nav-arrow { color: var(--border-strong); }
-
 /* ------------------------------------------------------------------ layout */
 .content { max-width: 1400px; margin: 0 auto; padding: 1.25rem 1.25rem 3rem; }
-.panel { display: none; }
-.panel.active { display: block; animation: fade .15s ease-out; }
 @keyframes fade { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
 .panel-head { margin-bottom: 1rem; }
 .lead { color: var(--text-muted); margin: 0; max-width: 1100px; }
@@ -11493,30 +11308,10 @@ input:focus, select:focus, button:focus-visible { outline: 2px solid #8fb4f2; ou
 .kv dt { color: var(--text-muted); font-weight: 600; font-size: .88rem; }
 .kv dd { margin: 0; word-break: break-all; }
 
-/* ------------------------------------------------------------------ record panel */
-.rec-status { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .75rem 1rem; border-radius: 8px; background: var(--surface-2); border: 1px solid var(--border); }
-.rec-indicator { display: flex; align-items: center; gap: .5rem; font-weight: 700; }
-.rec-light { width: 12px; height: 12px; border-radius: 50%; background: var(--text-faint); }
-.rec-indicator.live .rec-light { background: var(--danger); animation: pulse 1.2s infinite; }
-.rec-indicator.live { color: var(--danger); }
-.rec-count { display: flex; align-items: baseline; gap: .4rem; }
-.rec-count-num { font-size: 2rem; font-weight: 800; color: var(--primary); font-variant-numeric: tabular-nums; }
-.rec-count-label { color: var(--text-muted); }
 details summary { cursor: pointer; color: var(--text-muted); font-size: .9rem; margin-top: .5rem; }
-
-/* ------------------------------------------------------------------ load panel */
-.dropzone {
-  position: relative; border: 2px dashed var(--border-strong); border-radius: var(--radius);
-  padding: 1.5rem 1rem; text-align: center; background: var(--surface-2); color: var(--text-muted);
-  margin-bottom: .75rem; transition: border-color .12s, background .12s;
-}
-.dropzone.over { border-color: var(--primary); background: var(--primary-soft); }
-.dropzone input[type=file] { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
-.dropzone p { margin: .2rem 0; pointer-events: none; }
 
 /* ------------------------------------------------------------------ tables */
 .table-wrap { overflow: auto; max-height: 62vh; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
-.table-wrap.short { max-height: 40vh; }
 table.data { width: 100%; border-collapse: separate; border-spacing: 0; font-size: .86rem; }
 table.data th, table.data td { padding: .42rem .55rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
 table.data thead th {
@@ -11567,8 +11362,6 @@ table.kv-table td { font-family: var(--mono); font-size: .8rem; word-break: brea
 .stat-label { font-size: .78rem; color: var(--text-muted); }
 .warnings { margin: .25rem 0 0; padding-left: 1.2rem; color: #5c3a00; font-size: .85rem; }
 .warnings li { margin-bottom: .2rem; }
-.env-list { margin: .25rem 0; padding-left: 1.2rem; }
-.summary-text { white-space: pre-wrap; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: .6rem .8rem; font-size: .88rem; margin-top: .75rem; }
 .auth-pill { display: inline-block; padding: .05em .5em; border-radius: 999px; background: var(--warn-soft); color: #5c3a00; border: 1px solid #f1d49a; font-weight: 700; font-size: .8rem; }
 
 /* ------------------------------------------------------------------ code / console */
@@ -11577,10 +11370,8 @@ pre.code, pre.console {
   font-family: var(--mono); font-size: .8rem; line-height: 1.5; tab-size: 4;
   background: #0f172a; color: #e2e8f0; max-height: 70vh; white-space: pre;
 }
-pre.code .placeholder { color: #94a3b8; font-style: italic; }
 pre.console { background: #111827; color: #d1d5db; min-height: 8rem; max-height: 40vh; white-space: pre-wrap; word-break: break-all; }
 pre.console.stderr { color: #fecaca; }
-pre.console.small { min-height: 3rem; max-height: 14rem; font-size: .75rem; }
 pre.code.body { max-height: 45vh; white-space: pre-wrap; word-break: break-all; background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
 .run-state { font-weight: 700; color: var(--text-muted); }
 .run-state.running { color: var(--primary); }
@@ -11619,18 +11410,14 @@ pre.code.body { max-height: 45vh; white-space: pre-wrap; word-break: break-all; 
   .content { padding: .75rem .75rem 2rem; }
   .form-grid { grid-template-columns: 1fr; }
   .form-grid > label { padding-top: 0; }
-  .nav-label { display: none; }
-  .nav-step.active .nav-label { display: inline; }
   .col-ref, th.col-ref { display: none; }
   .drawer { width: 100vw; }
 }
 
 /* ------------------------------------------------------------------ かんたん画面 (既定) */
 .mode-toggle { flex: none; white-space: nowrap; }
-#panel-easy { display: none; }
-body.easy-mode #panel-easy { display: block; animation: fade .15s ease-out; }
-body.easy-mode .steps-nav { display: none; }
-body.easy-mode .panel { display: none !important; }
+#panel-easy, #panel-detail { animation: fade .15s ease-out; }
+body.easy-mode #panel-detail, body:not(.easy-mode) #panel-easy { display: none; }
 body.easy-mode .content { max-width: 960px; }
 
 .easy-hero { text-align: center; margin: 1.25rem 0 1.5rem; }
@@ -11693,14 +11480,26 @@ body.easy-mode .content { max-width: 960px; }
 }
 .easy-loaded { display: flex; flex-wrap: wrap; gap: .5rem .75rem; align-items: center; justify-content: center; margin-top: 1rem; padding-top: .75rem; border-top: 1px dashed var(--border); }
 
-/* ------------------------------------------------------------------ 記録用ブラウザ (IE エンジン) */
-select.w-full { width: 100%; max-width: 100%; }
-#rec-emulation + .hint { margin-top: .25rem; }
 .easy-ready li.bad { color: #7a1e14; }
+#easy-emulation + .hint { margin-top: .25rem; }
+
+/* ------------------------------------------------------------------ 詳細設定 (スクリプトの詳細と変更) */
+.detail-settings h3:first-child { margin-top: 0; }
+textarea.code-editor {
+  display: block; width: 100%; height: 60vh; min-height: 18rem; resize: vertical; margin: .5rem 0 0;
+  padding: .75rem .9rem; border-radius: 8px; border: 1px solid #0f172a; overflow: auto;
+  font-family: var(--mono); font-size: .8rem; line-height: 1.5; tab-size: 4; white-space: pre;
+  background: #0f172a; color: #e2e8f0;
+}
+textarea.code-editor:focus { outline: 2px solid #8fb4f2; outline-offset: 1px; }
+textarea.code-editor[readonly] { opacity: .7; }
+.dirty-badge { color: var(--warn); font-weight: 700; font-size: .85rem; }
+#sum-notes-wrap { margin-bottom: 1rem; }
+.notes { margin: .25rem 0 0; padding-left: 1.2rem; font-size: .85rem; color: var(--text-muted); }
 {% endraw %}
 </style>
 </head>
-<body data-token="{{ token }}"
+<body class="easy-mode" data-token="{{ token }}"
       data-mitm-available="{{ 'true' if mitmproxy_available else 'false' }}"
       data-iehost-available="{{ 'true' if iehost and iehost.available else 'false' }}"
       data-iehost-reason="{{ (iehost.reason if iehost and iehost.reason else '') }}">
@@ -11715,20 +11514,9 @@ select.w-full { width: 100%; max-width: 100%; }
       <span class="status-dot"></span>
       <span id="status-text">準備完了。</span>
     </div>
-    <button type="button" id="mode-toggle" class="btn tiny ghost mode-toggle" title="フィルタ設定や通信の一覧など、細かい設定を表示します">詳細設定を表示</button>
+    <button type="button" id="mode-toggle" class="btn tiny ghost mode-toggle" title="かんたん画面で作ったスクリプトの中身を確認して、細かく変更します">詳細設定を表示</button>
     {% if logged_in %}<a href="/logout" id="logout-link" class="btn tiny ghost" title="ログアウトします">ログアウト</a>{% endif %}
   </div>
-  <nav class="steps-nav" id="nav" aria-label="作業の流れ">
-    <button type="button" class="nav-step active" data-panel="record"><span class="nav-num">1</span><span class="nav-label">記録</span><span class="nav-badge" id="badge-record" hidden></span></button>
-    <span class="nav-arrow" aria-hidden="true">→</span>
-    <button type="button" class="nav-step" data-panel="load"><span class="nav-num">2</span><span class="nav-label">読み込み</span><span class="nav-badge" id="badge-load" hidden></span></button>
-    <span class="nav-arrow" aria-hidden="true">→</span>
-    <button type="button" class="nav-step" data-panel="steps"><span class="nav-num">3</span><span class="nav-label">ステップ</span><span class="nav-badge" id="badge-steps" hidden></span></button>
-    <span class="nav-arrow" aria-hidden="true">→</span>
-    <button type="button" class="nav-step" data-panel="code"><span class="nav-num">4</span><span class="nav-label">コード</span><span class="nav-badge" id="badge-code" hidden></span></button>
-    <span class="nav-arrow" aria-hidden="true">→</span>
-    <button type="button" class="nav-step" data-panel="run"><span class="nav-num">5</span><span class="nav-label">実行</span><span class="nav-badge" id="badge-run" hidden></span></button>
-  </nav>
 </header>
 
 <main class="content">
@@ -11759,6 +11547,14 @@ select.w-full { width: 100%; max-width: 100%; }
         <label for="easy-url">開くサイトのアドレス <span class="hint">(任意)</span></label>
         <div><input id="easy-url" type="text" class="w-full" placeholder="例: http://kanri/  または  http://192.168.1.10/seisan/" autocomplete="url">
           <div class="hint">空欄のままでも構いません。開いたブラウザのアドレス欄にサイトのアドレスを入れて開けます。</div></div>
+        <label for="easy-emulation">表示モード</label>
+        <div><select id="easy-emulation" class="w-m">
+            <option value="default">既定 (IE7 互換表示)</option>
+            <option value="ie8">IE8 相当</option>
+            <option value="ie11">IE11 相当 (ページの指定に従う)</option>
+            <option value="ie11_force">IE11 強制</option>
+          </select>
+          <div class="hint">ふだんは「既定」のままで構いません。記録用ブラウザで画面が崩れるときだけ変えてください。既定以外を選ぶと、この記録用ブラウザだけに効く設定を Windows のユーザー設定 (レジストリの HKCU) に書き込みます。選んだモードは次回も使われます。</div></div>
       </div>
       <div class="easy-actions">
         <button type="button" id="easy-start" class="btn primary xl" {% if not (mitmproxy_available and iehost and iehost.available) %}disabled{% endif %}>● 記録をはじめる</button>
@@ -11767,6 +11563,11 @@ select.w-full { width: 100%; max-width: 100%; }
       <div class="easy-loaded" id="easy-loaded" hidden>
         <span class="hint">すでに読み込まれている記録があります:</span>
         <button type="button" id="easy-build-loaded" class="btn">読み込み済みの記録 (<span id="easy-loaded-count">0</span> 件) からスクリプトを作る</button>
+      </div>
+      <div class="easy-loaded" id="easy-har">
+        <span class="hint">IE の F12 開発者ツールで保存した HAR ファイルからも作れます:</span>
+        <button type="button" id="easy-har-pick" class="btn">HAR ファイルから作る…</button>
+        <input id="easy-har-input" type="file" multiple accept=".har,.json" hidden>
       </div>
     </div>
   </div>
@@ -11820,6 +11621,7 @@ select.w-full { width: 100%; max-width: 100%; }
         <a id="easy-download" class="btn primary" href="#" download>⬇ スクリプトをダウンロード</a>
         <button type="button" id="easy-open-folder" class="btn">保存先フォルダを開く</button>
         <button type="button" id="easy-test-run" class="btn">▶ 試しに実行する</button>
+        <button type="button" id="easy-open-detail" class="btn">詳細を見る・変更する</button>
         <button type="button" id="easy-again" class="btn ghost">もう一度記録する</button>
       </div>
     </div>
@@ -11847,209 +11649,60 @@ select.w-full { width: 100%; max-width: 100%; }
   <div class="notice error" id="easy-error" hidden></div>
 </section>
 
-<!-- ===================================================== 1 記録 -->
-<section id="panel-record" class="panel active" aria-labelledby="h-record">
+<!-- ===================================================== 詳細設定 (かんたん画面で作ったスクリプトの詳細と変更) -->
+<section id="panel-detail" aria-labelledby="h-detail">
   <div class="panel-head">
-    <h1 id="h-record">1. ブラウザの通信を記録する</h1>
-    <p class="lead">[記録開始] を押すと記録用ブラウザ (Edge の IE モードと同じエンジン) が開きます。その窓で普段どおりにサイトを操作すると、http:// の通信がすべて記録されます (https:// は記録しません)。別窓やダイアログで開いた画面も、記録用ブラウザのタブとして記録されます。操作が終わったら [記録停止して読み込む] を押します。<br>
-    すでに HAR ファイル (IE の F12 開発者ツールで保存した通信ログ) がある場合は、この手順を飛ばして「<a href="#" data-goto="load">2 読み込み</a>」へ進んでください。</p>
+    <h1 id="h-detail">スクリプトの詳細と変更</h1>
+    <p class="lead">かんたん画面で作ったスクリプトの中身を確認して、細かく変更できます。手順を使う・使わないや待ち時間などを変えて [設定から作り直す] を押すか、下のコードを直接書き換えて [保存] します。どちらも [試しに実行する] ですぐに確かめられます。新しく記録すると、ここの設定は最初の状態に戻ります。</p>
   </div>
 
-  {% if not mitmproxy_available %}
-  <div class="notice warn">
-    <strong>mitmproxy が見つかりません。</strong> 記録機能を使うには、コマンドプロンプト (ターミナル) で
-    <code>pip install "reqrec[record]"</code> を実行し、GUI を再起動してください。HAR ファイルの読み込みはそのまま使えます。
-  </div>
-  {% endif %}
-  {% if not (iehost and iehost.available) %}
-  <div class="notice warn" id="rec-unavailable">
-    <strong>記録用ブラウザ (IE エンジン) が使えないため、この PC では記録できません。</strong> {{ iehost.reason if iehost and iehost.reason else '' }}
-    HAR ファイルの読み込み以降はそのまま使えます。
-  </div>
-  {% endif %}
+  <div id="detail-empty" class="notice info">まだ記録がありません。右上の [かんたん画面に戻る] を押して記録するか、HAR ファイルを読み込むと、ここでスクリプトの中身を確認・変更できます。</div>
 
-  <div class="grid-2">
-    <div class="card">
-      <h2>記録の設定</h2>
-      <div class="form-grid">
-        <label for="rec-hosts">記録するサイト (ホスト名)</label>
-        <div><input id="rec-hosts" type="text" placeholder="例: example.co.jp, api.example.co.jp (空欄 = すべて記録)" class="w-full">
-          <div class="hint">カンマ区切りで複数指定できます。サブドメインも含めて記録されます。空欄なら開いたサイトをすべて記録します。</div></div>
-
-        <label>追加モード</label>
-        <div><label class="check"><input id="rec-append" type="checkbox"><span>停止したとき、すでに読み込んである記録に<strong>追加して結合</strong>する</span></label></div>
-
-        <label for="rec-start-url">最初に開くアドレス</label>
-        <div><input id="rec-start-url" type="text" class="w-full" placeholder="例: http://kanri/  (空欄なら空のページで開きます)" autocomplete="url"></div>
-
-        <label for="rec-emulation">表示モード (記録用ブラウザ)</label>
-        <div>
-          <select id="rec-emulation" class="w-full">
-            <option value="keep">変更しない (今の設定のまま)</option>
-            <option value="default">既定 (IE7 互換表示、レジストリに書き込まない)</option>
-            <option value="ie8">IE8 相当</option>
-            <option value="ie11">IE11 相当 (ページの指定に従う)</option>
-            <option value="ie11_force">IE11 強制</option>
-          </select>
-          <div class="hint">Edge の IE モードで表示が崩れないサイトは「既定」のままで構いません。既定以外は、この記録用ブラウザだけに効く設定をユーザーのレジストリ (HKCU) に書き込みます。選んだ表示モードは次回以降も (かんたん画面でも) そのまま使われます。</div>
-        </div>
-
-      </div>
-      <div class="actions">
-        <button type="button" id="btn-rec-start" class="btn primary" {% if not (mitmproxy_available and iehost and iehost.available) %}disabled{% endif %}>● 記録開始</button>
-        <button type="button" id="btn-rec-stop" class="btn danger" disabled>■ 記録停止して読み込む</button>
-      </div>
-      <p class="hint">※ この GUI 自身への通信 (<code>{{ gui_address }}</code>) は記録から自動的に除外されます。</p>
-    </div>
-
-    <div class="card">
-      <h2>記録の状態</h2>
-      <div class="rec-status">
-        <div class="rec-indicator" id="rec-indicator"><span class="rec-light"></span><span id="rec-state-text">停止中</span></div>
-        <div class="rec-count"><span class="rec-count-num" id="rec-flow-count">0</span><span class="rec-count-label">件のリクエストを記録</span></div>
-      </div>
-      <dl class="kv">
-        <dt>プロキシのアドレス</dt><dd id="rec-proxy-address">—</dd>
-        <dt>出力ファイル</dt><dd id="rec-out">—</dd>
-        <dt>記録用ブラウザ</dt><dd id="rec-browser-state">—</dd>
-      </dl>
-      <div id="rec-error" class="notice error" hidden></div>
-      <details>
-        <summary>プロキシのログを表示</summary>
-        <pre class="console small" id="rec-log"></pre>
-      </details>
-    </div>
-  </div>
-
-</section>
-
-<!-- ===================================================== 2 読み込み -->
-<section id="panel-load" class="panel" aria-labelledby="h-load">
-  <div class="panel-head">
-    <h1 id="h-load">2. 記録ファイルを読み込む</h1>
-    <p class="lead">「1 記録」で保存したファイルのほか、IE の F12 開発者ツール (IEChooser.exe で IE モードのタブを選ぶ → ネットワーク → 「HAR としてエクスポート」) で保存した <strong>.har</strong> も読み込めます。<br>
-    <strong>別タブで開いた画面</strong>を HAR で記録した場合はタブごとに HAR を保存し、複数ファイルをまとめて選ぶか「追加して結合」で読み込むと 1 つの流れとして扱えます。</p>
-  </div>
-
-  <div class="grid-2">
-    <div class="card">
-      <h2>ファイルを選んで読み込む</h2>
-      <div class="dropzone" id="dropzone">
-        <input id="file-input" type="file" multiple accept=".har,.json">
-        <p>ここにファイルをドラッグ＆ドロップするか、クリックして選択 (.har / .json、複数可)</p>
-        <p class="hint" id="file-chosen">ファイルが選ばれていません</p>
-      </div>
-      <label class="check"><input id="append-toggle" type="checkbox"><span><strong>追加して結合</strong>する (読み込み済みの記録を置き換えず、時刻順に結合します)</span></label>
-      <div class="actions">
-        <button type="button" id="btn-upload" class="btn primary" disabled>読み込む</button>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>現在読み込まれている記録</h2>
-      <dl class="kv">
-        <dt>ファイル</dt><dd id="cur-sources">(なし)</dd>
-        <dt>リクエスト数</dt><dd id="cur-flows">0</dd>
-        <dt>ホスト</dt><dd id="cur-hosts">—</dd>
-      </dl>
-      <div class="actions">
-        <button type="button" id="btn-goto-steps" class="btn primary" disabled>3 ステップへ進む →</button>
-        <button type="button" id="btn-clear" class="btn ghost" disabled>記録をクリア</button>
-      </div>
-    </div>
-  </div>
-
+  <div id="detail-body" hidden>
   <div class="card">
-    <h2>作業フォルダ内のファイルから開く</h2>
-    <p class="hint">作業フォルダ: <code>{{ workdir }}</code> — <code>recordings/</code> (この GUI で記録したもの) と <code>uploads/</code> (読み込んだファイル)</p>
-    <div class="table-wrap short">
-      <table class="data" id="files-table">
-        <thead><tr><th class="col-check"></th><th>ファイル名</th><th>フォルダ</th><th class="num">リクエスト数</th><th class="num">サイズ</th><th>更新日時</th></tr></thead>
-        <tbody><tr><td colspan="6" class="empty">読み込み中…</td></tr></tbody>
-      </table>
-    </div>
-    <div class="actions">
-      <button type="button" id="btn-open-selected" class="btn primary" disabled>選択したファイルを開く</button>
-      <button type="button" id="btn-refresh-files" class="btn ghost">一覧を更新</button>
-      <span class="hint">複数選ぶと結合して開きます。「追加して結合」にチェックがあれば現在の記録にも追加します。</span>
-    </div>
-  </div>
-</section>
-
-<!-- ===================================================== 3 ステップ -->
-<section id="panel-steps" class="panel" aria-labelledby="h-steps">
-  <div class="panel-head">
-    <h1 id="h-steps">3. スクリプトにするステップを選ぶ</h1>
-    <p class="lead">記録したリクエストを自動で解析し、画像や解析サービスなどの不要な通信を除外して「ステップ」にまとめます。表のチェックを外す/付けると採用・除外を手動で変えられます。「結果」の列で<strong>最終的に出力したい画面 (データ) のリクエスト</strong>を選べます。行をクリックすると内容を確認できます。</p>
-  </div>
-
-  <div id="steps-empty" class="notice info">記録が読み込まれていません。「<a href="#" data-goto="record">1 記録</a>」または「<a href="#" data-goto="load">2 読み込み</a>」で記録を読み込んでください。</div>
-
-  <div id="steps-body" hidden>
-  <div class="grid-2 steps-top">
-    <div class="card">
-      <h2>フィルタ設定 <span class="hint">(変更すると自動で再計算します)</span></h2>
-      <div class="opts">
-        <label class="check"><input type="checkbox" class="opt" data-opt="keep_static"><span>静的ファイル (画像 / CSS / JS / フォント) も残す</span></label>
-        <label class="check"><input type="checkbox" class="opt" data-opt="keep_trackers"><span>トラッカー / 解析サービスへの通信も残す</span></label>
-        <label class="check"><input type="checkbox" class="opt" data-opt="keep_all"><span>すべて残す (自動のノイズ除外を無効にする)</span></label>
-        <label class="check"><input type="checkbox" class="opt" data-opt="collapse_redirects" checked><span>リダイレクトを 1 つのステップに統合する</span></label>
-        <label class="check"><input type="checkbox" class="opt" data-opt="detect_loops" checked><span>ループ (ページ送りなど) を検出してまとめる</span></label>
-        <label class="check"><input type="checkbox" class="opt" data-opt="redact_secrets"><span>パスワードなどをスクリプトに書き込まず、実行するときに入力する (環境変数から読む)</span></label>
-        <label class="check"><input type="checkbox" class="opt" data-opt="detect_auth" checked><span>HTTP 認証 (Windows 統合認証 NTLM / Basic / Digest) のやり取りを検出して統合する</span></label>
-      </div>
-      <div class="form-grid compact">
-        <label for="opt-include-hosts">このホストだけ採用</label>
-        <div><input id="opt-include-hosts" type="text" class="opt-text w-full" data-opt="include_hosts" placeholder="例: example.co.jp (空欄 = 制限なし)"></div>
-        <label for="opt-exclude-hosts">このホストは除外</label>
-        <div><input id="opt-exclude-hosts" type="text" class="opt-text w-full" data-opt="exclude_hosts" placeholder="例: cdn.example.com, fonts.googleapis.com"></div>
-        <label for="opt-min-len">依存検出する値の最小文字数</label>
-        <div><input id="opt-min-len" type="number" min="1" value="4" class="opt-num w-s" data-opt="min_value_length"></div>
-        <label for="opt-max-steps">ステップ数の上限</label>
-        <div><input id="opt-max-steps" type="number" min="1" class="opt-num w-s" data-opt="max_steps" placeholder="なし"></div>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>解析結果</h2>
-      <div class="stats">
-        <div class="stat"><span class="stat-num" id="sum-steps">0</span><span class="stat-label">ステップ</span></div>
-        <div class="stat"><span class="stat-num" id="sum-kept">0</span><span class="stat-label">採用リクエスト</span></div>
-        <div class="stat"><span class="stat-num" id="sum-dropped">0</span><span class="stat-label">除外</span></div>
-        <div class="stat"><span class="stat-num" id="sum-vars">0</span><span class="stat-label">自動抽出する値</span></div>
-      </div>
-      <dl class="kv">
-        <dt>結果にするステップ</dt><dd id="sum-final">最後のステップ (既定)　<button type="button" id="btn-final-clear" class="btn tiny ghost" hidden>指定を解除</button></dd>
-        <dt>HTTP 認証</dt><dd id="sum-auth">検出されませんでした</dd>
-        <dt>定数 / 秘密情報</dt><dd id="sum-constants">なし</dd>
-        <dt>ループ</dt><dd id="sum-loops">なし</dd>
-        <dt>自動除外</dt><dd id="sum-self">—</dd>
-      </dl>
-      <div id="sum-warnings-wrap" hidden>
-        <h3>警告 <span class="hint">(生成されるスクリプトが期待どおり動かない可能性がある点)</span></h3>
-        <ul class="warnings" id="sum-warnings"></ul>
-      </div>
-    </div>
+    <dl class="kv">
+      <dt>スクリプト</dt><dd><code id="detail-script">(まだありません)</code></dd>
+      <dt>もとの記録</dt><dd id="detail-source">—</dd>
+    </dl>
   </div>
 
   <div class="card">
     <div class="table-toolbar">
-      <h2>リクエスト一覧 <span class="hint" id="table-count"></span></h2>
+      <h2>1. 手順の一覧 <span class="hint" id="table-count"></span></h2>
       <div class="toolbar-right">
         <input id="table-filter" type="search" placeholder="URL / ホスト / メソッドで絞り込み" class="w-l">
-        <label class="check"><input id="show-dropped" type="checkbox" checked><span>除外された行も表示</span></label>
-        <button type="button" id="btn-replan" class="btn ghost">再計算</button>
-        <button type="button" id="btn-goto-code" class="btn primary">4 コードへ進む →</button>
+        <label class="check"><input id="show-dropped" type="checkbox"><span>使わない通信も表示</span></label>
       </div>
     </div>
-    <p class="hint">☑ = スクリプトに採用　/　◉ 結果 = スクリプトの最後に出力するデータとして使うリクエスト　/　灰色の行 = 除外 (理由を「判定」列に表示)　/　行をクリック = リクエストとレスポンスの内容を表示</p>
+    <p class="hint">☑ = スクリプトに入れる　/　◉ 結果 = スクリプトの最後に表示する画面 (データ)　/　灰色の行 = 使わない通信 (理由は「判定」の列)　/　行をクリック = 送ったデータと受け取ったデータを表示</p>
+    <div class="stats">
+      <div class="stat"><span class="stat-num" id="sum-steps">0</span><span class="stat-label">手順</span></div>
+      <div class="stat"><span class="stat-num" id="sum-kept">0</span><span class="stat-label">使う通信</span></div>
+      <div class="stat"><span class="stat-num" id="sum-dropped">0</span><span class="stat-label">使わない通信</span></div>
+      <div class="stat"><span class="stat-num" id="sum-vars">0</span><span class="stat-label">自動で取り出す値</span></div>
+    </div>
+    <dl class="kv">
+      <dt>結果にする手順</dt><dd id="sum-final">最後の手順 (既定)　<button type="button" id="btn-final-clear" class="btn tiny ghost" hidden>指定を解除</button></dd>
+      <dt>HTTP 認証</dt><dd id="sum-auth">見つかりませんでした</dd>
+      <dt>定数 / 秘密情報</dt><dd id="sum-constants">なし</dd>
+      <dt>繰り返し</dt><dd id="sum-loops">なし</dd>
+      <dt>自動で外したもの</dt><dd id="sum-self">—</dd>
+    </dl>
+    <div id="sum-warnings-wrap" class="notice warn" hidden>
+      <strong>確認してください</strong>
+      <ul class="warnings" id="sum-warnings"></ul>
+    </div>
+    <details id="sum-notes-wrap" hidden>
+      <summary>お知らせ (スクリプトが自動で行うこと)</summary>
+      <ul class="notes" id="sum-notes"></ul>
+    </details>
     <div class="table-wrap">
       <table class="data flows">
         <thead>
           <tr>
-            <th class="col-check" title="チェック = スクリプトに採用">採用</th>
-            <th class="col-radio" title="最終結果として出力するリクエスト">結果</th>
-            <th class="col-step">ステップ</th>
+            <th class="col-check" title="チェック = スクリプトに入れる">使う</th>
+            <th class="col-radio" title="スクリプトの最後に結果を表示する通信">結果</th>
+            <th class="col-step">手順</th>
             <th class="col-method">メソッド</th>
             <th class="col-status">ステータス</th>
             <th class="col-type">種類</th>
@@ -12062,114 +11715,92 @@ select.w-full { width: 100%; max-width: 100%; }
       </table>
     </div>
   </div>
-  </div>
-</section>
 
-<!-- ===================================================== 4 コード -->
-<section id="panel-code" class="panel" aria-labelledby="h-code">
-  <div class="panel-head">
-    <h1 id="h-code">4. スクリプトを生成する</h1>
-    <p class="lead">選んだステップから、<code>requests</code> と <code>BeautifulSoup</code> だけで動く Python スクリプトを生成します。生成後に保存すると「5 実行」から実行でき、ダウンロードして別の PC で動かすこともできます (必要なもの: Python 3.8 以上と <code>pip install requests beautifulsoup4</code>)。</p>
-  </div>
-
-  <div class="grid-2">
-    <div class="card">
-      <h2>生成オプション</h2>
-      <div class="form-grid compact">
-        <label for="gopt-parser">HTML パーサー</label>
-        <div><select id="gopt-parser" class="gopt" data-gopt="html_parser"><option value="html.parser" selected>html.parser (標準・追加インストール不要)</option><option value="lxml">lxml (高速・pip install lxml が必要)</option></select></div>
-        <label for="gopt-delay">ステップ間の待ち時間 (秒)</label>
-        <div><input id="gopt-delay" type="number" min="0" step="0.1" value="0" class="gopt w-s" data-gopt="delay"> <span class="hint">サーバーに負荷をかけないための間隔</span></div>
-        <label for="gopt-timeout">タイムアウト (秒)</label>
-        <div><input id="gopt-timeout" type="number" min="1" step="1" value="30" class="gopt w-s" data-gopt="timeout"></div>
+  <div class="card">
+    <h2>2. 設定</h2>
+    <div class="grid-2 detail-settings">
+      <div>
+        <h3>手順の選び方 <span class="hint">(変えると上の一覧にすぐ反映されます)</span></h3>
+        <div class="opts">
+          <label class="check"><input type="checkbox" class="opt" data-opt="keep_static"><span>画像・CSS・JavaScript・フォントの通信も入れる</span></label>
+          <label class="check"><input type="checkbox" class="opt" data-opt="keep_trackers"><span>アクセス解析などの通信も入れる</span></label>
+          <label class="check"><input type="checkbox" class="opt" data-opt="keep_all"><span>自動で外すのをやめて、すべての通信を入れる</span></label>
+          <label class="check"><input type="checkbox" class="opt" data-opt="collapse_redirects" checked><span>転送 (リダイレクト) は 1 つの手順にまとめる</span></label>
+          <label class="check"><input type="checkbox" class="opt" data-opt="detect_loops" checked><span>同じ形の繰り返し (ページ送りなど) を見つけてまとめる</span></label>
+          <label class="check"><input type="checkbox" class="opt" data-opt="redact_secrets"><span>パスワードなどをスクリプトに書き込まず、実行するときに入力する (環境変数から読む)</span></label>
+          <label class="check"><input type="checkbox" class="opt" data-opt="detect_auth" checked><span>HTTP 認証 (Windows 統合認証 NTLM / Basic / Digest) のやり取りを見つけてまとめる</span></label>
+        </div>
+        <div class="form-grid compact">
+          <label for="opt-include-hosts">このホストだけ使う</label>
+          <div><input id="opt-include-hosts" type="text" class="opt-text w-full" data-opt="include_hosts" placeholder="例: kanri (空欄 = 制限なし)"></div>
+          <label for="opt-exclude-hosts">このホストは使わない</label>
+          <div><input id="opt-exclude-hosts" type="text" class="opt-text w-full" data-opt="exclude_hosts" placeholder="例: cdn.example.com, fonts.googleapis.com"></div>
+          <label for="opt-min-len">値を探す最小の文字数</label>
+          <div><input id="opt-min-len" type="number" min="1" value="4" class="opt-num w-s" data-opt="min_value_length"> <span class="hint">前の画面から受け取った値かどうかを調べる長さ</span></div>
+          <label for="opt-max-steps">手順の数の上限</label>
+          <div><input id="opt-max-steps" type="number" min="1" class="opt-num w-s" data-opt="max_steps" placeholder="なし"></div>
+        </div>
       </div>
-      <div class="opts">
-        <label class="check"><input type="checkbox" class="gopt" data-gopt="comments" checked><span>日本語の説明コメントを入れる</span></label>
-        <label class="check"><input type="checkbox" class="gopt" data-gopt="strict_status"><span>記録時と違うステータスコードが返ったらエラーにする (厳格モード)</span></label>
-      </div>
-      <div class="actions">
-        <button type="button" id="btn-generate" class="btn primary">⚙ 生成</button>
-      </div>
-      <div id="gen-summary" class="summary-text" hidden></div>
-      <div id="gen-warnings-wrap" hidden>
-        <h3>警告</h3>
-        <ul class="warnings" id="gen-warnings"></ul>
-      </div>
-      <div id="gen-secrets-wrap" hidden>
-        <h3>実行時に必要な環境変数</h3>
-        <p class="hint">パスワードなどはスクリプトに書き込まれません。「5 実行」で入力するか、実行前に環境変数として設定してください。</p>
-        <ul class="env-list" id="gen-secrets"></ul>
+      <div>
+        <h3>スクリプトの書き方</h3>
+        <div class="form-grid compact">
+          <label for="gopt-parser">HTML の読み取り方</label>
+          <div><select id="gopt-parser" class="gopt" data-gopt="html_parser"><option value="html.parser" selected>html.parser (標準・追加インストール不要)</option><option value="lxml">lxml (高速・pip install lxml が必要)</option></select></div>
+          <label for="gopt-delay">手順の間の待ち時間 (秒)</label>
+          <div><input id="gopt-delay" type="number" min="0" step="0.1" value="0" class="gopt w-s" data-gopt="delay"> <span class="hint">サーバーに負荷をかけないための間隔</span></div>
+          <label for="gopt-timeout">タイムアウト (秒)</label>
+          <div><input id="gopt-timeout" type="number" min="1" step="1" value="30" class="gopt w-s" data-gopt="timeout"></div>
+        </div>
+        <div class="opts">
+          <label class="check"><input type="checkbox" class="gopt" data-gopt="print_final" checked><span>最後の手順の結果を表示する (print)</span></label>
+          <label class="check"><input type="checkbox" class="gopt" data-gopt="comments" checked><span>日本語の説明コメントを入れる</span></label>
+          <label class="check"><input type="checkbox" class="gopt" data-gopt="strict_status"><span>記録したときと違うステータスコードが返ったらエラーにする (厳格モード)</span></label>
+        </div>
       </div>
     </div>
-
-    <div class="card">
-      <h2>保存</h2>
-      <div class="form-grid compact">
-        <label for="script-name">ファイル名</label>
-        <div><div class="input-suffix"><input id="script-name" type="text" placeholder="scrape_example" class="w-m"><span>.py</span></div>
-          <div class="hint">保存先: <code>{{ workdir }}/scripts/</code></div></div>
-      </div>
-      <div class="actions">
-        <button type="button" id="btn-save" class="btn primary" disabled>保存</button>
-        <a id="btn-download" class="btn disabled" href="#" download aria-disabled="true">ダウンロード</a>
-        <button type="button" id="btn-goto-run" class="btn ghost" disabled>5 実行へ進む →</button>
-      </div>
-      <p class="hint" id="save-result"></p>
+    <div class="notice info" id="regen-note" hidden>設定を変えました。[設定から作り直す] を押すと、コードに反映されます。</div>
+    <div class="actions">
+      <button type="button" id="btn-regenerate" class="btn primary" disabled>⚙ 設定から作り直す</button>
+      <span class="hint" id="regen-hint"></span>
     </div>
   </div>
 
   <div class="card">
-    <h2>生成されたコード <span class="hint" id="code-lines"></span></h2>
-    <pre class="code" id="code-preview"><span class="placeholder">(「生成」を押すとここにスクリプトが表示されます)</span></pre>
-  </div>
-</section>
-
-<!-- ===================================================== 5 実行 -->
-<section id="panel-run" class="panel" aria-labelledby="h-run">
-  <div class="panel-head">
-    <h1 id="h-run">5. スクリプトを実行する</h1>
-    <p class="lead">保存したスクリプトをこの PC の Python で実行し、出力をここに表示します。パスワードなどの秘密情報は入力欄から<strong>実行するプロセスにだけ</strong>渡され、ファイルには保存されません。</p>
-  </div>
-
-  <div class="grid-2">
-    <div class="card">
-      <h2>実行するスクリプト</h2>
-      <div class="form-grid compact">
-        <label for="run-script">スクリプト</label>
-        <div><select id="run-script" class="w-full"></select> <button type="button" id="btn-refresh-scripts" class="btn tiny ghost">一覧を更新</button></div>
-      </div>
-      <h3>環境変数 (秘密情報)</h3>
-      <div id="env-inputs" class="form-grid compact"><p class="hint">生成したスクリプトに秘密情報がなければ入力は不要です。</p></div>
-      <div class="actions">
-        <button type="button" id="btn-run" class="btn primary">▶ 実行</button>
-        <button type="button" id="btn-run-stop" class="btn danger" disabled>■ 停止</button>
-        <span id="run-state" class="run-state">待機中</span>
-      </div>
+    <div class="table-toolbar">
+      <h2>3. コード <span class="hint" id="code-lines"></span></h2>
+      <span class="dirty-badge" id="code-dirty" hidden>● 保存していない変更があります</span>
     </div>
-
-    <div class="card">
-      <h2>結果を保存</h2>
-      <p class="hint">最後に実行したときの標準出力 (スクリプトが print したもの) をファイルに保存します。保存先: <code>{{ workdir }}/outputs/</code></p>
-      <div class="form-grid compact">
-        <label for="output-name">ファイル名</label>
-        <div><input id="output-name" type="text" placeholder="output.txt" class="w-m"></div>
-      </div>
-      <div class="actions">
-        <button type="button" id="btn-save-output" class="btn" disabled>結果を保存</button>
-      </div>
-      <p class="hint" id="save-output-result"></p>
+    <p class="hint">ここで直接書き換えられます (Tab キーで空白 4 つ、Ctrl+S で保存)。</p>
+    <textarea id="code-editor" class="code-editor" spellcheck="false" wrap="off" autocomplete="off" autocapitalize="off" aria-label="スクリプトのコード" readonly placeholder="(スクリプトを作ると、ここにコードが表示されます)"></textarea>
+    <div class="actions">
+      <label for="script-name" class="hint">ファイル名</label>
+      <div class="input-suffix"><input id="script-name" type="text" class="w-m" placeholder="scrape_example" disabled><span>.py</span></div>
+      <button type="button" id="btn-save" class="btn primary" disabled>保存</button>
+      <button type="button" id="btn-revert" class="btn ghost" disabled>保存した内容に戻す</button>
+      <button type="button" id="btn-download" class="btn" disabled>⬇ ダウンロード</button>
     </div>
+    <p class="hint" id="save-result">保存先: <code>{{ workdir }}/scripts/</code></p>
   </div>
 
-  <div class="grid-2">
-    <div class="card">
-      <h2>標準出力</h2>
-      <pre class="console" id="run-stdout"></pre>
+  <div class="card" id="detail-run">
+    <h2>4. 試しに実行する</h2>
+    <div id="detail-env" class="form-grid compact"></div>
+    <div class="actions">
+      <button type="button" id="detail-run-btn" class="btn primary" disabled>▶ 試しに実行する</button>
+      <button type="button" id="detail-run-stop" class="btn danger" disabled>■ 停止</button>
+      <span id="detail-run-state" class="run-state">待機中</span>
+      <button type="button" id="detail-save-output" class="btn" disabled>結果をファイルに保存</button>
     </div>
-    <div class="card">
-      <h2>標準エラー (エラーメッセージ)</h2>
-      <pre class="console stderr" id="run-stderr"></pre>
-    </div>
+    <p class="hint">保存していない変更があるときは、保存してから実行します。</p>
+    <p class="hint" id="detail-save-output-result"></p>
+    <div class="notice error" id="detail-run-hint" hidden></div>
+    <h3>結果 (スクリプトの出力)</h3>
+    <pre class="console" id="detail-run-out"></pre>
+    <details id="detail-run-err-wrap" hidden>
+      <summary>エラーメッセージを表示</summary>
+      <pre class="console stderr" id="detail-run-err"></pre>
+    </details>
+  </div>
   </div>
 </section>
 
@@ -12214,7 +11845,7 @@ select.w-full { width: 100%; max-width: 100%; }
 // ===== former reqrec/webapp/static/app.js =====
 /* reqrec GUI — vanilla JS, no build step, no external resources.
  *
- * Structure:  api()  ->  per-panel modules (Record / Load / Steps / Code / Run)  ->  render functions.
+ * Structure:  api()  ->  modules (Steps / Drawer / Run / Detail = 詳細設定 / Easy = かんたん画面)  ->  render functions.
  * Every piece of recorded content is inserted with textContent (never innerHTML): recordings are
  * attacker-controlled data.
  */
@@ -12286,12 +11917,6 @@ select.w-full { width: 100%; max-width: 100%; }
     if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
     return (n / 1024 / 1024).toFixed(1) + ' MB';
   }
-  function fmtTime(ts) {
-    if (!ts) return '—';
-    const d = new Date(ts * 1000);
-    const p = (x) => String(x).padStart(2, '0');
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-  }
   function debounce(fn, ms) {
     let timer = null;
     return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), ms); };
@@ -12300,269 +11925,42 @@ select.w-full { width: 100%; max-width: 100%; }
     return (text || '').split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean);
   }
 
-  // ------------------------------------------------------------------ navigation
-  const panels = {};
-  $$('.panel').forEach((p) => { panels[p.id.replace('panel-', '')] = p; });
-  function show(name) {
-    Object.entries(panels).forEach(([k, p]) => p.classList.toggle('active', k === name));
-    $$('.nav-step').forEach((b) => b.classList.toggle('active', b.dataset.panel === name));
-    try { localStorage.setItem('reqrec.panel', name); } catch (e) { /* ignore */ }
-    window.scrollTo({ top: 0 });
-  }
-  $$('.nav-step').forEach((b) => b.addEventListener('click', () => show(b.dataset.panel)));
-  document.addEventListener('click', (ev) => {
-    const link = ev.target.closest('[data-goto]');
-    if (link) { ev.preventDefault(); show(link.dataset.goto); }
-  });
-  function markDone(name, done, badge) {
-    const btn = $(`.nav-step[data-panel="${name}"]`);
-    if (btn) btn.classList.toggle('done', !!done);
-    const b = $(`#badge-${name}`);
-    if (b) { if (badge) { b.textContent = badge; b.hidden = false; } else { b.hidden = true; } }
-  }
-
   // ------------------------------------------------------------------ shared state
   const S = {
-    recording: null,     // summary from the server
-    plan: null,          // last /api/plan payload
+    recording: null,      // summary of the loaded recording (from the server)
+    plan: null,           // last /api/plan payload
     flows: [],
     exclude: new Set(),
     include: new Set(),
     finalFlowId: null,
-    code: null,
-    secrets: [],
-    savedScript: null,
+    secrets: [],          // values the current script reads from environment variables
+    script: null,         // the current script (a file in scripts/): made on the easy screen, changed in 詳細設定
+    savedCode: null,      // its content as saved
+    generatedCode: null,  // the code as last generated; the editor differs = changed by hand (null = unknown)
     runPoll: null,
     recPoll: null,
   };
+  const scriptUrl = (name) => '/api/scripts/' + encodeURIComponent(name) + '/download';
+  // The plain-Japanese text of each plan warning comes from the server (routes.warning_message,
+  // tested against the warnings build_plan really produces); the raw text is the fallback.
+  function warningTexts(details, raw) {
+    if (Array.isArray(details)) return details.map((d) => d.message || d.text);
+    return raw || [];
+  }
 
-  // ================================================================== 1 記録
-  const Record = (() => {
-    const btnStart = $('#btn-rec-start');
-    const btnStop = $('#btn-rec-stop');
-    const indicator = $('#rec-indicator');
-    const stateText = $('#rec-state-text');
-    const countEl = $('#rec-flow-count');
-    const errEl = $('#rec-error');
-    const logEl = $('#rec-log');
+  // ------------------------------------------------------------------ screens
+  // かんたん画面 (既定) と 詳細設定 (かんたん画面で作ったスクリプトの中身を確認して、細かく変更する画面)
+  const toggleBtn = $('#mode-toggle');
+  function setMode(mode, persist = true) {
+    const easy = mode !== 'advanced';
+    body.classList.toggle('easy-mode', easy);
+    toggleBtn.textContent = easy ? '詳細設定を表示' : 'かんたん画面に戻る';
+    if (persist) { try { localStorage.setItem('reqrec.mode', easy ? 'easy' : 'advanced'); } catch (e) { /* ignore */ } }
+    window.scrollTo({ top: 0 });
+  }
+  toggleBtn.addEventListener('click', () => setMode(body.classList.contains('easy-mode') ? 'advanced' : 'easy'));
 
-    // 記録は常にアプリ内の記録用ブラウザ (IE エンジン, DESIGN.md §13.12) で行う
-    const IEHOST_AVAILABLE = body.dataset.iehostAvailable === 'true';
-    const CAN_RECORD = IEHOST_AVAILABLE && body.dataset.mitmAvailable === 'true';
-    function setEmulation(name) {  // the select starts at the 表示モード currently in the registry
-      const sel = $('#rec-emulation');
-      if (sel && name && sel.querySelector(`option[value="${name}"]`)) sel.value = name;
-      else if (sel && name === 'custom') sel.value = 'keep';
-    }
-
-    const listeners = [];
-    function subscribe(fn) { listeners.push(fn); }
-    function renderBrowser(b) {
-      const node = $('#rec-browser-state');
-      if (!node) return;
-      if (!b || !b.kind) node.textContent = '—';
-      else if (b.running) node.textContent = `起動中 (PID ${b.pid})`;
-      else node.textContent = '閉じられました' + (b.exit_code === null || b.exit_code === undefined ? '' : ` (終了コード ${b.exit_code})`);
-    }
-    function render(st) {
-      listeners.forEach((fn) => { try { fn(st); } catch (e) { console.error(e); } });
-      const running = !!st.running;
-      indicator.classList.toggle('live', running);
-      // ``out`` is cleared by the server when a recording is discarded or never really started
-      // (RecorderManager.forget); a child that died on its own keeps ``out`` but reports ``error``.
-      stateText.textContent = running ? '記録中…（ブラウザを操作してください）' : (st.out && !st.error ? '停止中（記録は保存されました）' : '停止中');
-      countEl.textContent = st.flows ?? 0;
-      $('#rec-out').textContent = st.out || '—';
-      if (st.browser !== undefined) renderBrowser(st.browser);
-      if (st.running && st.browser && st.browser.kind === 'iehost' && !st.browser.running && !body.classList.contains('easy-mode')) {
-        setStatus('記録用ブラウザが閉じられました。[記録停止して読み込む] を押すと記録が読み込まれます。', 'info');
-      }
-      if (st.port) $('#rec-proxy-address').textContent = `127.0.0.1:${st.port}`;
-      btnStart.disabled = running || !CAN_RECORD;
-      btnStop.disabled = !running && !st.out;
-      const log = [st.stdout_tail, st.stderr_tail].filter(Boolean).join('\n');
-      logEl.textContent = log;
-      if (st.error) { errEl.textContent = st.error; errEl.hidden = false; } else { errEl.hidden = true; }
-      markDone('record', !!st.out && !running, running ? `${st.flows ?? 0} 件` : null);
-      if (running && !S.recPoll) startPolling();
-      if (!running && S.recPoll) stopPolling();
-    }
-    async function poll() {
-      try { render(await api('/api/record/status')); } catch (e) { /* transient */ }
-    }
-    function startPolling() { if (!S.recPoll) S.recPoll = setInterval(poll, 1000); }
-    function stopPolling() { clearInterval(S.recPoll); S.recPoll = null; }
-
-    btnStart.addEventListener('click', async () => {
-      btnStart.disabled = true;
-      setStatus('記録プロキシと記録用ブラウザを起動しています…（初回は数秒かかります）', 'busy');
-      try {
-        const res = await api('/api/record/start', { method: 'POST', json: {
-          hosts: splitHosts($('#rec-hosts').value),
-          append: $('#rec-append').checked,
-          start_url: $('#rec-start-url').value.trim(),
-          emulation: $('#rec-emulation').value,
-          origin: 'advanced',  // never stopped automatically by the easy screen
-        } });
-        $('#rec-proxy-address').textContent = res.proxy_address || '';
-        render(res.status || { running: true, flows: 0, out: res.out });
-        renderBrowser(res.browser);
-        if (res.status && res.status.error) {
-          setStatus('記録プロキシが起動できませんでした: ' + res.status.error, 'error');
-        } else {
-          setStatus('記録を開始しました。開いた記録用ブラウザでサイトを操作してください (http:// のページだけが記録されます)。', 'ok');
-        }
-      } catch (e) {
-        btnStart.disabled = !CAN_RECORD;
-        fail(e, '記録を開始できません');
-      }
-    });
-
-    btnStop.addEventListener('click', async () => {
-      btnStop.disabled = true;
-      setStatus('記録を停止して読み込んでいます…', 'busy');
-      try {
-        const res = await api('/api/record/stop', { method: 'POST', json: { append: $('#rec-append').checked } });
-        stopPolling();
-        await poll();
-        Load.applySummary(res);
-        let msg = `記録を読み込みました: ${res.flows} 件のリクエスト (${res.out})`;
-        if (res.excluded_self) msg += `。GUI 自身への通信 ${res.excluded_self} 件は自動的に除外しました`;
-        setStatus(msg, 'ok');
-        Load.refreshFiles();
-        show('steps');
-        Steps.resetOverrides();
-        Steps.replan();
-      } catch (e) {
-        stopPolling();
-        await poll();
-        fail(e, '記録を停止できません');
-      }
-    });
-
-    return { render, poll, startPolling, subscribe, setEmulation };
-  })();
-
-  // ================================================================== 2 読み込み
-  const Load = (() => {
-    const fileInput = $('#file-input');
-    const dropzone = $('#dropzone');
-    const btnUpload = $('#btn-upload');
-    const filesTbody = $('#files-table tbody');
-    const btnOpen = $('#btn-open-selected');
-
-    function describeFiles() {
-      const files = Array.from(fileInput.files || []);
-      $('#file-chosen').textContent = files.length ? files.map((f) => `${f.name} (${fmtBytes(f.size)})`).join(', ') : 'ファイルが選ばれていません';
-      btnUpload.disabled = files.length === 0;
-    }
-    fileInput.addEventListener('change', describeFiles);
-    ['dragenter', 'dragover'].forEach((t) => dropzone.addEventListener(t, (e) => { e.preventDefault(); dropzone.classList.add('over'); }));
-    ['dragleave', 'drop'].forEach((t) => dropzone.addEventListener(t, (e) => { e.preventDefault(); dropzone.classList.remove('over'); }));
-    dropzone.addEventListener('drop', (e) => {
-      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
-        fileInput.files = e.dataTransfer.files;
-        describeFiles();
-      }
-    });
-
-    function applySummary(sum) {
-      S.recording = sum;
-      const loaded = !!(sum && sum.loaded && sum.flows);
-      $('#cur-sources').textContent = loaded && sum.sources && sum.sources.length ? sum.sources.join(', ') : '(なし)';
-      $('#cur-flows').textContent = loaded ? `${sum.flows} 件` : '0';
-      $('#cur-hosts').textContent = loaded && sum.hosts && sum.hosts.length ? sum.hosts.join(', ') : '—';
-      $('#btn-goto-steps').disabled = !loaded;
-      $('#btn-clear').disabled = !loaded;
-      $('#steps-empty').hidden = loaded;
-      $('#steps-body').hidden = !loaded;
-      markDone('load', loaded, loaded ? `${sum.flows} 件` : null);
-      if (!loaded) { Steps.clearTable(); markDone('steps', false, null); }
-      if (typeof Easy !== 'undefined' && Easy.refreshLoaded) Easy.refreshLoaded();
-    }
-
-    async function upload() {
-      const files = Array.from(fileInput.files || []);
-      if (!files.length) return;
-      const form = new FormData();
-      files.forEach((f) => form.append('files', f, f.name));
-      form.append('append', $('#append-toggle').checked ? 'true' : 'false');
-      btnUpload.disabled = true;
-      setStatus(`${files.length} 個のファイルを読み込んでいます…`, 'busy');
-      try {
-        const res = await api('/api/recordings/upload', { method: 'POST', form });
-        applySummary(res);
-        setStatus(`読み込みました: ${res.flows} 件のリクエスト` + (res.appended ? '（結合済み）' : ''), 'ok');
-        fileInput.value = '';
-        describeFiles();
-        refreshFiles();
-        show('steps');
-        Steps.resetOverrides();
-        Steps.replan();
-      } catch (e) {
-        btnUpload.disabled = false;
-        fail(e, '読み込みに失敗しました');
-      }
-    }
-    btnUpload.addEventListener('click', upload);
-
-    async function refreshFiles() {
-      try {
-        const res = await api('/api/recordings');
-        clear(filesTbody);
-        if (!res.files.length) {
-          filesTbody.appendChild(el('tr', {}, el('td', { colspan: 6, class: 'empty', text: '作業フォルダに記録ファイルはまだありません' })));
-        }
-        res.files.forEach((f) => {
-          const cb = el('input', { type: 'checkbox', dataset: { folder: f.folder, name: f.name } });
-          cb.addEventListener('change', updateOpenButton);
-          filesTbody.appendChild(el('tr', {}, [
-            el('td', { class: 'col-check' }, cb),
-            el('td', { text: f.name }),
-            el('td', { text: f.folder === 'recordings' ? 'recordings (この GUI で記録)' : 'uploads (読み込み)' }),
-            el('td', { class: 'num', text: f.flows === null || f.flows === undefined ? '—' : String(f.flows) }),
-            el('td', { class: 'num', text: fmtBytes(f.size) }),
-            el('td', { text: fmtTime(f.mtime) }),
-          ]));
-        });
-        updateOpenButton();
-      } catch (e) { fail(e, 'ファイル一覧を取得できません'); }
-    }
-    function selectedFiles() {
-      return $$('input[type=checkbox]:checked', filesTbody).map((cb) => ({ folder: cb.dataset.folder, name: cb.dataset.name }));
-    }
-    function updateOpenButton() { btnOpen.disabled = selectedFiles().length === 0; }
-    btnOpen.addEventListener('click', async () => {
-      const names = selectedFiles();
-      if (!names.length) return;
-      setStatus('ファイルを開いています…', 'busy');
-      try {
-        const res = await api('/api/recordings/open', { method: 'POST', json: { names, append: $('#append-toggle').checked } });
-        applySummary(res);
-        let msg = `開きました: ${res.flows} 件のリクエスト`;
-        if (res.excluded_self) msg += `（GUI 自身への通信 ${res.excluded_self} 件を自動除外）`;
-        setStatus(msg, 'ok');
-        show('steps');
-        Steps.resetOverrides();
-        Steps.replan();
-      } catch (e) { fail(e, 'ファイルを開けません'); }
-    });
-    $('#btn-refresh-files').addEventListener('click', refreshFiles);
-    $('#btn-goto-steps').addEventListener('click', () => { show('steps'); if (!S.plan) Steps.replan(); });
-    $('#btn-clear').addEventListener('click', async () => {
-      try {
-        const res = await api('/api/recordings/clear', { method: 'POST', json: {} });
-        applySummary(res.recording);
-        S.plan = null;
-        Steps.resetOverrides();
-        setStatus('記録をクリアしました', 'ok');
-      } catch (e) { fail(e); }
-    });
-
-    return { applySummary, refreshFiles };
-  })();
-
-  // ================================================================== 3 ステップ
+  // ================================================================== 詳細設定: 手順の一覧と設定
   const Steps = (() => {
     const tbody = $('#flow-tbody');
     const REASONS = [
@@ -12577,7 +11975,7 @@ select.w-full { width: 100%; max-width: 100%; }
       ['host excluded', '除外ホスト'],
       ['host not in', '対象ホスト外'],
       ['auth', '認証ハンドシェイク (統合済み)'],
-      ['not used', '使用されず (他ステップに統合 / 上限超過)'],
+      ['not used', '使用されず (他の手順に統合 / 上限超過)'],
     ];
     function reasonLabel(reason) {
       if (!reason) return '';
@@ -12622,12 +12020,33 @@ select.w-full { width: 100%; max-width: 100%; }
       });
       return g;
     }
+    // the form shows the options the server used (a new recording starts again from the defaults)
+    function fillOptions(planOpts, genOpts) {
+      const p = planOpts || {};
+      $$('input.opt[type=checkbox]').forEach((cb) => { if (typeof p[cb.dataset.opt] === 'boolean') cb.checked = p[cb.dataset.opt]; });
+      $('#opt-include-hosts').value = (p.include_hosts || []).join(', ');
+      $('#opt-exclude-hosts').value = (p.exclude_hosts || []).join(', ');
+      if (p.min_value_length) $('#opt-min-len').value = p.min_value_length;
+      $('#opt-max-steps').value = p.max_steps || '';
+      S.exclude = new Set(p.exclude_flow_ids || []);
+      S.include = new Set(p.include_flow_ids || []);
+      S.finalFlowId = p.final_flow_id || null;
+      const g = genOpts || {};
+      $$('.gopt').forEach((n) => {
+        const v = g[n.dataset.gopt];
+        if (v === undefined || v === null) return;
+        if (n.type === 'checkbox') n.checked = !!v; else n.value = String(v);
+      });
+      setChanged(false);
+    }
+    // The code is rebuilt only by [設定から作り直す]: rebuilding on every change would throw away hand edits.
+    function setChanged(on) { $('#regen-note').hidden = !(on && S.script); }
 
     let inflight = 0;
-    async function replan() {
+    async function replan(quiet = false) {
       if (!S.recording || !S.recording.loaded) return;
       const my = ++inflight;
-      setStatus('解析しています…', 'busy');
+      if (!quiet) setStatus('解析しています…', 'busy');
       tbody.classList.add('loading');
       try {
         const res = await api('/api/plan', { method: 'POST', json: { plan_options: collectPlanOptions() } });
@@ -12635,26 +12054,18 @@ select.w-full { width: 100%; max-width: 100%; }
         S.plan = res;
         S.flows = res.flows || [];
         render(res);
-        setStatus(`解析完了: ステップ ${res.steps_kept} 件 / 採用 ${res.flows_kept} 件 / 除外 ${res.dropped} 件`, 'ok');
+        if (!quiet) setStatus(`解析しました: 手順 ${res.steps_kept} 個 / 使う通信 ${res.flows_kept} 件 / 使わない通信 ${res.dropped} 件`, 'ok');
       } catch (e) {
         if (my === inflight) fail(e, '解析に失敗しました');
       } finally {
         tbody.classList.remove('loading');
       }
     }
-    const replanDebounced = debounce(replan, 250);
-
-    function resetOverrides() {
-      S.exclude = new Set();
-      S.include = new Set();
-      S.finalFlowId = null;
-    }
-    function clearTable() {
-      clear(tbody).appendChild(el('tr', {}, el('td', { colspan: 9, class: 'empty', text: '記録が読み込まれていません' })));
-    }
+    const replanDebounced = debounce(() => replan(), 250);
+    const replanTyped = debounce(() => replan(), 600);
 
     function render(plan) {
-      // summary card
+      // summary
       $('#sum-steps').textContent = plan.steps_kept;
       $('#sum-kept').textContent = plan.flows_kept;
       $('#sum-dropped').textContent = plan.dropped;
@@ -12664,13 +12075,13 @@ select.w-full { width: 100%; max-width: 100%; }
       clear(finalEl);
       if (plan.final_step_index) {
         const st = (plan.steps || []).find((s) => s.index === plan.final_step_index);
-        finalEl.appendChild(el('span', { text: `ステップ ${plan.final_step_index}${st ? ` (${st.method} ${st.url})` : ''} ` }));
+        finalEl.appendChild(el('span', { text: `手順 ${plan.final_step_index}${st ? ` (${st.method} ${st.url})` : ''} ` }));
         finalEl.appendChild(finalBtn); finalBtn.hidden = false;
       } else if (S.finalFlowId) {
-        finalEl.appendChild(el('span', { class: 'hint', text: `指定した ${S.finalFlowId} は除外されているため、最後のステップを結果にします `}));
+        finalEl.appendChild(el('span', { class: 'hint', text: `指定した ${S.finalFlowId} は使わない通信になっているため、最後の手順を結果にします ` }));
         finalEl.appendChild(finalBtn); finalBtn.hidden = false;
       } else {
-        finalEl.appendChild(el('span', { text: '最後のステップ (既定) ' }));
+        finalEl.appendChild(el('span', { text: '最後の手順 (既定) ' }));
         finalEl.appendChild(finalBtn); finalBtn.hidden = true;
       }
       const authEl = clear($('#sum-auth'));
@@ -12678,8 +12089,8 @@ select.w-full { width: 100%; max-width: 100%; }
         const a = plan.auth;
         const kind = { ntlm: 'NTLM (Windows 統合認証)', negotiate: 'Negotiate / Kerberos (Windows 統合認証)', basic: 'Basic 認証', digest: 'Digest 認証' }[a.kind] || a.kind;
         authEl.appendChild(el('span', { class: 'auth-pill', text: kind }));
-        authEl.appendChild(document.createTextNode(` ${(a.hosts || []).join(', ')}${a.username ? ` / 記録時のユーザー: ${a.username}` : ''} — 生成コードでは session.auth で認証します`));
-      } else authEl.textContent = '検出されませんでした';
+        authEl.appendChild(document.createTextNode(` ${(a.hosts || []).join(', ')}${a.username ? ` / 記録時のユーザー: ${a.username}` : ''} — スクリプトでは session.auth で認証します`));
+      } else authEl.textContent = '見つかりませんでした';
       const constEl = clear($('#sum-constants'));
       if (plan.constants && plan.constants.length) {
         plan.constants.forEach((c, i) => {
@@ -12689,15 +12100,17 @@ select.w-full { width: 100%; max-width: 100%; }
       } else constEl.textContent = 'なし';
       const loopEl = clear($('#sum-loops'));
       if (plan.loops && plan.loops.length) {
-        loopEl.textContent = plan.loops.map((l) => `ステップ ${l.step_index}: ${l.var} を ${l.count} 回${l.numeric_range ? ` (${l.numeric_range[0]}〜${l.numeric_range[1]})` : ''}`).join(' / ');
+        loopEl.textContent = plan.loops.map((l) => `手順 ${l.step_index}: ${l.var} を ${l.count} 回${l.numeric_range ? ` (${l.numeric_range[0]}〜${l.numeric_range[1]})` : ''}`).join(' / ');
       } else loopEl.textContent = 'なし';
       $('#sum-self').textContent = plan.excluded_self_flows ? `GUI 自身への通信 ${plan.excluded_self_flows} 件を記録から除外済み` : 'なし';
-      const warnWrap = $('#sum-warnings-wrap');
+      const warnings = warningTexts(plan.warning_details, plan.warnings);
       const warnList = clear($('#sum-warnings'));
-      (plan.warnings || []).forEach((w) => warnList.appendChild(el('li', { text: w })));
-      warnWrap.hidden = !(plan.warnings && plan.warnings.length);
-      markDone('steps', plan.steps_kept > 0, `${plan.steps_kept} ステップ`);
-
+      warnings.forEach((w) => warnList.appendChild(el('li', { text: w })));
+      $('#sum-warnings-wrap').hidden = !warnings.length;
+      const notes = warningTexts(plan.note_details, []);  // informational (Shift_JIS bodies, passwords read at run time)
+      const noteList = clear($('#sum-notes'));
+      notes.forEach((w) => noteList.appendChild(el('li', { text: w })));
+      $('#sum-notes-wrap').hidden = !notes.length;
       renderTable();
     }
 
@@ -12711,15 +12124,15 @@ select.w-full { width: 100%; max-width: 100%; }
         if (filter && !(`${f.method} ${f.url} ${f.host} ${f.reason || ''}`.toLowerCase().includes(filter))) return;
         shown++;
         const tr = el('tr', { class: (f.kept ? 'kept' : 'dropped') + (f.is_final ? ' final' : ''), dataset: { flowId: f.id } });
-        const cb = el('input', { type: 'checkbox', title: f.kept ? 'チェックを外すとこのリクエストを除外します' : 'チェックを入れるとこのリクエストを採用します' });
+        const cb = el('input', { type: 'checkbox', title: f.kept ? 'チェックを外すと、この通信をスクリプトから外します' : 'チェックを入れると、この通信をスクリプトに入れます' });
         cb.checked = f.kept;
         cb.addEventListener('click', (e) => e.stopPropagation());
         cb.addEventListener('change', () => toggleFlow(f, cb.checked));
-        const radio = el('input', { type: 'radio', name: 'final-flow', title: 'このリクエストの結果をスクリプトの出力にします' });
+        const radio = el('input', { type: 'radio', name: 'final-flow', title: 'この通信の結果をスクリプトの最後に表示します' });
         radio.checked = S.finalFlowId === f.id || (!S.finalFlowId && f.is_final);
         radio.disabled = !f.kept;
         radio.addEventListener('click', (e) => e.stopPropagation());
-        radio.addEventListener('change', () => { if (radio.checked) { S.finalFlowId = f.id; replanDebounced(); } });
+        radio.addEventListener('change', () => { if (radio.checked) { S.finalFlowId = f.id; setChanged(true); replanDebounced(); } });
         let urlNode;
         try {
           const u = new URL(f.url);
@@ -12735,12 +12148,15 @@ select.w-full { width: 100%; max-width: 100%; }
           el('td', { class: 'col-type', text: shortMime(f.mime, f.resource_type) }),
           el('td', { class: 'col-url', title: f.url }, urlNode),
           el('td', { class: 'col-ref', title: f.referer || '', text: f.referer ? f.referer.replace(/^https?:\/\//, '') : '' }),
-          el('td', { class: 'col-reason' }, el('span', { class: 'reason' + (f.reason === 'excluded by user' ? ' user' : ''), text: f.kept ? (f.is_final ? '採用（結果）' : '採用') : reasonLabel(f.reason) })),
+          el('td', { class: 'col-reason' }, el('span', { class: 'reason' + (f.reason === 'excluded by user' ? ' user' : ''), text: f.kept ? (f.is_final ? '使う（結果）' : '使う') : reasonLabel(f.reason) })),
         );
         tr.addEventListener('click', () => Drawer.open(f.id));
         tbody.appendChild(tr);
       });
-      if (!shown) tbody.appendChild(el('tr', {}, el('td', { colspan: 9, class: 'empty', text: S.flows.length ? '条件に合う行がありません' : 'リクエストがありません' })));
+      if (!shown) {
+        tbody.appendChild(el('tr', {}, el('td', { colspan: 9, class: 'empty', text: S.flows.length
+          ? '条件に合う行がありません (「使わない通信も表示」にチェックを入れると、すべての通信が出ます)' : '通信がありません' })));
+      }
       $('#table-count').textContent = `(${shown} / ${S.flows.length} 件を表示)`;
     }
 
@@ -12753,18 +12169,18 @@ select.w-full { width: 100%; max-width: 100%; }
         S.exclude.add(flow.id);
         if (S.finalFlowId === flow.id) S.finalFlowId = null;
       }
+      setChanged(true);
       replanDebounced();
     }
 
-    $$('input.opt, .opt-num').forEach((n) => n.addEventListener('change', replanDebounced));
-    $$('.opt-text').forEach((n) => n.addEventListener('input', debounce(replan, 600)));
+    $$('input.opt, .opt-num').forEach((n) => n.addEventListener('change', () => { setChanged(true); replanDebounced(); }));
+    $$('.opt-text').forEach((n) => n.addEventListener('input', () => { setChanged(true); replanTyped(); }));
+    $$('.gopt').forEach((n) => n.addEventListener('change', () => setChanged(true)));
     $('#table-filter').addEventListener('input', debounce(renderTable, 120));
     $('#show-dropped').addEventListener('change', renderTable);
-    $('#btn-replan').addEventListener('click', replan);
-    $('#btn-final-clear').addEventListener('click', () => { S.finalFlowId = null; replan(); });
-    $('#btn-goto-code').addEventListener('click', () => show('code'));
+    $('#btn-final-clear').addEventListener('click', () => { S.finalFlowId = null; setChanged(true); replan(); });
 
-    return { replan, resetOverrides, clearTable, collectPlanOptions, collectGenOptions };
+    return { replan, collectPlanOptions, collectGenOptions, fillOptions, setChanged };
   })();
 
   // ================================================================== 詳細ドロワー
@@ -12803,7 +12219,7 @@ select.w-full { width: 100%; max-width: 100%; }
         const pill = $('#dr-status');
         pill.textContent = st === null ? 'レスポンスなし' : String(st);
         pill.className = 'status-pill ' + (st === null ? 's0' : 's' + String(st)[0]);
-        $('#dr-flow-id').textContent = `${d.id}${d.step_index ? ` / ステップ ${d.step_index}` : d.reason ? ` / 除外: ${d.reason}` : ''}`;
+        $('#dr-flow-id').textContent = `${d.id}${d.step_index ? ` / 手順 ${d.step_index}` : d.reason ? ` / 使わない理由: ${d.reason}` : ''}`;
         $('#dr-url').textContent = d.request.url;
         $('#dr-meta').textContent = [d.started_at_iso ? `時刻 ${d.started_at_iso}` : null, d.resource_type ? `種類 ${d.resource_type}` : null, d.page_ref ? `ページ ${d.page_ref}` : null].filter(Boolean).join(' / ');
         fillPairs($('#dr-req-query'), d.request.query, 'クエリパラメータなし');
@@ -12828,86 +12244,9 @@ select.w-full { width: 100%; max-width: 100%; }
     return { open };
   })();
 
-  // ================================================================== 4 コード
-  const Code = (() => {
-    const preview = $('#code-preview');
-    const btnSave = $('#btn-save');
-    const btnDownload = $('#btn-download');
-    const nameInput = $('#script-name');
-
-    function renderSecrets(secrets) {
-      S.secrets = secrets || [];
-      const wrap = $('#gen-secrets-wrap');
-      const list = clear($('#gen-secrets'));
-      S.secrets.forEach((s) => list.appendChild(el('li', {}, [el('code', { text: s.env_var }), document.createTextNode(` — ${/^[A-Za-z_][A-Za-z0-9_]*$/.test(s.name) ? '定数 ' : ''}${s.name}${s.comment ? ` (${s.comment})` : ''}`)])));
-      wrap.hidden = !S.secrets.length;
-      Run.renderEnvInputs();
-    }
-
-    $('#btn-generate').addEventListener('click', async () => {
-      if (!S.recording || !S.recording.loaded) { setStatus('先に記録を読み込んでください', 'error'); show('load'); return; }
-      setStatus('スクリプトを生成しています…', 'busy');
-      try {
-        const res = await api('/api/generate', { method: 'POST', json: { plan_options: Steps.collectPlanOptions(), gen_options: Steps.collectGenOptions() } });
-        S.code = res.code;
-        preview.textContent = res.code;
-        $('#code-lines').textContent = `(${res.code.split('\n').length} 行 / ${res.steps} ステップ)`;
-        $('#gen-summary').textContent = res.summary || '';
-        $('#gen-summary').hidden = !res.summary;
-        const wl = clear($('#gen-warnings'));
-        (res.warnings || []).forEach((w) => wl.appendChild(el('li', { text: w })));
-        $('#gen-warnings-wrap').hidden = !(res.warnings && res.warnings.length);
-        renderSecrets(res.secrets);
-        if (!nameInput.value.trim() && res.suggested_name) nameInput.value = res.suggested_name;
-        btnSave.disabled = false;
-        markDone('code', true, `${res.steps} ステップ`);
-        setStatus(`スクリプトを生成しました (${res.steps} ステップ)。ファイル名を確認して [保存] してください。`, 'ok');
-      } catch (e) { fail(e, '生成に失敗しました'); }
-    });
-
-    btnSave.addEventListener('click', async () => {
-      if (!S.code) return;
-      let name = nameInput.value.trim();
-      if (!name) { setStatus('ファイル名を入力してください', 'error'); nameInput.focus(); return; }
-      setStatus('保存しています…', 'busy');
-      try {
-        const res = await api('/api/scripts/save', { method: 'POST', json: { name, code: S.code } });
-        S.savedScript = res.name;
-        $('#save-result').textContent = `保存しました: ${res.path}`;
-        btnDownload.href = res.download_url;
-        btnDownload.setAttribute('download', res.name);
-        btnDownload.classList.remove('disabled');
-        btnDownload.removeAttribute('aria-disabled');
-        $('#btn-goto-run').disabled = false;
-        setStatus(`保存しました: ${res.name}`, 'ok');
-        await Run.refreshScripts(res.name);
-      } catch (e) { fail(e, '保存に失敗しました'); }
-    });
-    $('#btn-goto-run').addEventListener('click', () => show('run'));
-
-    return { renderSecrets };
-  })();
-
-  // ================================================================== 5 実行
+  // ================================================================== 試しに実行 (かんたん画面と詳細設定)
   const Run = (() => {
-    const select = $('#run-script');
-    const envWrap = $('#env-inputs');
-    const btnRun = $('#btn-run');
-    const btnStop = $('#btn-run-stop');
-    const stateEl = $('#run-state');
-    const outEl = $('#run-stdout');
-    const errEl = $('#run-stderr');
-
-    async function refreshScripts(selectName) {
-      try {
-        const res = await api('/api/scripts');
-        clear(select);
-        if (!res.files.length) select.appendChild(el('option', { value: '', text: '(保存されたスクリプトはありません — 「4 コード」で保存してください)' }));
-        res.files.forEach((f) => select.appendChild(el('option', { value: f.name, text: `${f.name}  (${fmtBytes(f.size)}, ${fmtTime(f.mtime)})` })));
-        const want = selectName || S.savedScript || res.last;
-        if (want && res.files.some((f) => f.name === want)) select.value = want;
-      } catch (e) { fail(e, 'スクリプト一覧を取得できません'); }
-    }
+    let last = {};  // the last /api/run/status (one script runs at a time; both screens show it)
     function authLabel(s) {  // Windows authentication entries (REQREC_NTLM_USER / _PASSWORD) carry ``auth``
       return `Windows 認証 (${s.auth === 'negotiate' ? 'Negotiate' : 'NTLM'})`;
     }
@@ -12927,157 +12266,305 @@ select.w-full { width: 100%; max-width: 100%; }
       if (s.auth) return s.comment || '';
       return '記録したときと同じ値を入れてください。実行するときだけ使われ、どこにも保存されません。';
     }
-    function renderEnvInputsInto(container, idPrefix = 'env-', friendly = false) {
+    // input fields for the values the current script reads from environment variables (S.secrets)
+    function renderEnvInputsInto(container, idPrefix, runLabel, showEnvName = false) {
       clear(container);
       if (!S.secrets.length) {
-        container.appendChild(el('p', { class: 'hint', text: friendly
-          ? '入力するものはありません。[▶ 実行] を押すだけで動きます。'
-          : '生成したスクリプトに秘密情報がなければ入力は不要です。' }));
+        container.appendChild(el('p', { class: 'hint', text: `入力するものはありません。[${runLabel}] を押すだけで動きます。` }));
         return;
       }
       S.secrets.forEach((s) => {
         const id = idPrefix + s.env_var;
-        container.appendChild(el('label', { for: id, text: friendly ? friendlySecretLabel(s) : s.env_var }));
+        container.appendChild(el('label', { for: id, text: friendlySecretLabel(s) }));
         const isSecret = s.secret !== false;
         container.appendChild(el('div', {}, [
           el('input', { type: isSecret ? 'password' : 'text', id, class: 'env-input w-m', dataset: { env: s.env_var }, autocomplete: 'off', placeholder: s.name, value: !isSecret && s.default ? s.default : undefined }),
-          el('div', { class: 'hint', text: friendly
-            ? friendlySecretHint(s)
-            : `${s.name}${s.comment ? ' — ' + s.comment : ''}（実行プロセスにだけ渡され、保存されません）` }),
+          el('div', { class: 'hint', text: friendlySecretHint(s) + (showEnvName ? `（環境変数 ${s.env_var}）` : '') }),
         ]));
       });
     }
-    function renderEnvInputs() { renderEnvInputsInto(envWrap); }
     function collectEnvFrom(container) {
       const env = {};
       $$('.env-input', container).forEach((i) => { if (i.value !== '') env[i.dataset.env] = i.value; });
       return env;
     }
-    function collectEnv() { return collectEnvFrom(envWrap); }
     const listeners = [];
     function subscribe(fn) { listeners.push(fn); }
     function render(st) {
-      listeners.forEach((fn) => { try { fn(st); } catch (e) { console.error(e); } });
-      const running = !!st.running;
-      btnRun.disabled = running;
-      btnStop.disabled = !running;
-      outEl.textContent = (st.output_tail ?? st.stdout_tail) || '';  // result + progress lines ([2/9] OK ...)
-      errEl.textContent = (st.errors_tail ?? st.stderr_tail) || '';
-      if (running) { stateEl.textContent = `実行中… (${st.name || ''})`; stateEl.className = 'run-state running'; }
-      else if (st.exit_code === null || st.exit_code === undefined) { stateEl.textContent = '待機中'; stateEl.className = 'run-state'; }
-      else if (st.exit_code === 0) { stateEl.textContent = `正常終了 (${st.name || ''})`; stateEl.className = 'run-state ok'; }
-      else { stateEl.textContent = st.stopped_by_user ? '停止しました' : `エラー終了 (終了コード ${st.exit_code})`; stateEl.className = 'run-state fail'; }
-      $('#btn-save-output').disabled = running || !st.started_at;
-      if (running) outEl.scrollTop = outEl.scrollHeight;
-      markDone('run', !running && st.exit_code === 0, null);
+      last = st || {};
+      listeners.forEach((fn) => { try { fn(last); } catch (e) { console.error(e); } });
+      const running = !!last.running;
       if (running && !S.runPoll) S.runPoll = setInterval(poll, 1000);
       if (!running && S.runPoll) { clearInterval(S.runPoll); S.runPoll = null; }
     }
+    function refresh() { render(last); }  // e.g. the current script changed: the run buttons follow
     async function poll() {
       try {
         const st = await api('/api/run/status');
         render(st);
         if (!st.running && st.exit_code !== null && st.exit_code !== undefined) {
-          setStatus(st.exit_code === 0 ? 'スクリプトは正常に終了しました' : `スクリプトは終了コード ${st.exit_code} で終了しました（標準エラーを確認してください）`, st.exit_code === 0 ? 'ok' : 'error');
+          if (st.exit_code === 0) setStatus('スクリプトは正常に終わりました', 'ok');
+          else if (st.stopped_by_user) setStatus('スクリプトを停止しました', 'info');
+          else setStatus(`スクリプトはエラーで終わりました (終了コード ${st.exit_code})`, 'error');
         }
       } catch (e) { /* transient */ }
     }
     async function start(name, env) {
-      if (!name) { setStatus('実行するスクリプトを選んでください（「4 コード」で保存できます）', 'error'); return false; }
-      btnRun.disabled = true;
+      if (!name) { setStatus('実行するスクリプトがありません', 'error'); return false; }
       setStatus(`${name} を実行しています…`, 'busy');
       try {
-        const st = await api('/api/run', { method: 'POST', json: { name, env } });
-        render(st);
+        render(await api('/api/run', { method: 'POST', json: { name, env } }));
         return true;
-      } catch (e) { btnRun.disabled = false; fail(e, '実行できません'); return false; }
+      } catch (e) { fail(e, '実行できません'); return false; }
     }
     async function stop() {
       try { render(await api('/api/run/stop', { method: 'POST', json: {} })); setStatus('スクリプトを停止しました', 'info'); } catch (e) { fail(e); }
     }
-    btnRun.addEventListener('click', () => start(select.value, collectEnv()));
-    btnStop.addEventListener('click', stop);
-    $('#btn-refresh-scripts').addEventListener('click', () => refreshScripts());
-    $('#btn-save-output').addEventListener('click', async () => {
-      const name = $('#output-name').value.trim();
+    async function saveOutput(resultEl) {
       try {
-        const res = await api('/api/run/save_output', { method: 'POST', json: name ? { name } : {} });
-        $('#save-output-result').textContent = `保存しました: ${res.path} (${fmtBytes(res.size)})${res.truncated ? ' ※出力が大きすぎたため途中までです' : ''}`;
+        const res = await api('/api/run/save_output', { method: 'POST', json: {} });
+        resultEl.textContent = `保存しました: ${res.path}${res.truncated ? ' ※出力が大きすぎたため途中までです' : ''}`;
         setStatus(`結果を保存しました: ${res.name}`, 'ok');
       } catch (e) { fail(e, '結果を保存できません'); }
+    }
+    // plain-language hint for the most common failures of a generated script (the raw traceback stays available below)
+    const ERROR_HINTS = [
+      [/getaddrinfo failed|Name or service not known|NameResolutionError|nodename nor servname/i, 'サイトに接続できません (アドレスが見つかりません)。社内ネットワークに接続しているか、VPN が必要なサイトではないか確認してください。'],
+      [/ConnectTimeout|Read timed out|timed out/i, 'サイトの応答がありません (タイムアウト)。しばらくしてからもう一度実行してください。'],
+      [/CERTIFICATE_VERIFY_FAILED|SSLError|SSLCertVerificationError/i, 'https:// のサイトの証明書を確認できませんでした。このツールが対象とするのは http:// のサイトです。'],
+      [/ConnectionRefused|Connection refused|WinError 10061/i, 'サイトに接続できません (接続が拒否されました)。サイトが動いているか確認してください。'],
+      [/\b(401|403) Client Error|Unauthorized for url|Forbidden for url/, 'ログインに失敗したか、権限がありません。パスワードなどの入力値を確認してください。'],
+      [/REQREC_[A-Z_]+ (が|is) /, '実行に必要な入力 (パスワードなど) が足りません。上の入力欄をすべて埋めてください。'],
+      [/要素が見つかりません|パターンに一致しませんでした|JSON にパス/, '画面の内容が記録したときと違うため、続きの値を取り出せませんでした。パスワードが正しいか、ログインが拒否されていないかを確認してください。サイトの画面が変わった場合は、もう一度記録してください。'],
+      [/ModuleNotFoundError: No module named '(requests_negotiate_sspi|requests_ntlm)'/, 'Windows 統合認証用の部品が入っていません。管理者に pip install "reqrec[sspi]" の実行を依頼してください。'],
+      [/ModuleNotFoundError: No module named '([\w.]+)'/, '必要な部品 ($1) が入っていません。管理者に pip install の実行を依頼してください。'],
+      [/status (\d{3}) .*expected|想定外のステータス|unexpected status/i, 'サイトの応答が記録したときと違います。サイト側が変わったか、ログインが切れている可能性があります。'],
+      [/SyntaxError|IndentationError|TabError/, 'スクリプトの書き方に誤りがあります。詳細設定でコードを書き換えた場合は、エラーメッセージの行を確認してください。'],
+    ];
+    function errorHint(text) {
+      if (!text) return '';
+      for (const [re, msg] of ERROR_HINTS) {
+        const m = re.exec(text);
+        if (m) return msg.replace('$1', m[1] || '');
+      }
+      const lastLine = text.trim().split('\n').pop();
+      return lastLine ? `エラー: ${lastLine.slice(0, 200)}` : '';
+    }
+    // one run card (#easy-run-… / #detail-run-…): buttons, state, result (with the progress lines),
+    // error details and the plain-language hint
+    function bindView(p, opts) {
+      const btn = $(`#${p}-run-btn`);
+      const stopBtn = $(`#${p}-run-stop`);
+      const saveBtn = $(`#${p}-save-output`);
+      const out = $(`#${p}-run-out`);
+      const err = $(`#${p}-run-err`);
+      const errWrap = $(`#${p}-run-err-wrap`);
+      const state = $(`#${p}-run-state`);
+      const hint = $(`#${p}-run-hint`);
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;  // no second start while the first one is on its way
+        try { await opts.onRun(); } finally { refresh(); }
+      });
+      stopBtn.addEventListener('click', stop);
+      saveBtn.addEventListener('click', () => saveOutput($(`#${p}-save-output-result`)));
+      subscribe((st) => {
+        const running = !!st.running;
+        btn.disabled = running || !opts.canRun();
+        stopBtn.disabled = !running;
+        saveBtn.disabled = running || !st.started_at;
+        out.textContent = (st.output_tail ?? st.stdout_tail) || (running ? '(実行中… 出力を待っています)' : '');
+        if (running) out.scrollTop = out.scrollHeight;
+        const errors = (st.errors_tail ?? st.stderr_tail) || '';  // stderr without the progress lines
+        err.textContent = errors;
+        errWrap.hidden = !errors;
+        hint.hidden = true;
+        if (running) { state.textContent = '実行中…'; state.className = 'run-state running'; }
+        else if (st.exit_code === null || st.exit_code === undefined) { state.textContent = '待機中'; state.className = 'run-state'; }
+        else if (st.exit_code === 0) { state.textContent = '正常に終わりました'; state.className = 'run-state ok'; }
+        else {
+          state.textContent = st.stopped_by_user ? '停止しました' : 'エラーで終わりました';
+          state.className = 'run-state fail';
+          if (!st.stopped_by_user) {
+            const h = errorHint(st.stderr_tail);
+            if (h) { hint.textContent = h; hint.hidden = false; }
+            errWrap.open = true;
+          }
+        }
+      });
+    }
+    return { start, render, refresh, bindView, renderEnvInputsInto, collectEnvFrom, friendlySecretLabel, authLabel };
+  })();
+
+  // ================================================================== 詳細設定: スクリプトの中身を確認・変更する
+  // 手順と設定を変えて [設定から作り直す] (= /api/easy/build で同じファイルを作り直す) か、コードを直接
+  // 書き換えて [保存] する。どちらも [試しに実行する] ですぐに確かめられる。
+  const Detail = (() => {
+    const editor = $('#code-editor');
+    const nameInput = $('#script-name');
+    const btnSave = $('#btn-save');
+    const btnRevert = $('#btn-revert');
+    const btnDownload = $('#btn-download');
+    const btnRegen = $('#btn-regenerate');
+    const RUN_LABEL = '▶ 試しに実行する';
+
+    function typedName() {
+      const n = nameInput.value.trim();
+      return n && !/\.py$/i.test(n) ? n + '.py' : n;
+    }
+    function dirty() { return !!S.script && S.savedCode !== null && editor.value !== S.savedCode; }
+    function refreshButtons() {
+      const changed = dirty();
+      $('#code-dirty').hidden = !changed;
+      btnSave.disabled = !S.script || (!changed && typedName() === S.script);
+      btnRevert.disabled = !changed;
+      btnDownload.disabled = !S.script;
+      $('#code-lines').textContent = editor.value ? `(${editor.value.split('\n').length} 行)` : '';
+    }
+    // steps and settings need a loaded recording, the code a script
+    function refresh() {
+      const loaded = !!(S.recording && S.recording.loaded && S.recording.flows);
+      $('#detail-empty').hidden = loaded || !!S.script;
+      $('#detail-body').hidden = !(loaded || S.script);
+      $('#detail-source').textContent = loaded
+        ? `${(S.recording.sources || []).join(', ') || '—'}（${S.recording.flows} 件の通信）`
+        : '(記録は読み込まれていません)';
+      btnRegen.disabled = !loaded;
+      btnRegen.textContent = S.script ? '⚙ 設定から作り直す' : '⚙ この設定でスクリプトを作る';
+      $('#regen-hint').textContent = S.script
+        ? '今のスクリプトを、この設定で作ったコードに置きかえて保存します (コードを直接書き換えた部分は消えます)。'
+        : 'この設定でスクリプトを作って保存します。';
+    }
+    // The current script, shown on both screens.  ``code`` is its saved content; the editor is only
+    // refilled when ``fillEditor`` (a save keeps whatever was typed meanwhile).
+    function setScript(name, code, path, fillEditor = true) {
+      S.script = name || null;
+      S.savedCode = name ? (code || '') : null;
+      if (!name) S.generatedCode = null;
+      if (fillEditor && editor.value !== (code || '')) editor.value = code || '';
+      editor.readOnly = !name;
+      nameInput.value = name ? name.replace(/\.py$/i, '') : '';
+      nameInput.disabled = !name;
+      $('#detail-script').textContent = name || '(まだありません)';
+      if (path) $('#save-result').textContent = `保存先: ${path}`;
+      Run.renderEnvInputsInto($('#detail-env'), 'detail-env-', RUN_LABEL, true);
+      Easy.showScript(name, path);
+      refreshButtons();
+      refresh();
+      Run.refresh();
+    }
+    async function loadScript(name) {  // after a page reload: the saved file goes into the editor
+      try {
+        const resp = await fetch(scriptUrl(name), { credentials: 'same-origin', cache: 'no-store' });
+        if (resp.ok) setScript(name, await resp.text(), null);
+      } catch (e) { /* the editor stays empty */ }
+    }
+    async function save() {
+      if (!S.script) return false;
+      const name = typedName();
+      if (!name) { setStatus('ファイル名を入力してください', 'error'); nameInput.focus(); return false; }
+      const code = editor.value;
+      setStatus('保存しています…', 'busy');
+      try {
+        const res = await api('/api/scripts/save', { method: 'POST', json: { name, code } });
+        setScript(res.name, code, res.path, false);
+        $('#save-result').textContent = `保存しました: ${res.path}`;
+        setStatus(`保存しました: ${res.name}`, 'ok');
+        return true;
+      } catch (e) { fail(e, '保存できませんでした'); return false; }
+    }
+    function revert() {
+      if (!dirty() || !window.confirm('保存していない変更を消して、保存した内容に戻しますか？')) return;
+      editor.value = S.savedCode;
+      refreshButtons();
+    }
+    async function download() {
+      if (!S.script || (dirty() && !(await save()))) return;
+      const a = el('a', { href: scriptUrl(S.script), download: S.script });
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+    async function regenerate() {
+      if (!S.recording || !S.recording.loaded) return;
+      const edited = !!S.script && (S.generatedCode === null || editor.value !== S.generatedCode);
+      if (edited && !window.confirm('コードを直接書き換えた部分は消えて、この設定で作ったコードに置きかわります。よろしいですか？')) return;
+      const had = !!S.script;
+      btnRegen.disabled = true;
+      setStatus('設定からスクリプトを作っています…', 'busy');
+      try {
+        const b = await api('/api/easy/build', { method: 'POST', json: {
+          name: S.script || undefined,  // the same file is replaced; a new one gets the automatic name
+          plan_options: Steps.collectPlanOptions(),
+          gen_options: Steps.collectGenOptions(),
+        } });
+        applyBuild(b);
+        setStatus(had ? `作り直して保存しました: ${b.name}` : `スクリプトを作りました: ${b.name}`, 'ok');
+      } catch (e) { fail(e, 'スクリプトを作れませんでした'); }
+      finally { refresh(); }
+    }
+
+    editor.addEventListener('input', refreshButtons);
+    editor.addEventListener('keydown', (e) => {
+      if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && !editor.readOnly) {
+        e.preventDefault();  // 4 spaces (Python indentation) instead of moving the focus
+        if (!document.execCommand('insertText', false, '    ')) editor.setRangeText('    ', editor.selectionStart, editor.selectionEnd, 'end');
+        refreshButtons();
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault();
+        if (!btnSave.disabled) save();
+      }
     });
-    return { refreshScripts, renderEnvInputs, renderEnvInputsInto, collectEnvFrom, render, start, stop, subscribe, friendlySecretLabel, authLabel };
+    nameInput.addEventListener('input', refreshButtons);
+    nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !btnSave.disabled) save(); });
+    btnSave.addEventListener('click', save);
+    btnRevert.addEventListener('click', revert);
+    btnDownload.addEventListener('click', download);
+    btnRegen.addEventListener('click', regenerate);
+    window.addEventListener('beforeunload', (e) => { if (dirty()) { e.preventDefault(); e.returnValue = ''; } });
+    Run.bindView('detail', {
+      canRun: () => !!S.script,
+      onRun: async () => {  // unsaved edits are saved first: the run uses the file
+        if (!dirty() || await save()) await Run.start(S.script, Run.collectEnvFrom($('#detail-env')));
+      },
+    });
+    return { setScript, loadScript, refresh, dirty };
   })();
 
   // ================================================================== かんたん画面 (既定)
   // 「記録をはじめる」→ 記録用ブラウザでサイトを操作 → 「記録をおわる」だけで、ポート選択・記録用ブラウザの
-  // 起動・解析・生成・保存をすべて自動で行う。細かい設定は「詳細設定を表示」で既存の 5 画面に切り替える。
+  // 起動・解析・生成・保存をすべて自動で行う。HAR ファイルからも同じように作れる。
+  // できたスクリプトの中身の確認と細かい変更は「詳細設定を表示」(Detail) で行う。
   const Easy = (() => {
     const MITM_AVAILABLE = body.dataset.mitmAvailable === 'true';
     // アプリ内の記録用ブラウザ (IE エンジン, DESIGN.md §13.12): Windows でコンパイラか exe があるときだけ使える。
-    // Windows の設定や証明書は変更しない。使えない PC では記録できない (HAR の読み込み以降は使える)。
+    // Windows の設定や証明書は変更しない。使えない PC では記録できない (HAR ファイルからは作れる)。
     const IEHOST = body.dataset.iehostAvailable === 'true';
     const IEHOST_REASON = body.dataset.iehostReason || '';
-    const toggleBtn = $('#mode-toggle');
+    const CAN_RECORD = MITM_AVAILABLE && IEHOST;
     const stages = { idle: $('#easy-idle'), recording: $('#easy-recording'), processing: $('#easy-processing'), done: $('#easy-done') };
     const errEl = $('#easy-error');
     const btnStart = $('#easy-start');
     const btnStop = $('#easy-stop');
+    const emuSel = $('#easy-emulation');
     let current = 'idle';
-    let lastBuild = null;
-    let browserSeen = false;   // the recording browser was seen running during this recording (guards the auto-stop against racing the launch)
-    let autoStopped = false;   // the auto-stop already fired for this recording
-    let recOrigin = null;      // 'easy' / 'advanced': which screen started the recording in progress (from the server)
-    let lastIEError = null;    // last failure to start the recording browser in this GUI session
-    function canStart() { return MITM_AVAILABLE && IEHOST; }
-
-    // ---------------------------------------------------------------- mode
-    function setMode(mode, persist = true) {
-      const easy = mode !== 'advanced';
-      body.classList.toggle('easy-mode', easy);
-      toggleBtn.textContent = easy ? '詳細設定を表示' : 'かんたん画面に戻る';
-      if (persist) { try { localStorage.setItem('reqrec.mode', easy ? 'easy' : 'advanced'); } catch (e) { /* ignore */ } }
-      if (!easy) {
-        // show the panel that matches what the easy screen just did
-        let panel = null;
-        try { panel = localStorage.getItem('reqrec.panel'); } catch (e) { /* ignore */ }
-        if (current === 'recording') panel = 'record';
-        else if (current === 'done') panel = 'code';
-        else if (!panel && S.recording && S.recording.loaded) panel = 'steps';
-        if (panel && panels[panel]) show(panel);
-      }
-      window.scrollTo({ top: 0 });
-    }
-    toggleBtn.addEventListener('click', async () => {
-      const toEasy = !body.classList.contains('easy-mode');
-      setMode(toEasy ? 'easy' : 'advanced');
-      if (!toEasy) return;
-      try {  // a recording started or stopped in 詳細設定 is reflected here
-        const st = await api('/api/record/status');
-        if (st.running) recOrigin = st.origin || null;
-        if (st.running && current !== 'recording') {
-          browserSeen = !!(st.browser && st.browser.running);
-          autoStopped = false;
-          stage('recording');
-          renderLive(st);
-          Record.startPolling();
-        } else if (!st.running && current === 'recording') {
-          stage('idle'); btnStart.disabled = !canStart(); readiness();
-        }
-      } catch (e) { /* the regular poll will catch up */ }
-    });
+    let emuCurrent = 'default'; // 表示モード in the registry: an unchanged select sends 'keep' (nothing is written)
+    let browserSeen = false;    // the recording browser was seen running during this recording (guards the auto-stop against racing the launch)
+    let autoStopped = false;    // the auto-stop already fired for this recording
+    let lastIEError = null;     // last failure to start the recording browser in this GUI session
 
     // ---------------------------------------------------------------- stages
     function stage(name, text) {
       current = name;
       Object.entries(stages).forEach(([k, node]) => { node.hidden = k !== name; });
       if (name === 'processing' && text) $('#easy-processing-text').textContent = text;
+      toggleBtn.disabled = name === 'recording' || name === 'processing';  // 詳細設定 waits for the script
+      if (name === 'idle') { btnStart.disabled = !CAN_RECORD; readiness(); }
       window.scrollTo({ top: 0 });
     }
     function showError(message) { errEl.textContent = message || ''; errEl.hidden = !message; }
 
     // ---------------------------------------------------------------- readiness (idle)
-    async function readiness() {
+    function readiness() {
       refreshLoaded();
       const list = clear($('#easy-ready'));
       const add = (cls, text) => list.appendChild(el('li', { class: cls, text }));
@@ -13089,10 +12576,29 @@ select.w-full { width: 100%; max-width: 100%; }
         return;
       }
       add('bad', '記録用ブラウザ (IE エンジン): 準備できていません: ' + (IEHOST_REASON || '理由不明'));
-      add('warn', 'この PC では記録できません。管理者に連絡してください (HAR ファイルを読み込んでスクリプトを作ることはできます)。');
+      add('warn', 'この PC では記録できません。管理者に連絡してください (下の [HAR ファイルから作る] は使えます)。');
+    }
+    // a recording loaded earlier (before a page reload, or one that could not be turned into a script)
+    function refreshLoaded() {
+      const loaded = !!(S.recording && S.recording.loaded && S.recording.flows);
+      $('#easy-loaded').hidden = !loaded;
+      if (loaded) $('#easy-loaded-count').textContent = S.recording.flows;
     }
 
-    // ---------------------------------------------------------------- live count
+    // ---------------------------------------------------------------- 表示モード
+    function setEmulation(name) {
+      const other = emuSel.querySelector('option[value="keep"]');
+      if (other) other.remove();
+      if (name && !emuSel.querySelector(`option[value="${name}"]`)) {
+        // a value written outside reqrec: kept as it is unless another mode is chosen
+        emuSel.appendChild(el('option', { value: 'keep', text: '今の設定のまま' }));
+        name = 'keep';
+      }
+      emuSel.value = name || 'default';
+      emuCurrent = emuSel.value;
+    }
+
+    // ---------------------------------------------------------------- live count (polled every second)
     function renderLive(st) {
       $('#easy-count').textContent = st.flows ?? 0;
       const err = $('#easy-rec-error');
@@ -13103,29 +12609,29 @@ select.w-full { width: 100%; max-width: 100%; }
         err.hidden = false;
       }
     }
-    Record.subscribe((st) => {  // Record polls /api/record/status every second
+    function onRecordStatus(st) {
       if (current !== 'recording') return;
       renderLive(st);
-      if (st.running) recOrigin = st.origin || null;
       if (!st.browser || st.browser.kind !== 'iehost') return;
       if (st.browser.running) { browserSeen = true; return; }
-      // Closing the recording browser is the natural "I'm done" of the in-app flow: stop + build once.
-      // Only while this screen is shown, and only for a recording started from this screen: one started
-      // in 詳細設定 (also after a page reload) is only pointed out; its own stop keeps its 追加モード.
-      if (!browserSeen || autoStopped || !body.classList.contains('easy-mode')) return;
+      // Closing the recording browser is the natural "I'm done": stop + build once.
+      if (!browserSeen || autoStopped) return;
       autoStopped = true;  // handled once per recording ([ブラウザをもう一度開く] re-arms it)
-      if (recOrigin !== 'easy') {
-        setStatus('記録用ブラウザが閉じられました。[記録をおわる] を押すと記録を保存します。', 'info');
-        return;
-      }
       if (st.browser.exit_code === 4) {  // RecBrowser could not set its per-process proxy: nothing was recorded
         discardSilently('記録用ブラウザの中継設定に失敗したため、記録できませんでした。もう一度 [記録をはじめる] を押してください。直らない場合は管理者に連絡してください。');
         return;
       }
       setStatus('記録用ブラウザが閉じられました。スクリプトを作成します…', 'busy');
       stop();
-    });
-    const pollOnce = () => Record.poll();
+    }
+    async function pollRecord() {
+      let st;
+      try { st = await api('/api/record/status'); } catch (e) { return; }  // transient
+      onRecordStatus(st);
+      if (!st.running) stopPolling();
+    }
+    function startPolling() { if (!S.recPoll) S.recPoll = setInterval(pollRecord, 1000); }
+    function stopPolling() { clearInterval(S.recPoll); S.recPoll = null; }
 
     // ---------------------------------------------------------------- browser
     async function openBrowser() {
@@ -13144,13 +12650,17 @@ select.w-full { width: 100%; max-width: 100%; }
     }
 
     // ---------------------------------------------------------------- start / stop / cancel
+    function okToStartOver() {  // a new recording replaces the current script of 詳細設定
+      return !Detail.dirty() || window.confirm('詳細設定で書き換えたコードが、まだ保存されていません。保存しないで新しく作りますか？');
+    }
     async function start() {
-      if (!canStart()) {
+      if (!CAN_RECORD) {
         showError(!MITM_AVAILABLE
           ? '記録機能の準備ができていません (mitmproxy が未インストール)。'
           : '記録用ブラウザが使えないため記録できません: ' + (IEHOST_REASON || '理由不明') + '　管理者に連絡してください。');
         return;
       }
+      if (!okToStartOver()) return;
       showError('');
       btnStart.disabled = true;
       $('#easy-browser-note').hidden = true;
@@ -13162,46 +12672,44 @@ select.w-full { width: 100%; max-width: 100%; }
       let res;
       try {
         res = await api('/api/record/start', { method: 'POST', json: {
-          hosts: [], append: false,
           start_url: $('#easy-url').value.trim(),
-          emulation: 'keep',  // 表示モード is only changed from 詳細設定
-          origin: 'easy',     // only easy-started recordings are stopped automatically when the browser closes
+          emulation: emuSel.value === emuCurrent ? 'keep' : emuSel.value,  // the registry is written only for a change
         } });
       } catch (e) {
-        stage('idle'); btnStart.disabled = !canStart();
+        stage('idle');
         const kind = e.data && e.data.kind;
         if (kind === 'iehost') {
           // RecBrowser.exe could not be built or started: typically blocked by a security policy (AppLocker)
           lastIEError = e.message;
+          readiness();
           showError(e.message + '　パソコンのセキュリティ設定で記録用ブラウザ (RecBrowser.exe) が止められた可能性があります。'
             + '管理者に「reqrec のフォルダで python -m reqrec browser build を実行し、そのフォルダの RecBrowser.exe の実行を許可する」よう依頼してください。');
-          readiness();
         } else if (kind === 'proxy') {
           // the recording proxy (mitmdump) did not start listening: not a security-policy problem
           showError(e.message + '　記録用の中継サーバーが動きませんでした。もう一度 [記録をはじめる] を押してください。'
             + '何度やっても同じときは、パソコンを再起動してから試すか、管理者に連絡してください。');
         } else if (kind === 'emulation') {
-          showError(e.message + '　右上の「詳細設定を表示」→「1 記録」の「表示モード」を「変更しない」にして、もう一度記録してください。');
+          showError(e.message + '　「表示モード」を「既定」にして、もう一度記録してください。');
         } else {
           showError('記録を始められませんでした: ' + e.message);
         }
         setStatus('記録を始められませんでした', 'error');
         return;
       }
-      Record.render(res.status || { running: true, flows: 0, out: res.out });
       if (res.status && res.status.error) {
-        stage('idle'); btnStart.disabled = !canStart();
+        stage('idle');
         showError('記録用の中継サーバーを起動できませんでした: ' + res.status.error);
         setStatus('記録を始められませんでした', 'error');
         return;
       }
-      recOrigin = res.origin || 'easy';
+      emuCurrent = emuSel.value;
       stage('recording');
-      Record.startPolling();
+      renderLive(res.status || { running: true, flows: 0 });
+      startPolling();
       // the server already opened the recording browser
       browserSeen = !!(res.browser && res.browser.running);
-      (res.warnings || []).forEach((w) => setStatus(w, 'info'));
-      setStatus('記録中です。開いた記録用ブラウザでサイトを操作してください。', 'ok');
+      const notes = (res.warnings || []).join(' ');
+      setStatus('記録中です。開いた記録用ブラウザでサイトを操作してください。' + (notes ? ' ' + notes : ''), notes ? 'info' : 'ok');
     }
 
     async function stop() {
@@ -13209,25 +12717,41 @@ select.w-full { width: 100%; max-width: 100%; }
       stage('processing', '記録を保存しています…');
       let res;
       try {
-        // no ``append``: the server uses the one the recording was started with (always false for an
-        // easy-started recording, the 追加モード checkbox for one started in 詳細設定)
         res = await api('/api/record/stop', { method: 'POST', json: {} });
       } catch (e) {
         btnStop.disabled = false;
-        await pollOnce();
-        stage('idle'); btnStart.disabled = !canStart();
+        stopPolling();
+        stage('idle');
         const empty = !!(e.data && e.data.empty);
         showError((empty ? '' : '記録を保存できませんでした: ') + e.message);
         setStatus(empty ? '何も記録されませんでした' : '記録を保存できませんでした', 'error');
-        readiness();
         return;
       }
       btnStop.disabled = false;
-      recOrigin = null;
-      Load.applySummary(res);
-      Load.refreshFiles();
-      Steps.resetOverrides();
+      stopPolling();
+      setRecording(res);
       stage('processing', `記録した ${res.flows} 件の通信を解析して、スクリプトを作成しています…`);
+      await build();
+    }
+
+    // HAR files (one per tab are merged by time stamp) or reqrec's own .json, the same way as a recording
+    async function buildFromFiles(files) {
+      if (!files.length || !okToStartOver()) return;
+      showError('');
+      stage('processing', `${files.length} 個のファイルを読み込んでいます…`);
+      const form = new FormData();
+      files.forEach((f) => form.append('files', f, f.name));
+      let res;
+      try {
+        res = await api('/api/recordings/upload', { method: 'POST', form });
+      } catch (e) {
+        stage('idle');
+        showError('ファイルを読み込めませんでした: ' + e.message);
+        setStatus('ファイルを読み込めませんでした', 'error');
+        return;
+      }
+      setRecording(res);
+      stage('processing', `読み込んだ ${res.flows} 件の通信を解析して、スクリプトを作成しています…`);
       await build();
     }
 
@@ -13236,24 +12760,14 @@ select.w-full { width: 100%; max-width: 100%; }
       try {
         b = await api('/api/easy/build', { method: 'POST', json: {} });
       } catch (e) {
-        stage('idle'); btnStart.disabled = !canStart();
-        showError('スクリプトを作成できませんでした: ' + e.message + '　記録は読み込まれているので、「詳細設定を表示」から通信の一覧を確認できます。');
+        stage('idle');
+        showError('スクリプトを作成できませんでした: ' + e.message + '　記録は読み込まれているので、右上の「詳細設定を表示」で通信の一覧を確認できます。');
         setStatus('スクリプトを作成できませんでした', 'error');
-        Steps.replan();
-        readiness();
+        Steps.replan(true);
         return;
       }
-      lastBuild = b;
-      S.code = b.code;
-      S.savedScript = b.name;
-      Code.renderSecrets(b.secrets);
-      $('#code-preview').textContent = b.code;
-      $('#script-name').value = b.name.replace(/\.py$/i, '');
-      $('#btn-save').disabled = false;
-      markDone('code', true, `${b.steps} ステップ`);
-      Run.refreshScripts(b.name);
-      Steps.replan();  // keep the advanced table in sync (not awaited)
-      renderDone(b);
+      applyBuild(b);
+      Steps.replan(true);  // the table of 詳細設定 (not awaited)
       stage('done');
       setStatus(`スクリプトができました: ${b.name}`, 'ok');
     }
@@ -13261,38 +12775,30 @@ select.w-full { width: 100%; max-width: 100%; }
     async function discardSilently(message) {
       stage('processing', '記録を止めています…');
       try { await api('/api/record/stop', { method: 'POST', json: { discard: true } }); } catch (e) { /* already stopped */ }
-      recOrigin = null;
-      await pollOnce();
-      stage('idle'); btnStart.disabled = !canStart();
+      stopPolling();
+      stage('idle');
       showError(message);
       setStatus('記録できませんでした', 'error');
-      readiness();
     }
 
     async function cancel() {
       if (!window.confirm('記録をやめて破棄しますか？')) return;
       stage('processing', '記録を止めています…');
-      try {
-        const res = await api('/api/record/stop', { method: 'POST', json: { discard: true } });
-        if (res.recording) Load.applySummary(res.recording);  // unchanged: the discarded recording is never loaded
-      } catch (e) { /* already stopped: nothing to discard */ }
-      recOrigin = null;
-      await pollOnce();
-      stage('idle'); btnStart.disabled = !canStart();
+      try { await api('/api/record/stop', { method: 'POST', json: { discard: true } }); } catch (e) { /* already stopped: nothing to discard */ }
+      stopPolling();
+      stage('idle');
       setStatus('記録をやめました', 'info');
-      readiness();
     }
 
     // ---------------------------------------------------------------- done screen
-    // The plain-Japanese text of each plan warning comes from the server (routes.warning_message,
-    // tested against the warnings build_plan really produces); the raw text is the fallback.
-    function warningTexts(details, raw) {
-      if (Array.isArray(details)) return details.map((d) => d.message || d.text);
-      return raw || [];
+    function showScript(name, path) {  // the current script (saved under another name in 詳細設定, too)
+      $('#easy-done-name').textContent = name || '';
+      if (path) $('#easy-done-path').textContent = path;
+      const dl = $('#easy-download');
+      if (name) { dl.href = scriptUrl(name); dl.setAttribute('download', name); }
     }
     function renderDone(b) {
-      $('#easy-done-name').textContent = b.name;
-      $('#easy-done-path').textContent = b.path;
+      showScript(b.name, b.path);
       $('#easy-done-steps').textContent = `${b.steps} 手順 (記録した ${b.flows_total} 件の通信から、画像や広告などを除いて作りました)`;
       $('#easy-done-final').textContent = b.final_url ? `${b.final_method || ''} ${b.final_url}` : '最後の手順の結果';
       const files = clear($('#easy-done-files'));
@@ -13326,13 +12832,7 @@ select.w-full { width: 100%; max-width: 100%; }
         sec.textContent = text;
         sec.hidden = false;
       } else sec.hidden = true;
-      const dl = $('#easy-download');
-      dl.href = b.download_url;
-      dl.setAttribute('download', b.name);
       $('#easy-run').hidden = true;
-      $('#easy-run-out').textContent = '';
-      $('#easy-run-err').textContent = '';
-      $('#easy-run-err-wrap').hidden = true;
       $('#easy-save-output-result').textContent = '';
     }
 
@@ -13340,82 +12840,26 @@ select.w-full { width: 100%; max-width: 100%; }
       try { await api('/api/folder/open', { method: 'POST', json: { folder: 'scripts' } }); }
       catch (e) { fail(e, 'フォルダを開けません'); }
     });
-    $('#easy-again').addEventListener('click', () => { stage('idle'); btnStart.disabled = !canStart(); showError(''); readiness(); });
-    // a recording loaded elsewhere (詳細設定 / HAR from DevTools) can be turned into a script from here too
-    function refreshLoaded() {
-      const loaded = !!(S.recording && S.recording.loaded && S.recording.flows);
-      $('#easy-loaded').hidden = !loaded;
-      if (loaded) $('#easy-loaded-count').textContent = S.recording.flows;
-    }
+    $('#easy-open-detail').addEventListener('click', () => setMode('advanced'));
+    $('#easy-again').addEventListener('click', () => { stage('idle'); showError(''); });
     $('#easy-build-loaded').addEventListener('click', async () => {
-      if (!(S.recording && S.recording.loaded)) return;
+      if (!(S.recording && S.recording.loaded) || !okToStartOver()) return;
       showError('');
       stage('processing', `読み込み済みの ${S.recording.flows} 件の通信を解析して、スクリプトを作成しています…`);
       await build();
     });
+    $('#easy-har-pick').addEventListener('click', () => $('#easy-har-input').click());
+    $('#easy-har-input').addEventListener('change', (e) => {
+      const files = Array.from(e.target.files || []);
+      e.target.value = '';  // the same file can be chosen again
+      buildFromFiles(files);
+    });
     $('#easy-test-run').addEventListener('click', () => {
-      Run.renderEnvInputsInto($('#easy-env'), 'easy-env-', true);
+      Run.renderEnvInputsInto($('#easy-env'), 'easy-env-', '▶ 実行');
       $('#easy-run').hidden = false;
       $('#easy-run').scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
-    $('#easy-run-btn').addEventListener('click', () => { if (lastBuild) Run.start(lastBuild.name, Run.collectEnvFrom($('#easy-env'))); });
-    $('#easy-run-stop').addEventListener('click', () => Run.stop());
-    $('#easy-save-output').addEventListener('click', async () => {
-      try {
-        const res = await api('/api/run/save_output', { method: 'POST', json: {} });
-        $('#easy-save-output-result').textContent = `保存しました: ${res.path}`;
-        setStatus(`結果を保存しました: ${res.name}`, 'ok');
-      } catch (e) { fail(e, '結果を保存できません'); }
-    });
-    // plain-language hint for the most common failures of a generated script (the raw traceback stays available below)
-    const ERROR_HINTS = [
-      [/getaddrinfo failed|Name or service not known|NameResolutionError|nodename nor servname/i, 'サイトに接続できません (アドレスが見つかりません)。社内ネットワークに接続しているか、VPN が必要なサイトではないか確認してください。'],
-      [/ConnectTimeout|Read timed out|timed out/i, 'サイトの応答がありません (タイムアウト)。しばらくしてからもう一度実行してください。'],
-      [/CERTIFICATE_VERIFY_FAILED|SSLError|SSLCertVerificationError/i, 'https:// のサイトの証明書を確認できませんでした。このツールが対象とするのは http:// のサイトです。'],
-      [/ConnectionRefused|Connection refused|WinError 10061/i, 'サイトに接続できません (接続が拒否されました)。サイトが動いているか確認してください。'],
-      [/\b(401|403) Client Error|Unauthorized for url|Forbidden for url/, 'ログインに失敗したか、権限がありません。パスワードなどの入力値を確認してください。'],
-      [/REQREC_[A-Z_]+ (が|is) /, '実行に必要な入力 (パスワードなど) が足りません。上の入力欄をすべて埋めてください。'],
-      [/要素が見つかりません|パターンに一致しませんでした|JSON にパス/, '画面の内容が記録したときと違うため、続きの値を取り出せませんでした。パスワードが正しいか、ログインが拒否されていないかを確認してください。サイトの画面が変わった場合は、もう一度記録してください。'],
-      [/ModuleNotFoundError: No module named '(requests_negotiate_sspi|requests_ntlm)'/, 'Windows 統合認証用の部品が入っていません。管理者に pip install "reqrec[sspi]" の実行を依頼してください。'],
-      [/ModuleNotFoundError: No module named '([\w.]+)'/, '必要な部品 ($1) が入っていません。管理者に pip install の実行を依頼してください。'],
-      [/status (\d{3}) .*expected|想定外のステータス|unexpected status/i, 'サイトの応答が記録したときと違います。サイト側が変わったか、ログインが切れている可能性があります。'],
-    ];
-    function errorHint(text) {
-      if (!text) return '';
-      for (const [re, msg] of ERROR_HINTS) {
-        const m = re.exec(text);
-        if (m) return msg.replace('$1', m[1] || '');
-      }
-      const last = text.trim().split('\n').pop();
-      return last ? `エラー: ${last.slice(0, 200)}` : '';
-    }
-    Run.subscribe((st) => {
-      const running = !!st.running;
-      $('#easy-run-btn').disabled = running;
-      $('#easy-run-stop').disabled = !running;
-      $('#easy-save-output').disabled = running || !st.started_at;
-      const out = $('#easy-run-out');
-      out.textContent = (st.output_tail ?? st.stdout_tail) || (running ? '(実行中… 出力を待っています)' : '');
-      if (running) out.scrollTop = out.scrollHeight;
-      const errors = (st.errors_tail ?? st.stderr_tail) || '';  // stderr without the progress lines
-      $('#easy-run-err').textContent = errors;
-      $('#easy-run-err-wrap').hidden = !errors;
-      const s = $('#easy-run-state');
-      const hint = $('#easy-run-hint');
-      hint.hidden = true;
-      if (running) { s.textContent = '実行中…'; s.className = 'run-state running'; }
-      else if (st.exit_code === null || st.exit_code === undefined) { s.textContent = '待機中'; s.className = 'run-state'; }
-      else if (st.exit_code === 0) { s.textContent = '正常に終わりました'; s.className = 'run-state ok'; }
-      else {
-        s.textContent = st.stopped_by_user ? '停止しました' : 'エラーで終わりました';
-        s.className = 'run-state fail';
-        if (!st.stopped_by_user) {
-          const h = errorHint(st.stderr_tail);
-          if (h) { hint.textContent = h; hint.hidden = false; }
-          $('#easy-run-err-wrap').open = true;
-        }
-      }
-    });
+    Run.bindView('easy', { canRun: () => !!S.script, onRun: () => Run.start(S.script, Run.collectEnvFrom($('#easy-env'))) });
 
     btnStart.addEventListener('click', start);
     btnStop.addEventListener('click', stop);
@@ -13425,47 +12869,57 @@ select.w-full { width: 100%; max-width: 100%; }
 
     function initFromState(st) {
       lastIEError = (st.iehost && st.iehost.last_error) || null;
-      let mode = 'easy';
-      try { mode = localStorage.getItem('reqrec.mode') || 'easy'; } catch (e) { /* ignore */ }
-      setMode(mode, false);
+      setEmulation(st.iehost && st.iehost.emulation);
       if (st.recorder && st.recorder.running) {
-        // a page reload during an in-app-browser recording keeps the auto-stop working, but only for a
-        // recording that was started from the easy screen (record_origin is kept by the server)
-        const b = st.browser || null;
-        recOrigin = st.record_origin || null;
-        browserSeen = !!(b && b.kind === 'iehost' && b.running);
+        // a page reload during a recording: it is finished here (closing the browser still stops it)
+        setMode('easy', false);
+        browserSeen = !!(st.browser && st.browser.kind === 'iehost' && st.browser.running);
         autoStopped = false;
         stage('recording');
         renderLive(st.recorder);
-        Record.startPolling();
-      } else {
-        stage('idle');
-        btnStart.disabled = !canStart();
-        readiness();
+        startPolling();
+        return;
       }
+      let mode = 'easy';
+      try { mode = localStorage.getItem('reqrec.mode') || 'easy'; } catch (e) { /* ignore */ }
+      setMode(mode, false);
+      stage('idle');
     }
-    return { initFromState, refreshLoaded };
+    return { initFromState, renderDone, showScript, refreshLoaded };
   })();
+
+  // ================================================================== shared by the two screens
+  // A recording was loaded (recorded or HAR): the server starts over with the default options and no script.
+  function setRecording(sum) {
+    S.recording = sum;
+    S.plan = null;
+    S.flows = [];
+    S.secrets = [];
+    Steps.fillOptions(sum.plan_options, sum.gen_options);
+    Detail.setScript(null, null, null);
+    Easy.refreshLoaded();
+  }
+  // A script was made (かんたん画面) or rebuilt (詳細設定 [設定から作り直す]) and saved: /api/easy/build.
+  function applyBuild(b) {
+    S.secrets = b.secrets || [];
+    S.generatedCode = b.code;
+    Steps.fillOptions(b.plan_options, b.gen_options);
+    Detail.setScript(b.name, b.code, b.path);
+    Easy.renderDone(b);
+  }
 
   // ================================================================== 起動
   async function init() {
     try {
       const st = await api('/api/state');
-      Record.render(st.recorder || {});
-      Load.applySummary(st.recording || { loaded: false });
+      S.recording = st.recording || { loaded: false };
+      S.secrets = st.secrets || [];
+      Steps.fillOptions(st.plan_options, st.gen_options);
       Run.render(st.run || {});
-      if (st.secrets && st.secrets.length) Code.renderSecrets(st.secrets);
-      if (st.last_script) S.savedScript = st.last_script;
-      if (st.recording && st.recording.loaded) Steps.replan();
-      Load.refreshFiles();
-      Run.refreshScripts();
-      let panel = null;
-      try { panel = localStorage.getItem('reqrec.panel'); } catch (e) { /* ignore */ }
-      if (st.recorder && st.recorder.running) panel = 'record';
-      else if (!panel && st.recording && st.recording.loaded) panel = 'steps';
-      if (panel && panels[panel]) show(panel);
-      if (st.iehost && st.iehost.emulation) Record.setEmulation(st.iehost.emulation);
       Easy.initFromState(st);
+      Detail.refresh();
+      if (st.last_script) await Detail.loadScript(st.last_script);
+      if (S.recording.loaded) Steps.replan(true);
     } catch (e) { fail(e, '初期化に失敗しました'); }
   }
   init();

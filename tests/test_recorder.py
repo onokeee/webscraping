@@ -22,7 +22,7 @@ from reqrec import Recording
 import reqrec as run_mod
 from reqrec import ADDON_PATH, HTTPS_PASSTHROUGH_ARGS, MITMDUMP_PYTHON_STUB, RECORD_LISTEN_HOST, build_command
 
-from reqrec import DEFAULT_OUT, ReqRecAddon, addons, parse_hosts, write_recording_atomic
+from reqrec import DEFAULT_OUT, ReqRecAddon, addons, write_recording_atomic
 
 try:
     from mitmproxy.test import taddons, tflow
@@ -57,21 +57,6 @@ def _no_temp_files(directory: Path) -> bool:
 
 
 # =========================================================================== helpers
-
-class TestParseHosts:
-    @pytest.mark.parametrize("spec, expected", [
-        (None, []),
-        ("", []),
-        ("  , ", []),
-        ("example.com", ["example.com"]),
-        ("Example.COM, api.example.com;foo.test", ["example.com", "api.example.com", "foo.test"]),
-        ("a.com b.com\nc.com.", ["a.com", "b.com", "c.com"]),
-        (["A.com", "a.com", "b.com,c.com"], ["a.com", "b.com", "c.com"]),
-        (("x.test",), ["x.test"]),
-    ])
-    def test_parse(self, spec, expected):
-        assert parse_hosts(spec) == expected
-
 
 class TestWriteRecordingAtomic:
     def test_writes_valid_json_and_leaves_no_temp_files(self, tmp_path: Path):
@@ -112,17 +97,16 @@ class TestAddonWithMitmproxyContext:
         addon = ReqRecAddon()
         with taddons.context(addon) as tctx:
             assert tctx.options.reqrec_out == DEFAULT_OUT
-            assert tctx.options.reqrec_hosts == ""
+            assert "reqrec_hosts" not in tctx.options  # every host is recorded (filter removed 2026-10-25)
             assert addon.output_path == os.path.abspath(DEFAULT_OUT)
 
-    def test_configure_sets_output_and_hosts(self, tmp_path: Path):
+    def test_configure_sets_output(self, tmp_path: Path):
         addon = ReqRecAddon()
         out = tmp_path / "rec.json"
         with taddons.context(addon) as tctx:
-            tctx.configure(addon, reqrec_out=str(out), reqrec_hosts="Shop.example.test, api.example.test")
+            tctx.configure(addon, reqrec_out=str(out))
             assert addon.out == str(out)
             assert addon.output_path == str(out)
-            assert addon.hosts == ["shop.example.test", "api.example.test"]
 
     def test_response_writes_valid_json_after_every_call(self, tmp_path: Path):
         addon = ReqRecAddon()
@@ -141,7 +125,7 @@ class TestAddonWithMitmproxyContext:
             assert [f.request.url for f in rec.flows] == [f"https://shop.example.test/page{n}" for n in range(1, 4)]
             assert rec.flows[0].response.status == 200
             assert rec.flows[0].response.body == b"message"
-            assert rec.meta["source"] == "mitmproxy"
+            assert rec.meta["source"] == "mitmproxy" and "hosts" not in rec.meta
             assert rec.meta["flows_total"] == 3 and rec.meta["errors"] == 0
             assert rec.meta["started_at"] and rec.meta["updated_at"]
             assert addon.flush_count == 3
@@ -154,24 +138,17 @@ class TestAddonWithMitmproxyContext:
         rec = Recording.load(addon.output_path)
         assert [(f.id, f.request.path) for f in rec.flows] == [("f0001", "/early"), ("f0002", "/middle"), ("f0003", "/late")]
 
-    def test_host_filtering_including_subdomains(self, tmp_path: Path):
+    def test_every_host_is_recorded(self, tmp_path: Path):
         addon = ReqRecAddon()
         out = tmp_path / "rec.json"
         with taddons.context(addon) as tctx:
-            tctx.configure(addon, reqrec_out=str(out), reqrec_hosts="example.test")
-            addon.response(_http_flow("tracker.other.test", "/pixel"))
-            assert not out.exists()  # nothing recorded -> nothing written yet
+            tctx.configure(addon, reqrec_out=str(out))
             addon.response(_http_flow("example.test", "/"))
             addon.response(_http_flow("API.example.test", "/v1/me"))
-            addon.response(_http_flow("notexample.test", "/"))
-            addon.response(_http_flow("example.test.evil.com", "/"))
+            addon.response(_http_flow("tracker.other.test", "/pixel"))  # dropped later by the analysis, not here
             rec = Recording.load(str(out))
-            assert [f.request.host for f in rec.flows] == ["example.test", "api.example.test"]
+            assert [f.request.host for f in rec.flows] == ["example.test", "api.example.test", "tracker.other.test"]
             assert rec.flows[1].request.url == "https://API.example.test/v1/me"  # URL kept as captured
-            # widening the filter at runtime applies to later flows
-            tctx.configure(addon, reqrec_hosts="")
-            addon.response(_http_flow("anything.test", "/"))
-            assert len(_read(out)["flows"]) == 3
 
     def test_error_hook_records_request_without_response(self, tmp_path: Path):
         addon = ReqRecAddon(out=str(tmp_path / "rec.json"))
@@ -240,22 +217,19 @@ class TestAddonWithMitmproxyContext:
         # Simulate plain-Python use: no mitmproxy master is running (taddons leaves a stale global ctx).
         monkeypatch.delattr(ctx, "options", raising=False)
         monkeypatch.delattr(ctx, "master", raising=False)
-        addon = ReqRecAddon(out=str(tmp_path / "direct.json"), hosts=["example.test"])
-        addon.configure({"reqrec_out", "reqrec_hosts"})  # no options readable: constructor values stay
-        assert addon.hosts == ["example.test"]
+        addon = ReqRecAddon(out=str(tmp_path / "direct.json"))
+        addon.configure({"reqrec_out"})  # no options readable: the constructor value stays
         assert addon.output_path == str(tmp_path / "direct.json")
         addon.response(_http_flow("example.test", "/x"))
         assert len(_read(tmp_path / "direct.json")["flows"]) == 1
 
-    def test_non_default_options_override_constructor_values(self, tmp_path: Path):
-        addon = ReqRecAddon(out=str(tmp_path / "ctor.json"), hosts=["ctor.test"])
+    def test_non_default_option_overrides_constructor_value(self, tmp_path: Path):
+        addon = ReqRecAddon(out=str(tmp_path / "ctor.json"))
         with taddons.context(addon) as tctx:
-            tctx.configure(addon, reqrec_out=str(tmp_path / "opt.json"), reqrec_hosts="opt.test")
+            tctx.configure(addon, reqrec_out=str(tmp_path / "opt.json"))
             assert addon.output_path == str(tmp_path / "opt.json")
-            assert addon.hosts == ["opt.test"]
-            tctx.configure(addon, reqrec_out=DEFAULT_OUT, reqrec_hosts="")  # back to defaults -> constructor values
+            tctx.configure(addon, reqrec_out=DEFAULT_OUT)  # back to the default -> constructor value
             assert addon.output_path == str(tmp_path / "ctor.json")
-            assert addon.hosts == ["ctor.test"]
 
     def test_recording_snapshot_is_valid_recording(self, tmp_path: Path):
         addon = ReqRecAddon(out=str(tmp_path / "rec.json"))
@@ -317,15 +291,15 @@ class TestScriptMode:
 class TestBuildCommand:
     def test_prefers_mitmdump_executable(self, monkeypatch, tmp_path: Path):
         monkeypatch.setattr(shutil, "which", lambda name: "/opt/venv/bin/mitmdump" if name == "mitmdump" else None)
-        cmd = build_command(str(tmp_path / "rec.json"), port=8081, hosts=["Shop.example.test", "api.example.test"])
+        cmd = build_command(str(tmp_path / "rec.json"), port=8081)
         assert cmd[0] == "/opt/venv/bin/mitmdump"
         assert cmd[1:3] == ["-s", ADDON_PATH]
         assert cmd[3:5] == ["--set", f"reqrec_out={tmp_path / 'rec.json'}"]
-        assert cmd[5:7] == ["--set", "reqrec_hosts=shop.example.test,api.example.test"]
-        assert cmd[7:9] == ["-p", "8081"]
-        assert cmd[9:11] == ["--listen-host", "127.0.0.1"]
-        assert cmd[11:13] == ["--set", "flow_detail=0"]
-        assert len(cmd) == 13
+        assert cmd[5:7] == ["-p", "8081"]
+        assert cmd[7:9] == ["--listen-host", "127.0.0.1"]
+        assert cmd[9:11] == ["--set", "flow_detail=0"]
+        assert len(cmd) == 11
+        assert not any(a.startswith("reqrec_hosts=") for a in cmd)  # every host is recorded
 
     def test_proxy_only_ever_listens_on_this_pc(self, monkeypatch):
         """The recording proxy's only client is the recording browser on this PC: no listen-host knob."""
@@ -336,6 +310,8 @@ class TestBuildCommand:
         assert cmd[-2:] == ["--ignore-hosts", ".*"]  # the GUI's always-on https:// pass-through
         with pytest.raises(TypeError):
             build_command("rec.json", listen_host="0.0.0.0")
+        with pytest.raises(TypeError):
+            build_command("rec.json", hosts=["a.test"])  # the host filter was removed (2026-10-25)
 
     def test_falls_back_to_python_entry_point(self, monkeypatch, tmp_path: Path):
         monkeypatch.setattr(shutil, "which", lambda name: None)
@@ -345,12 +321,10 @@ class TestBuildCommand:
         assert cmd[3:5] == ["-s", ADDON_PATH]
         assert "-p" in cmd and cmd[cmd.index("-p") + 1] == "8080"
         assert cmd[cmd.index("--listen-host") + 1] == "127.0.0.1"
-        assert not any(a.startswith("reqrec_hosts=") for a in cmd)  # no hosts -> option omitted (= all)
 
-    def test_hosts_as_string_and_extra_args(self, monkeypatch):
+    def test_extra_args(self, monkeypatch):
         monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/mitmdump")
-        cmd = build_command("rec.json", port="9000", hosts="a.com, b.com", extra_args=["--ssl-insecure", "--set", "connection_strategy=lazy"])
-        assert "reqrec_hosts=a.com,b.com" in cmd
+        cmd = build_command("rec.json", port="9000", extra_args=["--ssl-insecure", "--set", "connection_strategy=lazy"])
         assert cmd[cmd.index("flow_detail=0") - 1] == "--set"  # mitmdump's own per-flow dump is always off
         assert cmd[-3:] == ["--ssl-insecure", "--set", "connection_strategy=lazy"]
         assert cmd[cmd.index("-p") + 1] == "9000"
@@ -411,7 +385,7 @@ def test_real_mitmdump_records_proxied_request(tmp_path: Path):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     proxy_port = _free_port()
     out = tmp_path / "live.json"
-    cmd = build_command(str(out), port=proxy_port, hosts=["127.0.0.1"], extra_args=list(HTTPS_PASSTHROUGH_ARGS))
+    cmd = build_command(str(out), port=proxy_port, extra_args=list(HTTPS_PASSTHROUGH_ARGS))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         _wait_for_port(proxy_port, proc)
@@ -447,4 +421,4 @@ def test_real_mitmdump_records_proxied_request(tmp_path: Path):
     assert flow.response.mime_type == "text/html"
     assert "こんにちは" in flow.response.text()
     assert flow.response.set_cookies == ["sid=abc123; Path=/"]
-    assert rec.meta["source"] == "mitmproxy" and rec.meta["hosts"] == ["127.0.0.1"]
+    assert rec.meta["source"] == "mitmproxy" and "hosts" not in rec.meta

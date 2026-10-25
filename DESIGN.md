@@ -9,7 +9,7 @@ recording browser (`RecBrowser.exe`, §13.12): `POST /api/record/start` starts m
 with `HTTPS_PASSTHROUGH_ARGS` (`--ignore-hosts .*`) always on, and opens the recording browser
 through it.  A PC that cannot run the recording browser cannot record; there is no fallback.
 Importing a HAR (e.g. saved with IE11's F12 tools) or a reqrec JSON recording, the analysis, code
-generation, script runs, downloads, 表示モード, the host filter, 追加モード and the CLI commands
+generation, script runs, downloads, 表示モード, the host filter, 追加モード (these two removed on 2026-10-25) and the CLI commands
 `import` / `inspect` / `generate` / `gui` / `browser` are unchanged.  Everything that existed only
 for Chrome / normal Edge / other browsers / smartphones / https recording / mitmproxy flow files
 was deleted.  The history sections below still mention these names (as history); where a section
@@ -24,6 +24,20 @@ specifies a removed feature, a note dated 2026-10-12 (3) says so.
 | `reqrec record` (the recorder's `run` sub-section, §3) | `cmd_record`, `run_record`, `stop_child`, `format_instructions`, `_print_summary`, `_GRACE_FIRST_WAIT`, `_GRACE_AFTER_SIGINT` | `build_command`, `mitmdump_launcher`, `mitmproxy_available`, `_wait` |
 | mitmproxy flow files (the importers' `mitm` sub-section, §2) | `load_mitm`, `_import_mitmproxy`, `_flows_in_order`, `MITM_EXTENSIONS`, `MITMPROXY_INSTALL_HINT`; `.mitm` / `.flows` / `.flow` as input and upload | `flow_from_mitm` and its helpers (used by the recorder addon); `RECORDING_EXTENSIONS = {".har", ".json"}` |
 | legacy TLS (codegen, §13.3) | `GenOptions.legacy_tls`, `generate --legacy-tls`, the GUI checkbox; `VERIFY_TLS`, `session.verify`, `import ssl` / `import warnings`, `_LegacyTLSAdapter` in generated scripts | — |
+
+**2026-10-25: 詳細設定 = the details of the script made on the easy screen.**  The five panels
+(1 記録 / 2 読み込み / 3 ステップ / 4 コード / 5 実行) became one screen (`#panel-detail`, §13.11) for
+checking and customising the script the easy screen made: the steps table, the settings with
+[設定から作り直す] (`/api/easy/build` with the current script's name), the code in an editable
+`<textarea>` with [保存] (`/api/scripts/save`), and 試しに実行.  Recording happens only on the easy
+screen, which also got 表示モード and [HAR ファイルから作る…].
+
+| area | removed | kept |
+|---|---|---|
+| recording settings of 「1 記録」 | the page's host filter (記録するサイト), 追加モード, 最初に開くアドレス (the easy screen's 開くサイトのアドレス stays), record status card and proxy log; the `record_start` fields `hosts`, `append`, `origin` (ignored now) and the response field `origin`; `/api/record/stop {append}`; `AppState.record_append` / `record_origin`, `_ORIGINS`, `/api/state` → `record_origin`, `/api/record/status` → `origin` | `record_start {start_url, emulation}`; `/api/record/stop {discard}` |
+| the recorder's host filter | the addon option `reqrec_hosts`, `OPT_HOSTS`, `parse_hosts`, `HostsSpec`, `ReqRecAddon(hosts=)` / `.hosts`, `_host_of`, `meta["hosts"]` of a recording; `build_command(hosts=)`; `RecorderManager.start(hosts=)` / `.hosts` and `status()["hosts"]` | every HTTP flow through the proxy is recorded (its only client is the recording browser); hosts are chosen afterwards in 詳細設定 (`include_hosts` / `exclude_hosts` of `PlanOptions`) |
+| 「2 読み込み」 | the routes `GET /api/recordings`, `POST /api/recordings/open`, `POST /api/recordings/clear`; `_resolve_recording_name`, `_file_entry_with_flows`, `CHEAP_COUNT_MAX_BYTES`, `AppState.clear_recording`; the `append` form field of the upload, `set_recording(..., append)` and the summary field `appended` | `POST /api/recordings/upload` (several files are merged by time stamp); a new recording now resets the options and the current script (`set_recording`) |
+| 「4 コード」 / 「5 実行」 | `POST /api/generate`, `GET /api/scripts` (script list), the script select, `#code-preview` | `/api/easy/build` (both screens; its payload adds `plan_options` / `gen_options`), `/api/scripts/save`, `/api/scripts/<name>/download` (also reloads the editor), `/api/run*` |
 
 The whole application is **one module, `reqrec.py`, in the repository root** (no package folder,
 no data files).  The repository holds only `reqrec.py`, `pyproject.toml`, `requirements.txt` (pinned
@@ -287,11 +301,11 @@ def flow_from_mitm(flow, flow_id: str) -> Flow   # HTTPFlow (or a duck-typed obj
 ```python
 # reqrec/recorder/addon.py   — a mitmproxy addon (importable without mitmproxy *installed* at module
 #                              import time only if guarded; it's fine to require mitmproxy here)
-class ReqRecAddon:   options: reqrec_out (str path), reqrec_hosts (str, comma-separated, "" = all)
+class ReqRecAddon:   options: reqrec_out (str path)   (reqrec_hosts was removed on 2026-10-25)
     load(loader) / response(flow) / error(flow) / done()
 addons = [ReqRecAddon()]
 ```
-Append every completed HTTP flow (optionally only for the given hosts and their sub-domains) and
+Append every completed HTTP flow and
 **flush the JSON file atomically after every response** (write temp file + `os.replace`) so a
 killed session still leaves a valid recording. `meta = {"source": "mitmproxy", "started_at": …}`.
 
@@ -300,13 +314,12 @@ killed session still leaves a valid recording. `meta = {"source": "mitmproxy", "
 RECORD_LISTEN_HOST = "127.0.0.1"
 def mitmproxy_available() -> bool          # a mitmdump executable on PATH or an importable mitmproxy
 def mitmdump_launcher() -> list[str]       # [mitmdump] when on PATH, else [sys.executable, "-c", MITMDUMP_PYTHON_STUB]
-def build_command(out: str, port: int = 8080, hosts: list[str] | str | None = None,
-                  extra_args: Sequence[str] = ()) -> list[str]
+def build_command(out: str, port: int = 8080, extra_args: Sequence[str] = ()) -> list[str]
 ```
 `build_command` returns (the bracketed parts only when they apply)
 
 ```
-<mitmdump_launcher()> -s <ADDON_PATH> --set reqrec_out=<absolute out> [--set reqrec_hosts=a,b]
+<mitmdump_launcher()> -s <ADDON_PATH> --set reqrec_out=<absolute out>
     -p PORT --listen-host 127.0.0.1 --set flow_detail=0 [extra_args...]
 ```
 It is the default `command_builder` of `RecorderManager` (§13.6), the only way reqrec records; the
@@ -722,53 +735,57 @@ offline). UI language: **Japanese**. Served only on the bind address; default `1
 * file names from the client are reduced to a basename and must match `^[\w.\-]+$`; everything is
   read/written **inside `workdir`** (resolve + check prefix). Uploaded files are stored under
   `workdir/uploads/`. Generated scripts under `workdir/scripts/`. Recordings under `workdir/recordings/`.
-* secrets typed in the 実行 panel (env values) are passed to the subprocess only; never written to disk, never logged.
+* secrets typed into the 試しに実行 inputs (env values) are passed to the subprocess only; never written to disk, never logged.
 * `debug=False`; no `flask run` reloader.
 
 **JSON API** (all return JSON; errors `{"error": "<日本語>"}` with 4xx):
 * `GET /` → page. `GET /api/state` → `{version, workdir, gui_address, mitmproxy_available,
   recorder: {...}, recording: {loaded: bool, sources: [...], flows: n, ...}, plan_loaded, plan_options,
-  gen_options, run, iehost, browser, record_origin, last_script, secrets}` (the `windows: {is_windows,
-  proxy, cert}` block and `record_browser_kind` were removed on 2026-10-12 (3)).
-* Recording (current contract since 2026-10-12 (3); every recording opens the recording browser,
-  §13.12): `POST /api/record/start {hosts: [...] | "a,b", append: bool, start_url, emulation: "keep" |
-  <iehost.EMULATION_LEVELS key>, origin: "easy" | "advanced"}`, all optional; the former keys `port`,
-  `listen_host`, `set_system_proxy`, `browser` and `https_passthrough` are ignored.  Order: validate
-  `hosts`, `start_url` (`_iehost_start_url`), `emulation`, `origin` (400) → 409 when already
+  gen_options, run, iehost, browser, last_script, secrets}` (the `windows: {is_windows,
+  proxy, cert}` block and `record_browser_kind` were removed on 2026-10-12 (3), `record_origin` on 2026-10-25).
+* Recording (current contract since 2026-10-25; every recording opens the recording browser,
+  §13.12, and every site opened in it is recorded): `POST /api/record/start {start_url, emulation:
+  "keep" | <iehost.EMULATION_LEVELS key>}`, both optional; the former keys `hosts`, `append`, `origin`
+  (2026-10-25), `port`, `listen_host`, `set_system_proxy`, `browser` and `https_passthrough` are
+  ignored.  Order: validate `start_url` (`_iehost_start_url`), `emulation` (400) → 409 when already
   recording → 400 when mitmproxy is missing (only with the default command builder) →
   `_require_iehost` (400 with `iehost.availability()["reason"]`) → `port = find_free_port("127.0.0.1",
   preferred=8080, avoid=(GUI port,))` → close a leftover recording browser,
-  `RecorderManager.start(out, port=port, hosts=hosts, extra_args=list(HTTPS_PASSTHROUGH_ARGS))` (output
+  `RecorderManager.start(out, port=port, extra_args=list(HTTPS_PASSTHROUGH_ARGS))` (output
   `workdir/recordings/rec_YYYYmmdd_HHMMSS.json`) → when the child is running: `wait_until_listening`
   (500 `kind: "proxy"` on timeout), 表示モード (500 `kind: "emulation"`) and
   `_launch_iehost(state, "127.0.0.1:PORT", start_url)` (500 `kind: "iehost"`); each of these three
   failures stops the recorder and forgets the file (`_abandon_start`).  Returns `{out, out_path, port,
-  proxy_address: "127.0.0.1:PORT", status, browser, emulation, origin, warnings,
+  proxy_address: "127.0.0.1:PORT", status, browser, emulation, warnings,
   self_excluded_hosts}`.  `GET /api/record/status` → `RecorderManager.status()` (`{running, flows,
-  out, out_name, pid, exit_code, started_at, stopped_at, port, hosts, stdout_tail, stderr_tail, error,
+  out, out_name, pid, exit_code, started_at, stopped_at, port, stdout_tail, stderr_tail, error,
   command}`; counts flows by reading the flushed JSON, tolerant of a file mid-write) plus
-  `mitmproxy_available`, `browser: {kind, running, pid, exit_code}` and `origin`.
-  `POST /api/record/stop {append?, discard?}` → closes the recording browser, stops the recorder,
-  **loads the recording** as current (merging with already loaded ones only when `append`, by
-  default the choice made at start), returns the recording summary plus `{out, out_path, exit_code,
-  browser_exit_code}`; nothing recorded → 400 「何も記録されませんでした。…」 with `empty: true`;
+  `mitmproxy_available` and `browser: {kind, running, pid, exit_code}`.
+  `POST /api/record/stop {discard?}` → closes the recording browser, stops the recorder,
+  **loads the recording** as the new current one (`AppState.set_recording`: replaces the loaded
+  recording and resets `plan_options` / `gen_options` to the defaults and the current script,
+  `last_script` / `secrets`, because flow ids belong to one recording), returns the recording summary
+  plus `{out, out_path, exit_code, browser_exit_code, excluded_self, plan_options, gen_options}`; nothing recorded → 400 「何も記録されませんでした。…」 with `empty: true`;
   `{discard: true}` loads nothing and deletes the file (§13.11).  The former `instructions`,
   `auto_port`, `system_proxy`, `browser_kind`, `https_passthrough`, `listen_host`,
   `proxy_backup_active` and `proxy_error` fields are gone.
 * Loading: `POST /api/recordings/upload` (multipart, field `files`, several allowed: `.har` / `.json`
-  = `RECORDING_EXTENSIONS`, anything else 400 (`.mitm` since 2026-10-12 (3));
-  `append` form field) → saves to `uploads/`, `load_recordings`, sets/merges current; returns summary.
-  `GET /api/recordings` lists files in `recordings/` and `uploads/` (name, size, mtime, flows if cheap).
-  `POST /api/recordings/open {names: [...], append}` opens server-side files by name.
-  `POST /api/recordings/clear`.
+  = `RECORDING_EXTENSIONS`, anything else 400 (`.mitm` since 2026-10-12 (3))) → saves to `uploads/`,
+  `load_recordings` (several files merged by time stamp), sets it as the new current recording like
+  `record_stop` (options and script reset); returns the summary with `plan_options` / `gen_options`.
+  The file list / open / clear routes and the `append` field were removed on 2026-10-25.
 * Analysis: `POST /api/plan {plan_options}` → runs `build_plan`, stores plan+options, returns
   `cli.build_inspect_report(...)` **plus** `flows: [{id, started_at, method, status, mime, url, referer,
-  kept, reason, step_index, resource_type}]` for *every* flow, `constants`, `auth`, `warnings`,
-  `final_step_index`. `GET /api/flow/<id>` → request/response headers and decoded bodies (bodies
+  kept, reason, step_index, resource_type}]` for *every* flow, `constants`, `auth`, `warnings` (+
+  `warning_details` / `note_details` in plain Japanese, split like the easy build: 確認してください /
+  お知らせ), `final_step_index`. `GET /api/flow/<id>` → request/response headers and decoded bodies (bodies
   truncated to 200 KiB with a flag; JSON pretty-printed; binary → size + mime only).
-* Generation: `POST /api/generate {plan_options, gen_options}` → `{code, summary, warnings, secrets:
-  [{name, env_var}]}`; `POST /api/scripts/save {name, code}` → writes `scripts/<name>.py`, returns path;
-  `GET /api/scripts/<name>/download`; `GET /api/scripts` list.
+* Generation: `POST /api/easy/build {name?, plan_options?, gen_options?}` (§13.11) analyses, generates
+  and saves in one call — the easy screen after a recording, and 詳細設定 [設定から作り直す] with the
+  current script's `name` (the file is replaced); `POST /api/scripts/save {name, code}` → writes
+  `scripts/<name>.py` (詳細設定 [保存] of hand edits; that file becomes `last_script`), returns path;
+  `GET /api/scripts/<name>/download` (also how 詳細設定 reloads the editor after a page reload).
+  `POST /api/generate` and the `GET /api/scripts` list were removed on 2026-10-25.
 * Run: `POST /api/run {name, env: {VAR: value}}` → starts `sys.executable scripts/<name>.py` in a
   thread (cwd `workdir/scripts/`, env = os.environ + given), max one at a time; `GET /api/run/status`
   → `{running, exit_code, stdout_tail, stderr_tail, output_tail, errors_tail, started_at}`; `POST /api/run/stop`.
@@ -778,9 +795,9 @@ offline). UI language: **Japanese**. Served only on the bind address; default `1
   2026-10-12 (3); reqrec never changes the Windows proxy or installs a certificate.
 
 **RecorderManager** (recorder section, former `reqrec/recorder/manager.py`): wraps `build_command`
-(or an injected `command_builder`, called as `command_builder(out_abs, port=..., hosts=[...])`, plus
+(or an injected `command_builder`, called as `command_builder(out_abs, port=...)`, plus
 `extra_args=[...]` when there are any) + `subprocess.Popen` (stdout / stderr drained by reader
-threads into bounded ring buffers); `start(out, port=8080, hosts=None, extra_args=()) -> status()`;
+threads into bounded ring buffers); `start(out, port=8080, extra_args=()) -> status()`;
 `wait_until_listening(timeout=20.0)` (dials `127.0.0.1:port`, i.e. `RECORD_LISTEN_HOST`; `False` when
 the child exits first or the time runs out); `stop(timeout) -> exit_code` (SIGINT, or
 `CTRL_BREAK_EVENT` on Windows where the child runs in its own process group → wait → `terminate()` →
@@ -789,21 +806,20 @@ returns last good count while the file is mid-write); `load_recording()`.  There
 attribute or parameter any more: the proxy always listens on `127.0.0.1`.  Must be testable with a
 fake command (inject `command_builder`).
 
-**UI** (single page, sections as tabs or a vertical flow):
-1. 記録 — 記録するサイト (ホスト名)、追加モード、最初に開くアドレス、表示モード (記録用ブラウザ)、
-   [記録開始] (記録用プロキシを空きポートで起動し、記録用ブラウザを開く) / [記録停止して読み込む]、記録の状態
-   (ライブ件数、プロキシのアドレス、出力ファイル、記録用ブラウザの状態、プロキシのログ)。記録用ブラウザが使えない PC
-   では [記録開始] は無効で、理由を表示する (`#rec-unavailable`)。The port input, the 手順カード (proxy
-   `127.0.0.1:8080`, CA certificate, `http://mitm.it`, Internet Options) and the Windows card
-   ([システムプロキシを設定する], [CA 証明書をインストール]) were removed on 2026-10-12 (3).
-2. 読み込み — ファイル選択(複数: .har/.json)、IE の F12 開発者ツールで保存した HAR の案内、作業フォルダ内ファイル一覧から開く、「追加して結合」トグル。
-3. ステップ — フィルタ設定(静的ファイル/トラッカー/全て残す、リダイレクト統合、ループ検出、秘密情報の環境変数化、
-   ホスト include/exclude、認証検出)、全フローの表(チェック=採用、判定理由、ステップ番号、メソッド、
-   ステータス、種類、URL、参照元)、「結果として使う」ラジオ、クリックで詳細ドロワー(リクエスト/レスポンスのヘッダー・本文)。
-   表の変更は即 `/api/plan` 再計算。
-4. コード — [生成] → プレビュー(`<pre>` + 行番号は任意)、ファイル名入力、[保存]、[ダウンロード]、警告と環境変数の一覧。
-5. 実行 — 検出された秘密情報の環境変数ごとの入力欄(type=password)、[実行]/[停止]、標準出力/標準エラーのコンソール、
-   [結果を保存]。
+**UI** (single page, two screens since 2026-10-25; until then 詳細設定 was five panels 1 記録 /
+2 読み込み / 3 ステップ / 4 コード / 5 実行):
+1. かんたん画面 (default, §13.11) — 開くサイトのアドレス、表示モード、[記録をはじめる] → 記録中 → できあがり
+   (ファイル名・手順・保存されるファイル・確認してほしい点、[ダウンロード] / [保存先フォルダを開く] /
+   [試しに実行する] / [詳細を見る・変更する] / [もう一度記録する])、[HAR ファイルから作る…]。
+2. 詳細設定 (`#panel-detail`) — the script made on the easy screen: (1) 手順の一覧 = the flows table
+   (チェック = 使う、ラジオ = 結果、判定理由、手順番号、メソッド、ステータス、種類、URL、参照元; only the used
+   flows until 「使わない通信も表示」) with the plan summary and click-through drawer; changes re-plan at
+   once (`/api/plan`) and show 「設定を変えました」, (2) 設定 = plan + gen options and
+   [設定から作り直す] (confirms first when the editor differs from the generated code), (3) コード =
+   `<textarea>` editor (Tab = 4 spaces, Ctrl+S), file name, [保存] / [保存した内容に戻す] /
+   [ダウンロード], a 「保存していない変更」 badge and a `beforeunload` guard, (4) 試しに実行する (saves
+   unsaved edits first; env inputs, progress + result console, error hint, [結果をファイルに保存]).
+   Not available while recording or building.
 Status bar with the last message. Keep the JS modular (`api()`, render functions); no build step.
 
 **Tests**: `tests/test_webapp.py` (Flask test client; every endpoint; token/Host/Origin enforcement;
@@ -881,26 +897,31 @@ Nobody edits `model.py`, `util.py`, `pyproject.toml` or another owner's files. N
 Target users are factory-floor staff who must not have to know what a port, a proxy or a CA
 certificate is.  The GUI therefore opens in **easy mode** by default: one screen with
 **[記録をはじめる] → operate the site in the browser → [記録をおわる]**, and everything else is
-automatic.  The five detailed panels of §13.6 stay intact behind the **[詳細設定を表示]** toggle
-in the top bar (`body.easy-mode` hides the nav + panels via CSS; the choice is kept in
-`localStorage["reqrec.mode"]`).  No new state lives in the browser: the easy screen is a thin
-client over the existing API plus the three endpoints below, and it keeps the advanced panels in
-sync (`Record.render`, `Load.applySummary`, `Steps.replan`, `Code.renderSecrets`, `Run`).
+automatic.  The **[詳細設定を表示]** toggle in the top bar (also [詳細を見る・変更する] on the done
+screen) switches to 詳細設定, the screen for checking and customising the script the easy screen
+made (§13.6 UI; until 2026-10-25 five panels with their own recording and loading).  `body.easy-mode`
+(rendered on the `<body>`, so 詳細設定 never flashes) hides one screen via CSS; the choice is kept in
+`localStorage["reqrec.mode"]`; the toggle is disabled while recording or building.  No new state
+lives in the browser: both screens are thin clients over the API; `setRecording` / `applyBuild` in
+the page script keep them in sync (the current script `S.script`, its saved and generated code, the
+options echoed by the server).
 
 **Flow (the script in GUI_HTML, module `Easy`):**
-1. **start** — `POST /api/record/start {hosts: [], append: false, start_url: <address box>,
-   emulation: "keep", origin: "easy"}`.  The server always picks a free port on `127.0.0.1`
+1. **start** — `POST /api/record/start {start_url: <address box>, emulation: <表示モード select,
+   "keep" while it shows the current registry value>}`.  The server always picks a free port on `127.0.0.1`
    (`find_free_port("127.0.0.1", preferred=8080, avoid=(gui port,))`), waits for the proxy and opens
    the in-app recording browser itself (§13.12): no certificate, no system proxy, no Edge.  The
-   response carries `port`, `proxy_address`, `browser`, `origin` and `warnings`.  `emulation: "keep"`
-   = the easy screen never touches 表示モード (only 詳細設定 does).  (Until 2026-10-12 (3) the body
+   response carries `port`, `proxy_address`, `browser` and `warnings`.  `emulation: "keep"` = the
+   registry is not touched; the select starts at `/api/state` → `iehost.emulation` (a value set outside
+   reqrec shows as 「今の設定のまま」 = keep).  (Until 2026-10-25 the body also had `hosts`, `append` and
+   `origin`, and only 詳細設定 changed 表示モード.  Until 2026-10-12 (3) the body
    also had `port: "auto"`, `listen_host`, `set_system_proxy`, `https_passthrough` and
    `browser: "iehost" | "none"`, with a manual-proxy flow on other OSes.)
 2. **no recording browser = no recording** — [記録をはじめる] is rendered disabled unless mitmproxy
    and the recording browser are available (`data-mitm-available` / `data-iehost-available`), and the
    readiness list (`#easy-ready`) shows the reason (`data-iehost-reason`: not Windows, or neither
    `csc.exe` nor a prebuilt `RecBrowser.exe`) with 「この PC では記録できません」.  There is no fallback:
-   no system proxy, no certificate, no other browser; loading a HAR in 詳細設定 still works.  A launch
+   no system proxy, no certificate, no other browser; [HAR ファイルから作る…] still works.  A launch
    failure at run time (e.g. the exe blocked by AppLocker) is shown with guidance for the
    administrator (`python -m reqrec browser build` + allow that folder) and kept in
    `/api/state` → `iehost.last_error` for the readiness list.
@@ -911,13 +932,13 @@ sync (`Record.render`, `Load.applySummary`, `Steps.replan`, `Code.renderSecrets`
    `host:port` get `http://`, other schemes such as `javascript:` or `edge://` are rejected with
    400), `relaunched: true`.  409 when nothing is being recorded; `_require_iehost` as for start; a
    `browser` key in the body is ignored.
-4. **recording** — live count from the `Record` poller (`Record.subscribe`), [記録をおわる],
+4. **recording** — live count from polling `/api/record/status` every second, [記録をおわる],
    [ブラウザをもう一度開く], [やめる] (`POST /api/record/stop {discard: true}`: nothing is loaded and
    the file is deleted).  Closing the recording browser stops automatically (once it was seen
-   running; exit code 4 = its proxy could not be set → discard + message).  Switching back from
-   詳細設定 re-reads `/api/record/status` so a recording started there is followed.
-5. **stop** — `POST /api/record/stop {}` (the append choice stored at start applies; closes the
-   recording browser, stops the recorder and loads the recording;
+   running; exit code 4 = its proxy could not be set → discard + message), also after a page reload
+   (the page follows a running recording from `/api/state`).
+5. **stop** — `POST /api/record/stop {}` (closes the recording browser, stops the recorder and loads
+   the recording as the new one;
    no recording file at all = 「何も記録されませんでした」 400 with `empty: true`),
    then **`POST /api/easy/build`**: `build_plan` with the current `PlanOptions` → `generate` →
    save to `scripts/<scrape_<host>_YYYYmmdd_HHMM>.py` (or `{"name": ...}`), returns
@@ -929,9 +950,10 @@ sync (`Record.render`, `Load.applySummary`, `Steps.replan`, `Code.renderSecrets`
    {folder: "scripts"|"outputs"|"recordings"|"uploads"|"workdir"}` → `gui.open_folder`:
    `os.startfile` / `open` / `xdg-open`; anything else is a 400), [試しに実行する] (env inputs
    for `secrets`, `Run.start` / `Run.stop`, output console, a plain-language hint for the common
-   failures via `errorHint`, [結果をファイルに保存]), [もう一度記録する].
-   A recording loaded from the advanced panels (a HAR) can be built from the idle screen
-   too ([読み込み済みの記録からスクリプトを作る]).
+   failures via `errorHint`, [結果をファイルに保存]), [詳細を見る・変更する], [もう一度記録する].
+   **[HAR ファイルから作る…]** (`<input type=file multiple accept=".har,.json">`) uploads the files
+   (`/api/recordings/upload`) and goes through the same build; a loaded recording without a script
+   (after a page reload, or a build that failed) offers [読み込み済みの記録からスクリプトを作る].
 
 **Security:** the new endpoints are `POST` and therefore covered by the token / Host / Origin
 hook of `create_app`.  `/api/browser/open` only ever (re)starts the recording browser, with a start
@@ -1020,12 +1042,12 @@ ie8: 8000, ie11: 11000, ie11_force: 11001}`, `set_emulation` / `get_emulation` (
 value reqrec ever writes: `HKCU\Software\Microsoft\Internet Explorer\Main\FeatureControl\
 FEATURE_BROWSER_EMULATION\RecBrowser.exe`, and only for a non-default 表示モード; `default`
 deletes it, after a read-only check; `record_start` also accepts `emulation: "keep"` = no registry
-access at all, which the easy screen always sends; `/api/state` → `iehost.emulation` reports the
-current preset so the 詳細設定 select starts there).
+access at all, which the easy screen sends while its select shows the current value; `/api/state`
+→ `iehost.emulation` reports the current preset so the select starts there).
 
 **GUI / API.** Since 2026-10-12 (3) every recording uses the recording browser (§13.6 has the
-full `record_start` order).  `POST /api/record/start` takes `start_url` and `emulation` (besides
-`hosts`, `append`, `origin`); there is no `browser` kind, no `set_system_proxy` and no
+full `record_start` order).  `POST /api/record/start` takes `start_url` and `emulation` (`hosts`,
+`append` and `origin` until 2026-10-25); there is no `browser` kind, no `set_system_proxy` and no
 `https_passthrough` switch any more.  It requires `iehost.availability()["available"]`
 (`_require_iehost`: 400 with the reason, off Windows
 「記録用ブラウザ (IE エンジン) は Windows でのみ使えます。」), starts the recorder on `127.0.0.1` on a
@@ -1038,7 +1060,7 @@ recorder.  `GET /api/record/status` reports `browser: {kind, running, pid, exit_
 `browser_exit_code`; `POST /api/browser/open {url}` relaunches it against the running recorder
 (§13.11).  `AppState.browser` / `close_browser()`; `AppState.close()` closes it on exit (the GUI's
 shutdown only calls `AppState.close()`).  The page gets `data-iehost-available` /
-`data-iehost-reason`; [記録開始] and [記録をはじめる] are rendered disabled unless mitmproxy and the
+`data-iehost-reason`; [記録をはじめる] is rendered disabled unless mitmproxy and the
 recording browser are available.  `record_start` waits (without the lock, up
 to `PROXY_READY_TIMEOUT` = 20 s) for `RecorderManager.wait_until_listening()` before opening the
 browser and re-checks under the lock that the same recording is still running (the former
@@ -1050,9 +1072,9 @@ nothing and deletes the half-made file.  `iehost.launch` puts the browser in a W
 with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`kill_on_close_job`), so it dies with the GUI process.
 The easy screen (§13.11) records only through the recording browser (no certificate step, no
 system proxy) and stops automatically when the recording browser is closed.  Where the recording
-browser cannot be used, that PC cannot record: the easy screen and 「1 記録」 (`#rec-unavailable`)
-explain why; there is no fallback to the system proxy, a certificate or another browser, and HAR
-import still works.  詳細設定 exposes 最初に開くアドレス and 表示モード.
+browser cannot be used, that PC cannot record: the easy screen explains why; there is no fallback
+to the system proxy, a certificate or another browser, and HAR import still works.  The easy screen
+has 開くサイトのアドレス and 表示モード.
 
 **Tests.** `tests/test_iehost.py` (pure logic with fakes), `tests/test_gui.py` (former
 `test_webapp_iehost.py` section: API with a fake recorder and a fake `BrowserProcess`),
@@ -1113,8 +1135,8 @@ against a fresh server led to these rules:
   every warning gets a plain-Japanese `message` (`gui.warning_message`; a test checks all warnings
   `build_plan` produces on the fixtures).  Error kinds are distinct (`proxy` / `emulation` / `iehost`
   launch); only a launch failure gets the AppLocker / `python -m reqrec browser build` guidance.
-  Recordings remember their `origin` (`easy` / `advanced`); only easy-started recordings auto-stop
-  in easy mode.  The 試しに実行 inputs use friendly labels (「パスワード (入力欄: txtPassword)」;
+  (Until 2026-10-25 recordings remembered their `origin` and only easy-started ones auto-stopped;
+  now only the easy screen records and every recording stops when its browser closes.)  The 試しに実行 inputs use friendly labels (「パスワード (入力欄: txtPassword)」;
   NTLM / Negotiate entries keep their "leave blank with sspi" instruction).
 
 Tests: `tests/test_integration.py`, former `test_factory_replay.py` section (always on; the two recordings in
@@ -1125,3 +1147,39 @@ code, second run, missing / wrong password), and `tests/test_real_engine.py`: th
 `tests/IEDriver.cs` / the `iedriver` section of `tests/ie_support.py` operating RecBrowser via
 `WM_HTML_GETOBJECT`) and the opt-in former `e2e/test_factory_live.py` section, which records the
 scenario in the real recording browser with the `factory_scenario` section of `tests/ie_support.py`.
+
+### 13.14 Every pattern at once: the 受注管理 mock (2026-10-25)
+
+A second mock (`order_site` section of `tests/ie_support.py`) puts the patterns a recorded script must
+reproduce into one flow: the session id the login puts into every URL (`302 /oms/s/<SID>/menu`, no
+cookie at all), one-time tokens in a hidden field of the login form, in a link (`tk=`), in a script
+variable appended by `window.open`, inside an `onclick`, in a hidden field of the search form, one per
+order link, and in a script variable sent by an XMLHttpRequest as the `X-Api-Token` header; a
+`window.open` child window that writes the chosen customer into its opener and closes itself; a
+`showModalDialog` child window returning the item; a date picked in a calendar that the page's script
+draws over the field (no request: only the posted `dateFrom` matters); an order opened in another tab
+(`target=_blank`); a CSV export that also checks the Referer.  `operate_order_site` drives it in the
+real RecBrowser through the GUI API (`tests/test_real_engine.py::test_order_site_with_every_pattern_through_the_gui`,
+opt-in), and `tests/fixtures/order_ie_recording.json` (a recording made that way) is replayed by the
+always-on `tests/test_integration.py` against a fresh site - with the recorded data and with data that
+changed since (`drift=True`: a new customer listed first in the picker, the first order of the result
+cancelled, a new order).  The first real recording replayed at once; the changed data showed three
+weaknesses, fixed in the analysis section:
+
+* **Positional patterns for chosen values** (`build_pattern(..., allow_ambiguous=...)`): the code chosen
+  in the picker (its first row) was traced by `></tr><tr><td><a id="c_(...)"`, which matches every row;
+  verification only checked the *first* match, so a customer listed first later silently replaced the
+  user's choice.  Now a value that does not look random (`is_dynamic_looking` False: codes, numbers)
+  gets a regex only when *every* match captures it, and only with the shortest context (anchored by
+  what stands next to it on its row, e.g. the customer's name), else it stays literal.  Random-looking
+  tokens keep the old rule (first match), since nothing else may name their spot.  The context of a
+  pattern never contains the value itself any more (an earlier occurrence ends the prefix, a later one
+  the suffix): such a pattern could only ever match the recorded value.
+* **Record ids in selectors** (`_stablest`): the session id is in every link of the result list and
+  was read from the first one, `#o_10009`, which is gone once that order is cancelled.  When several
+  elements carry the value, the one whose selector has the fewest digits wins (`#lnkCsv`), document
+  order breaking ties (at most `_MAX_LOCATE_ELEMENTS` are compared).
+* **Referer of a later step** (`_Builder.traced_refs`): the Referer of the search POST is the search
+  page's URL with that page's `tk`; only values traced for the *same* step were substituted, so the
+  recorded token was sent.  Values traced for earlier steps (their extractor variables, not constants
+  or loop variables) are now used too, this step's first.

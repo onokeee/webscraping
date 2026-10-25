@@ -809,6 +809,74 @@ def test_build_pattern_drops_indentation_and_partial_words():
     assert p3 and re.search(p3, "a\n    TOKEN123456 b").group(1) == "TOKEN123456"
 
 
+def _picker(rows):
+    cells = "".join(f'<tr><td><a id="c_{c}" href="#" onclick="return pick(\'{c}\', \'{n}\');">{c}</a></td>'
+                    f"<td>{n}</td></tr>" for c, n in rows)
+    return f"<table><tr><th>コード</th><th>取引先名</th></tr>{cells}</table>"
+
+
+def test_build_pattern_never_relies_on_the_row_a_choice_was_listed_in():
+    """A code chosen in a picker list: "the first match" is the first row, which silently becomes
+    another customer once a new one is listed first.  Only a pattern anchored by the row's own text
+    (its name) is accepted, and the recorded value itself is never part of the context."""
+    rows = [("C-0042", "東和精機"), ("C-0107", "丸山商事"), ("C-0211", "北陸産業")]
+    page = _picker(rows)
+    newer = _picker([("C-0001", "朝日工業")] + rows)  # the data changed after the recording
+    for code, _name in rows:
+        p = deps.build_pattern(page, code, allow_ambiguous=False)
+        assert p and code not in p, (code, p)
+        assert [m.group(1) for m in re.finditer(p, page)] == [code]
+        assert re.search(p, newer).group(1) == code
+    # a row with no text of its own can only be found by its position: no pattern (the value stays literal)
+    links = '<a href="go?c=C-0042">x</a><a href="go?c=C-0107">x</a>'
+    assert deps.build_pattern(links, "C-0042", allow_ambiguous=False) is None
+    # a random token in such a spot keeps the position-only pattern: nothing else names it
+    tokens = '<a href="go?t=Qx7Lm2Pz9Kw4">x</a><a href="go?t=Ab3Cd4Ef5Gh6">x</a>'
+    p = deps.build_pattern(tokens, "Qx7Lm2Pz9Kw4")
+    assert p and re.search(p, tokens).group(1) == "Qx7Lm2Pz9Kw4"
+
+
+def test_a_code_chosen_in_a_picker_is_traced_by_its_name_or_kept():
+    flow = resp_flow(_picker([("C-0042", "東和精機"), ("C-0107", "丸山商事")]).encode())
+    ext = deps.locate_value("C-0042", flow)
+    assert ext is None or "東和精機" in (ext.pattern or "")
+
+
+def test_a_value_in_several_elements_is_read_from_the_stablest_one():
+    """A session id in every link of a result list is read from the link whose id names no record
+    (``#lnkCsv``): ``#o_10009`` is gone once that order is cancelled."""
+    sid = "bEC4Dzco5szhDjHdWEMDMAfr"
+    rows = "".join(f'<tr><td><a id="o_{n}" href="/oms/s/{sid}/order?no={n}&amp;tk=T{n}abcdef">{n}</a></td></tr>'
+                   for n in (10009, 10017))
+    body = f'<table>{rows}</table><p><a id="lnkCsv" href="/oms/s/{sid}/export?tk=EXPORTtk123">CSV</a></p>'
+    ext = deps.locate_value(sid, resp_flow(body.encode()))
+    assert (ext.kind, ext.selector, ext.attr) == ("html_attr", "#lnkCsv", "href")
+    assert re.search(ext.pattern, f"/oms/s/{sid}/export?tk=X").group(1) == sid
+
+
+def test_referer_is_rebuilt_with_a_token_traced_for_an_earlier_step():
+    """The Referer of the search POST is the search page's URL (``/search?tk=<the token of that step>``):
+    the token is the earlier step's variable, never the recorded one."""
+    menu = Flow("f0001", RecordedRequest("GET", "https://s/menu"),
+                RecordedResponse(200, list(HTML_CT), b'<a id="lnkSearch" href="/search?tk=SRCHtok123456">search</a>'),
+                started_at=1.0)
+    search = Flow("f0002", RecordedRequest("GET", "https://s/search?tk=SRCHtok123456", [("Referer", "https://s/menu")]),
+                  RecordedResponse(200, list(HTML_CT), b'<form id="f" action="/result" method="post">'
+                                                       b'<input type="hidden" name="token" value="FORMtok987654"></form>'),
+                  started_at=2.0)
+    result = Flow("f0003", RecordedRequest("POST", "https://s/result",
+                                           [("Referer", "https://s/search?tk=SRCHtok123456"),
+                                            ("Content-Type", "application/x-www-form-urlencoded")],
+                                           b"token=FORMtok987654"),
+                  RecordedResponse(200, list(HTML_CT), b"<p>ok</p>"), started_at=3.0)
+    plan = build_plan(Recording(flows=[menu, search, result]), PlanOptions())
+    (referer,) = [ref for name, ref in plan.steps[2].headers if name.lower() == "referer"]
+    assert referer.kind == "expr" and "SRCHtok123456" not in referer.value and "str(tk)" in referer.value
+    code = generate(plan)
+    executable = "\n".join(ln.split("  # ")[0] for ln in code.splitlines() if not ln.lstrip().startswith("#"))
+    assert "SRCHtok123456" not in executable and "FORMtok987654" not in executable
+
+
 # --------------------------------------------------------------------------- legacy-charset forms (DESIGN.md §13.4)
 
 class TestFormBytes:

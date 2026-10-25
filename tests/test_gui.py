@@ -24,7 +24,7 @@ import pytest
 
 import reqrec as launch, reqrec as routes_mod, reqrec as webapp
 from reqrec import iehost
-from reqrec import PlanOptions
+from reqrec import GenOptions, PlanOptions, options_to_plain
 from reqrec import (
     ApiError, AppState, ScriptRunner, TOKEN_HEADER, create_app, exclude_netlocs, find_free_port,
     gen_options_from_json, host_allowed, is_windows, normalise_netloc, origin_allowed, plan_options_from_json,
@@ -103,7 +103,7 @@ def stub_script(tmp_path: Path) -> Path:
 
 
 def _stub_builder(stub: Path, n: int = 3, self_url: str = ""):
-    def builder(out, port=8080, hosts=None, **_kw):
+    def builder(out, port=8080, **_kw):
         return [sys.executable, str(stub), out, str(n), self_url]
 
     return builder
@@ -148,10 +148,9 @@ def H(app):
     return {TOKEN_HEADER: app.config["REQREC_TOKEN"]}
 
 
-def _upload(client, headers, *paths: Path, append: bool = False):
-    files = [("files", (io.BytesIO(p.read_bytes()), p.name)) for p in paths]
-    data = {"append": "true" if append else "false"}
-    data["files"] = [f[1] for f in files] if len(files) > 1 else files[0][1]
+def _upload(client, headers, *paths: Path):
+    files = [(io.BytesIO(p.read_bytes()), p.name) for p in paths]
+    data = {"files": files if len(files) > 1 else files[0]}
     return client.post("/api/recordings/upload", data=data, headers=headers, content_type="multipart/form-data")
 
 
@@ -170,7 +169,7 @@ class TestSecurity:
         assert r.status_code == 200
         html = r.get_data(as_text=True)
         assert f'data-token="{app.config["REQREC_TOKEN"]}"' in html
-        assert "記録" in html and "読み込み" in html and "ステップ" in html and "コード" in html and "実行" in html
+        assert "記録をはじめる" in html and "スクリプトの詳細と変更" in html and "試しに実行する" in html
         # offline: every script / stylesheet comes from this server
         assert not re.findall(r'(?:src|href)=["\']https?://', html)
         assert not re.findall(r'(?:src|href)=["\']//', html)
@@ -212,28 +211,28 @@ class TestSecurity:
         assert not host_allowed("rebind.example.com", "0.0.0.0")  # ... but never a DNS name
 
     def test_post_without_token_is_403(self, client):
-        r = client.post("/api/recordings/clear", json={})
+        r = client.post("/api/run/stop", json={})
         assert r.status_code == 403
         assert "トークン" in r.get_json()["error"]
 
     def test_post_with_wrong_token_is_403(self, client):
-        r = client.post("/api/recordings/clear", json={}, headers={TOKEN_HEADER: "nope"})
+        r = client.post("/api/run/stop", json={}, headers={TOKEN_HEADER: "nope"})
         assert r.status_code == 403
 
     def test_post_with_token_ok(self, client, H):
-        assert client.post("/api/recordings/clear", json={}, headers=H).status_code == 200
+        assert client.post("/api/run/stop", json={}, headers=H).status_code == 200
 
     def test_cross_origin_post_rejected(self, client, H):
-        r = client.post("/api/recordings/clear", json={}, headers={**H, "Origin": "http://evil.com"})
+        r = client.post("/api/run/stop", json={}, headers={**H, "Origin": "http://evil.com"})
         assert r.status_code == 403
         assert "オリジン" in r.get_json()["error"]
-        r = client.post("/api/recordings/clear", json={}, headers={**H, "Origin": "null"})
+        r = client.post("/api/run/stop", json={}, headers={**H, "Origin": "null"})
         assert r.status_code == 403
 
     def test_same_origin_post_accepted(self, client, H):
-        r = client.post("/api/recordings/clear", json={}, headers={**H, "Origin": "http://localhost"})
+        r = client.post("/api/run/stop", json={}, headers={**H, "Origin": "http://localhost"})
         assert r.status_code == 200
-        r = client.post("/api/recordings/clear", json={}, headers={**H, "Host": "127.0.0.1:8765", "Origin": "http://127.0.0.1:8765"})
+        r = client.post("/api/run/stop", json={}, headers={**H, "Host": "127.0.0.1:8765", "Origin": "http://127.0.0.1:8765"})
         assert r.status_code == 200
 
     def test_origin_helper(self):
@@ -257,9 +256,9 @@ class TestSecurity:
         assert r.status_code == 405 and "error" in r.get_json()
 
     def test_non_json_body_is_400(self, client, H):
-        r = client.post("/api/recordings/open", data="not json", headers={**H, "Content-Type": "text/plain"})
+        r = client.post("/api/scripts/save", data="not json", headers={**H, "Content-Type": "text/plain"})
         assert r.status_code == 400 and "JSON" in r.get_json()["error"]
-        r = client.post("/api/recordings/open", data="[1,2]", headers={**H, "Content-Type": "application/json"})
+        r = client.post("/api/scripts/save", data="[1,2]", headers={**H, "Content-Type": "application/json"})
         assert r.status_code == 400
 
     def test_security_headers(self, client):
@@ -319,15 +318,6 @@ class TestPathSafety:
         r = client.post("/api/scripts/save", json={"name": name, "code": "print(1)\n"}, headers=H)
         assert r.status_code == 400, r.get_json()
         assert not list((workdir / "scripts").glob("*")) or all(p.suffix == ".py" and "evil" not in p.name for p in (workdir / "scripts").iterdir())
-
-    @pytest.mark.parametrize("name", ["../x.har", "a/b.har", "..", ".hidden.har"])
-    def test_open_traversal_rejected(self, client, H, name):
-        r = client.post("/api/recordings/open", json={"names": [name]}, headers=H)
-        assert r.status_code == 400
-
-    def test_open_bad_folder_rejected(self, client, H):
-        r = client.post("/api/recordings/open", json={"names": [{"folder": "scripts", "name": "x.har"}]}, headers=H)
-        assert r.status_code == 400
 
     def test_save_output_traversal_rejected(self, client, H):
         r = client.post("/api/run/save_output", json={"name": "../out.txt"}, headers=H)
@@ -407,16 +397,10 @@ class TestRecordings:
         assert s["recording"]["flows"] == 14
 
     def test_upload_two_files_at_once_merges(self, client, H):
-        r = _upload(client, H, LOGIN_HAR, API_HAR)
+        r = _upload(client, H, LOGIN_HAR, API_HAR)  # one HAR per browser tab
         assert r.status_code == 200
-        assert r.get_json()["flows"] == 20
-        assert len(r.get_json()["sources"]) == 2
-
-    def test_upload_append_merges_with_current(self, client, H, loaded):
-        r = _upload(client, H, API_HAR, append=True)
         j = r.get_json()
-        assert r.status_code == 200 and j["flows"] == 20 and j["appended"] is True
-        assert j["sources"] == ["uploads/login_flow_chrome.har", "uploads/api_firefox.har"]
+        assert j["flows"] == 20 and j["sources"] == ["uploads/login_flow_chrome.har", "uploads/api_firefox.har"]
         # flow ids are renumbered chronologically
         plan = client.post("/api/plan", json={}, headers=H).get_json()
         ids = [f["id"] for f in plan["flows"]]
@@ -424,10 +408,19 @@ class TestRecordings:
         times = [f["started_at"] for f in plan["flows"]]
         assert times == sorted(times)
 
-    def test_upload_without_append_replaces(self, client, H, loaded):
-        r = _upload(client, H, API_HAR, append=False)
-        assert r.get_json()["flows"] == 6
-        assert r.get_json()["sources"] == ["uploads/api_firefox.har"]
+    def test_upload_replaces_the_recording_and_starts_over(self, app, client, H, loaded):
+        # 詳細設定 changed the options and a script exists ...
+        client.post("/api/plan", json={"plan_options": {"keep_static": True, "exclude_flow_ids": ["f0010"]}}, headers=H)
+        client.post("/api/easy/build", json={"gen_options": {"delay": 1.5}}, headers=H)
+        assert app.extensions["reqrec"].last_script_name
+        # ... a new recording replaces the old one and starts from the defaults (flow ids belong to one recording)
+        r = _upload(client, H, API_HAR)
+        j = r.get_json()
+        assert j["flows"] == 6 and j["sources"] == ["uploads/api_firefox.har"] and "appended" not in j
+        assert j["plan_options"] == options_to_plain(PlanOptions()) and j["gen_options"] == options_to_plain(GenOptions())
+        s = client.get("/api/state").get_json()
+        assert s["plan_options"]["exclude_flow_ids"] == [] and s["gen_options"]["delay"] == 0.0
+        assert s["last_script"] is None and s["secrets"] == []
 
     def test_upload_same_name_twice_keeps_both_files(self, client, H, workdir):
         _upload(client, H, LOGIN_HAR)
@@ -448,29 +441,6 @@ class TestRecordings:
     def test_upload_without_file(self, client, H):
         r = client.post("/api/recordings/upload", data={}, headers=H, content_type="multipart/form-data")
         assert r.status_code == 400 and "ファイル" in r.get_json()["error"]
-
-    def test_list_and_open(self, client, H, loaded):
-        files = client.get("/api/recordings").get_json()["files"]
-        assert [(f["folder"], f["name"], f["flows"]) for f in files] == [("uploads", "login_flow_chrome.har", 14)]
-        client.post("/api/recordings/clear", json={}, headers=H)
-        assert client.get("/api/state").get_json()["recording"]["loaded"] is False
-        r = client.post("/api/recordings/open", json={"names": ["login_flow_chrome.har"]}, headers=H)
-        assert r.status_code == 200 and r.get_json()["flows"] == 14
-        r = client.post("/api/recordings/open", json={"names": [{"folder": "uploads", "name": "login_flow_chrome.har"}], "append": True}, headers=H)
-        assert r.get_json()["flows"] == 28  # appended to itself
-
-    def test_open_missing_is_404(self, client, H):
-        r = client.post("/api/recordings/open", json={"names": ["nope.har"]}, headers=H)
-        assert r.status_code == 404
-
-    def test_open_needs_names(self, client, H):
-        assert client.post("/api/recordings/open", json={}, headers=H).status_code == 400
-        assert client.post("/api/recordings/open", json={"names": []}, headers=H).status_code == 400
-
-    def test_clear(self, client, H, loaded):
-        r = client.post("/api/recordings/clear", json={}, headers=H)
-        assert r.status_code == 200 and r.get_json()["recording"]["loaded"] is False
-        assert client.post("/api/plan", json={}, headers=H).status_code == 409
 
     def test_exclude_netlocs_helper(self):
         rec = load_recording(str(LOGIN_HAR))
@@ -523,6 +493,10 @@ class TestPlan:
         j = r.get_json()
         assert j["constants"][0]["name"] == "PASSWORD" and j["constants"][0]["value"] is None
         assert "REQREC_PASSWORD" in j["env_vars"]
+        # 詳細設定 shows the warnings in plain Japanese, split like the easy screen (the credential is a note)
+        assert sorted(d["text"] for d in j["warning_details"] + j["note_details"]) == sorted(set(j["warnings"]))
+        assert any("REQREC_PASSWORD" in d["message"] for d in j["note_details"])
+        assert all(_JAPANESE.search(d["message"]) for d in j["warning_details"] + j["note_details"])
         assert j["loops"] == [{"step_index": 4, "var": "page", "count": 3, "numeric_range": [1, 3]}]
         assert j["steps"][0]["func_name"].startswith("step_01_")
         assert isinstance(j["warnings"], list)
@@ -630,62 +604,85 @@ class TestFlowDetail:
 # =========================================================================== generate / scripts
 
 class TestGenerate:
+    """The script is made by ``/api/easy/build`` on both screens; 詳細設定 saves hand edits with ``/api/scripts/save``."""
+
     def test_generate(self, client, H, loaded):
-        r = client.post("/api/generate", json={"plan_options": {}, "gen_options": {"delay": "0.5", "legacy_tls": True}}, headers=H)
+        r = client.post("/api/easy/build", json={"name": "gen", "plan_options": {}, "gen_options": {"delay": "0.5", "legacy_tls": True}}, headers=H)
         assert r.status_code == 200
         j = r.get_json()
         compile(j["code"], "<gen>", "exec")
         assert "def step_01_" in j["code"] and "DELAY = 0.5" in j["code"]
         # default: the recorded password is in the script, nothing has to be typed before running
-        assert j["secrets"] == [] and j["env_vars"] == [] and "'Secr3t!'" in j["code"] and "REQREC_PASSWORD" not in j["code"]
+        assert j["secrets"] == [] and "'Secr3t!'" in j["code"] and "REQREC_PASSWORD" not in j["code"]
         assert "ステップ" in j["summary"] and isinstance(j["warnings"], list)
-        assert j["steps"] == 5 and j["suggested_name"] == "scrape_shop_example_test"
+        assert j["steps"] == 5 and j["name"] == "gen.py"
         assert "legacy_tls" not in j["gen_options"]  # removed option: ignored, never echoed back
+        assert j["gen_options"]["delay"] == 0.5 and j["plan_options"]["redact_secrets"] is False
         assert "VERIFY_TLS" not in j["code"] and "_LegacyTLSAdapter" not in j["code"]
-        r = client.post("/api/generate", json={"plan_options": {"redact_secrets": True}, "gen_options": {"delay": "0.5"}}, headers=H)
+        r = client.post("/api/easy/build", json={"name": "gen", "plan_options": {"redact_secrets": True}, "gen_options": {"delay": "0.5"}}, headers=H)
         j = r.get_json()
         assert j["secrets"] == [{"name": "PASSWORD", "env_var": "REQREC_PASSWORD", "comment": j["secrets"][0]["comment"]}]
-        assert j["env_vars"] == ["REQREC_PASSWORD"] and "Secr3t!" not in j["code"]
+        assert "Secr3t!" not in j["code"]
         s = client.get("/api/state").get_json()
         assert s["gen_options"]["delay"] == 0.5 and s["secrets"] == j["secrets"]
+        assert s["plan_options"]["redact_secrets"] is True
 
     def test_generate_without_recording(self, client, H):
-        assert client.post("/api/generate", json={}, headers=H).status_code == 409
+        assert client.post("/api/easy/build", json={}, headers=H).status_code == 409
 
     def test_generate_bad_gen_option(self, client, H, loaded):
-        r = client.post("/api/generate", json={"gen_options": {"html_parser": "nope"}}, headers=H)
+        r = client.post("/api/easy/build", json={"gen_options": {"html_parser": "nope"}}, headers=H)
         assert r.status_code == 400
 
     def test_generate_uses_plan_options(self, client, H, loaded):
-        j = client.post("/api/generate", json={"plan_options": {"include_hosts": ["api.example.test"]}}, headers=H).get_json()
-        assert "shop.example.test" not in j["code"].split("BASE_HEADERS")[-1] or j["steps"] == 2
+        j = client.post("/api/easy/build", json={"plan_options": {"include_hosts": ["api.example.test"]}}, headers=H).get_json()
         assert j["steps"] == 2
 
-    def test_save_list_download(self, client, H, loaded, workdir):
-        code = client.post("/api/generate", json={}, headers=H).get_json()["code"]
-        r = client.post("/api/scripts/save", json={"name": "my_script", "code": code}, headers=H)
+    def test_rebuild_replaces_the_same_file(self, client, H, loaded, workdir):
+        """詳細設定 [設定から作り直す]: the current script's name and the changed options, the file is replaced."""
+        first = client.post("/api/easy/build", json={}, headers=H).get_json()
+        r = client.post("/api/easy/build", json={"name": first["name"], "plan_options": {"exclude_flow_ids": ["f0010"]},
+                                                  "gen_options": {"delay": 2}}, headers=H)
+        again = r.get_json()
+        assert r.status_code == 200 and again["name"] == first["name"] and again["steps"] == first["steps"] - 1
+        assert [p.name for p in (workdir / "scripts").iterdir()] == [first["name"]]
+        assert "DELAY = 2" in (workdir / "scripts" / first["name"]).read_text(encoding="utf-8")
+        assert again["plan_options"]["exclude_flow_ids"] == ["f0010"]
+
+    def test_save_edited_code_and_download(self, client, H, loaded, workdir):
+        built = client.post("/api/easy/build", json={}, headers=H).get_json()
+        code = built["code"].replace("def main():", "# 手で書き換えた\ndef main():")
+        r = client.post("/api/scripts/save", json={"name": built["name"], "code": code}, headers=H)
         assert r.status_code == 200
+        assert (workdir / "scripts" / built["name"]).read_text(encoding="utf-8") == code
+        # saved under another name: that file becomes the current script
+        r = client.post("/api/scripts/save", json={"name": "my_script", "code": code}, headers=H)
         j = r.get_json()
         assert j["name"] == "my_script.py" and Path(j["path"]) == (workdir / "scripts" / "my_script.py").resolve()
-        assert (workdir / "scripts" / "my_script.py").read_text(encoding="utf-8") == code
-        lst = client.get("/api/scripts").get_json()
-        assert [f["name"] for f in lst["files"]] == ["my_script.py"] and lst["last"] == "my_script.py"
+        assert client.get("/api/state").get_json()["last_script"] == "my_script.py"
         d = client.get("/api/scripts/my_script.py/download")
-        assert d.status_code == 200 and d.get_data(as_text=True) == code
+        assert d.status_code == 200 and d.get_data(as_text=True) == code  # what the editor reloads after a page reload
         assert "attachment" in d.headers["Content-Disposition"]
         assert client.get("/api/scripts/my_script/download").status_code == 200  # .py optional
         assert client.get("/api/scripts/other/download").status_code == 404
 
     def test_save_uses_last_generated_code_when_omitted(self, client, H, loaded):
-        client.post("/api/generate", json={}, headers=H)
+        client.post("/api/easy/build", json={}, headers=H)
         r = client.post("/api/scripts/save", json={"name": "auto"}, headers=H)
         assert r.status_code == 200 and r.get_json()["name"] == "auto.py"
 
     def test_save_without_code_or_name(self, client, H):
         r = client.post("/api/scripts/save", json={"name": "x"}, headers=H)
-        assert r.status_code == 400 and "生成" in r.get_json()["error"]
+        assert r.status_code == 400 and "コード" in r.get_json()["error"]
         r = client.post("/api/scripts/save", json={"code": "print(1)\n"}, headers=H)
         assert r.status_code == 200 and re.match(r"scrape_\d{8}_\d{6}\.py", r.get_json()["name"])
+
+    @pytest.mark.parametrize("method, path", [("GET", "/api/recordings"), ("POST", "/api/recordings/open"),
+                                              ("POST", "/api/recordings/clear"), ("POST", "/api/generate"),
+                                              ("GET", "/api/scripts")])
+    def test_routes_of_the_removed_panels_are_gone(self, client, H, method, path):
+        r = client.open(path, method=method, json={}, headers=H)
+        assert r.status_code in (404, 405)
 
 
 # =========================================================================== run
@@ -844,10 +841,10 @@ class TestRecorderManager:
         out = tmp_path / "recs" / "rec.json"
         m = RecorderManager(command_builder=_stub_builder(stub_script, n=4))
         assert m.running is False and m.status()["running"] is False and m.flow_count() == 0
-        st = m.start(str(out), port=18080, hosts="example.test, b.test")
+        st = m.start(str(out), port=18080)
         try:
             assert st["running"] is True and st["out"] == str(out) and st["pid"]
-            assert st["hosts"] == ["example.test", "b.test"] and st["port"] == 18080
+            assert st["port"] == 18080 and "hosts" not in st  # every host is recorded
             assert "listen_host" not in st  # always 127.0.0.1 (RECORD_LISTEN_HOST)
             assert m.running is True
             assert _wait_until(lambda: m.flow_count() == 4, 15)
@@ -863,7 +860,7 @@ class TestRecorderManager:
         assert m.load_recording().flows[0].request.url == "https://example.test/page0"
         assert m.stop() == 0  # idempotent
 
-    def test_command_builder_gets_port_hosts_and_extra_args_only(self, tmp_path, stub_script):
+    def test_command_builder_gets_port_and_extra_args_only(self, tmp_path, stub_script):
         seen = []
 
         def builder(out, **kw):
@@ -872,12 +869,12 @@ class TestRecorderManager:
 
         m = RecorderManager(command_builder=builder)
         out = str(tmp_path / "r.json")
-        m.start(out, port=18081, hosts=["a.test"], extra_args=("--ignore-hosts", ".*"))
+        m.start(out, port=18081, extra_args=("--ignore-hosts", ".*"))
         m.stop()
         m.start(out, port=18082)
         m.stop()
-        assert seen == [(os.path.abspath(out), {"port": 18081, "hosts": ["a.test"], "extra_args": ["--ignore-hosts", ".*"]}),
-                        (os.path.abspath(out), {"port": 18082, "hosts": []})]  # no listen_host: always 127.0.0.1
+        assert seen == [(os.path.abspath(out), {"port": 18081, "extra_args": ["--ignore-hosts", ".*"]}),
+                        (os.path.abspath(out), {"port": 18082})]  # no listen_host (always 127.0.0.1), no host filter
 
     def test_start_twice_is_an_error(self, tmp_path, stub_script):
         m = RecorderManager(command_builder=_stub_builder(stub_script))
@@ -998,12 +995,12 @@ class TestRecordEndpoints:
         state.recorder.close()
 
     def test_full_cycle(self, client, H, stubbed, workdir, launched):
-        r = client.post("/api/record/start", json={"hosts": "example.test"}, headers=H)
+        r = client.post("/api/record/start", json={}, headers=H)
         assert r.status_code == 200, r.get_json()
         j = r.get_json()
         assert re.match(r"rec_\d{8}_\d{6}\.json$", j["out"])
         assert j["proxy_address"] == f"127.0.0.1:{j['port']}" and j["status"]["port"] == j["port"]
-        assert j["status"]["running"] is True and j["status"]["hosts"] == ["example.test"]
+        assert j["status"]["running"] is True and "hosts" not in j["status"]  # every site is recorded
         assert j["browser"]["kind"] == "iehost" and launched.calls[0]["proxy_address"] == j["proxy_address"]
         assert "localhost" in j["self_excluded_hosts"]
         # status polling: flows appear (3 + the GUI's own request)
@@ -1028,23 +1025,12 @@ class TestRecordEndpoints:
         plan = client.post("/api/plan", json={}, headers=H).get_json()
         assert plan["flows_total"] == 3 and plan["excluded_self_flows"] == 1
         assert all("localhost" not in f["url"] for f in plan["flows"])
-        # the recording is listed and can be re-opened (self traffic excluded again, harmlessly)
-        files = client.get("/api/recordings").get_json()["files"]
-        assert any(f["folder"] == "recordings" and f["name"] == j["out"] for f in files)
-        r = client.post("/api/recordings/open", json={"names": [j["out"]]}, headers=H)
-        assert r.status_code == 200 and r.get_json()["flows"] == 3
 
-    def test_stop_with_append_merges(self, client, H, stubbed, loaded):
-        assert client.post("/api/record/start", json={}, headers=H).status_code == 200
+    def test_a_new_recording_replaces_the_loaded_one(self, client, H, stubbed, loaded):
+        assert client.post("/api/record/start", json={"append": True, "hosts": "x.test"}, headers=H).status_code == 200  # ignored
         assert _wait_until(lambda: client.get("/api/record/status").get_json()["flows"] == 4, 15)
         r = client.post("/api/record/stop", json={"append": True}, headers=H)
-        assert r.status_code == 200 and r.get_json()["flows"] == 14 + 3
-
-    def test_append_flag_from_start_is_remembered(self, client, H, stubbed, loaded):
-        assert client.post("/api/record/start", json={"append": True}, headers=H).status_code == 200
-        assert _wait_until(lambda: client.get("/api/record/status").get_json()["flows"] == 4, 15)
-        r = client.post("/api/record/stop", json={}, headers=H)
-        assert r.get_json()["flows"] == 17
+        assert r.status_code == 200 and r.get_json()["flows"] == 3 and "appended" not in r.get_json()
 
     def test_stop_without_start_409(self, client, H):
         r = client.post("/api/record/stop", json={}, headers=H)
@@ -1062,8 +1048,8 @@ class TestRecordEndpoints:
         assert client.post("/api/record/stop", json={}, headers=H).status_code == 409
 
     def test_start_validation(self, client, H, stubbed, launched):
-        assert client.post("/api/record/start", json={"hosts": 5}, headers=H).status_code == 400
         assert client.post("/api/record/start", json={"start_url": "javascript:alert(1)"}, headers=H).status_code == 400
+        assert client.post("/api/record/start", json={"emulation": "ie99"}, headers=H).status_code == 400
         assert stubbed.recorder.running is False and launched.calls == []
 
     def test_stop_with_empty_recording_is_400(self, client, H, stub_script, win, launched):
@@ -1195,8 +1181,18 @@ class TestPage:
         assert 'id="easy-start"' in html and "記録をはじめる" in html
         assert 'id="easy-stop"' in html and "記録をおわる" in html
         assert 'id="mode-toggle"' in html and "詳細設定を表示" in html
-        # the advanced panels are still there (hidden by CSS in easy mode)
-        assert 'id="panel-record"' in html and 'id="panel-steps"' in html
+        # 詳細設定 = the details of the script made on the easy screen (hidden by CSS in easy mode)
+        assert 'id="panel-detail"' in html and "スクリプトの詳細と変更" in html
+        for marker in ('id="flow-tbody"', 'id="btn-regenerate"', 'id="code-editor"', 'id="btn-save"',
+                       'id="detail-run-btn"', 'data-opt="redact_secrets"', 'data-gopt="delay"', 'data-gopt="print_final"',
+                       'id="easy-open-detail"', 'id="easy-emulation"', 'id="easy-har-input"'):
+            assert marker in html, marker
+        # the five panels and the recording settings that are gone
+        for removed in ('id="nav"', 'class="nav-step', 'id="panel-record"', 'id="panel-load"', 'id="panel-steps"',
+                        'id="panel-code"', 'id="panel-run"', 'id="rec-hosts"', 'id="rec-append"', 'id="append-toggle"',
+                        'id="files-table"', 'id="btn-clear"', 'id="run-script"', 'id="btn-generate"'):
+            assert removed not in html, removed
+        assert '<body class="easy-mode"' in html  # no flash of 詳細設定 before the script runs
 
 
 # --------------------------------------------------------------------------- free port
@@ -1225,7 +1221,7 @@ class TestFindFreePort:
 class TestAutoPort:
     @pytest.mark.parametrize("port", [8765, "auto", "abc"])  # a ``port`` in the body is ignored (no port input any more)
     def test_record_start_picks_a_free_loopback_port(self, client, H, recorder, win, launched, port):
-        r = client.post("/api/record/start", json={"port": port, "hosts": []}, headers=H)
+        r = client.post("/api/record/start", json={"port": port}, headers=H)
         assert r.status_code == 200, r.get_json()
         data = r.get_json()
         assert data["port"] == recorder.start_calls[0]["port"]
@@ -1263,9 +1259,9 @@ class TestEasyBuild:
         state = app.extensions["reqrec"]
         assert state.last_script_name == b["name"]
         assert state.last_code == b["code"]
-        listing = client.get("/api/scripts").get_json()
-        assert any(f["name"] == b["name"] for f in listing["files"])
-        assert listing["last"] == b["name"]
+        assert client.get("/api/state").get_json()["last_script"] == b["name"]
+        # the options used come back, so 詳細設定 shows them
+        assert b["plan_options"] == options_to_plain(PlanOptions()) and b["gen_options"] == options_to_plain(GenOptions())
 
     def test_custom_name_and_options(self, client, H, loaded):
         r = client.post("/api/easy/build", json={"name": "my_job", "gen_options": {"comments": False}}, headers=H)
@@ -1420,7 +1416,7 @@ class TestDownloadsFollowTheSharedRule:
 
     def test_easy_build_payload_marks_loop_downloads(self, app, client, H):
         state = app.extensions["reqrec"]
-        state.set_recording(_synthetic_recording(), ["synthetic"], append=False)
+        state.set_recording(_synthetic_recording(), ["synthetic"])
         r = client.post("/api/easy/build", json={}, headers=H)
         assert r.status_code == 200, r.get_json()
         b = r.get_json()
@@ -1498,19 +1494,39 @@ class TestWarningsInJapanese:
 class TestEasyScreenScript:
     """Static checks of the page script in gui.html (former app.js) for behaviour only a browser runs (tests/test_gui_browser.py drives it)."""
 
-    def test_easy_stop_does_not_override_append(self):
+    def test_closing_the_recording_browser_stops_every_recording(self):
         js = APP_JS
-        stops = re.findall(r"api\('/api/record/stop', \{ method: 'POST', json: (\{[^}]*\}) \}\)", js)
-        assert len(stops) >= 3 and not any("append: false" in s for s in stops), stops
+        block = js[js.index("function onRecordStatus(st) {"):]
+        block = block[:block.index("async function pollRecord()")]
+        assert "if (current !== 'recording') return;" in block and "if (!browserSeen || autoStopped) return;" in block
+        assert block.index("autoStopped = true;") < block.index("discardSilently(") < block.index("stop();")
+        for removed in ("recOrigin", "origin:", "easy-mode')) return;", "append"):
+            assert removed not in block, removed
 
-    def test_auto_stop_only_for_easy_started_recordings_in_easy_mode(self):
+    def test_detail_screen_rebuilds_with_the_current_name_and_saves_hand_edits(self):
         js = APP_JS
-        assert "origin: 'easy'" in js and "origin: 'advanced'" in js
-        block = js[js.index("Record.subscribe((st) => {  // Record polls"):]
-        block = block[:block.index("const pollOnce")]
-        assert "!body.classList.contains('easy-mode')) return;" in block
-        guard = block.index("if (recOrigin !== 'easy') {")
-        assert guard < block.index("stop();") and guard < block.index("discardSilently(")
+        regen = js[js.index("async function regenerate() {"):]
+        regen = regen[:regen.index("editor.addEventListener('input'")]
+        assert "api('/api/easy/build'" in regen and "name: S.script || undefined" in regen
+        assert "Steps.collectPlanOptions()" in regen and "Steps.collectGenOptions()" in regen
+        assert "window.confirm(" in regen  # hand edits are only thrown away after asking
+        assert "api('/api/scripts/save', { method: 'POST', json: { name, code } })" in js
+        # 試しに実行 in 詳細設定 saves unsaved edits first; the run uses the file
+        assert "if (!dirty() || await save()) await Run.start(S.script" in js
+        assert "window.addEventListener('beforeunload'" in js
+
+    def test_the_easy_screen_sends_the_chosen_display_mode_only_when_changed(self):
+        js = APP_JS
+        assert "emulation: emuSel.value === emuCurrent ? 'keep' : emuSel.value," in js
+        assert "setEmulation(st.iehost && st.iehost.emulation);" in js
+
+    def test_har_files_go_straight_to_a_script(self):
+        js = APP_JS
+        block = js[js.index("async function buildFromFiles(files) {"):]
+        block = block[:block.index("async function build() {")]
+        assert "api('/api/recordings/upload', { method: 'POST', form })" in block
+        assert block.index("setRecording(res);") < block.index("await build();")
+        assert "form.append('append'" not in block  # always a new recording (no 追加モード)
 
     def test_windows_auth_entries_keep_their_instruction(self):
         js = APP_JS
@@ -1528,21 +1544,17 @@ class TestEasyScreenScript:
     def test_every_recording_goes_through_the_recording_browser(self):
         js = APP_JS
         # the easy screen can start only with mitmproxy and the recording browser (no manual-proxy fallback)
-        assert "function canStart() { return MITM_AVAILABLE && IEHOST; }" in js
+        assert "const CAN_RECORD = MITM_AVAILABLE && IEHOST;" in js
         assert "const IEHOST = body.dataset.iehostAvailable === 'true'" in js
-        # 詳細設定 [記録開始] keeps the server-rendered disabled state: it needs mitmproxy as well
-        assert "const CAN_RECORD = IEHOST_AVAILABLE && body.dataset.mitmAvailable === 'true';" in js
-        assert "btnStart.disabled = running || !CAN_RECORD;" in js and "btnStart.disabled = !CAN_RECORD;" in js
-        assert "btnStart.disabled = false;" not in js.split("const Record = (() => {")[1].split("const Load = (() => {")[0]
+        assert "btnStart.disabled = !CAN_RECORD;" in js and "btnStart.disabled = false;" not in js
         # [ブラウザをもう一度開く] always (re)opens the recording browser: only the address is sent
         assert "api('/api/browser/open', { method: 'POST', json: { url } })" in js
         assert "if (!st.browser || st.browser.kind !== 'iehost') return;" in js
-        # neither start request sends a port, a listen address, a browser kind or a pass-through switch
+        # the one start request (かんたん画面 [記録をはじめる]) sends the address and the 表示モード only
         starts = re.findall(r"api\('/api/record/start', \{ method: 'POST', json: \{(.*?)\} \}\)", js, re.S)
-        assert len(starts) == 2, starts  # 詳細設定 [記録開始] and かんたん画面 [記録をはじめる]
-        for start in starts:
-            keys = re.findall(r"\b(\w+):", re.sub(r"//[^\n]*", "", start))
-            assert {"hosts", "append", "start_url", "emulation", "origin"} == set(keys), keys
+        assert len(starts) == 1, starts
+        keys = re.findall(r"\b(\w+):", re.sub(r"//[^\n]*", "", starts[0]))
+        assert {"start_url", "emulation"} == set(keys), keys
         for removed in ("/api/win/", "listen_host", "set_system_proxy", "https_passthrough", "IS_WINDOWS",
                         "EASY_BLOCKED", "recMode", "GUIDE_EDGE", "browser_kind", "legacy_tls", "mitm.it"):
             assert removed not in js, removed
@@ -1579,22 +1591,20 @@ class FakeRecorder:
         self.running = False
         self.out = None
         self.port = None
-        self.hosts = []
         self.command_builder = object()  # not the default builder -> the mitmproxy check is skipped
         self.start_calls = []
 
-    def start(self, out, port=8080, hosts=None, **kwargs):
-        self.start_calls.append({"out": out, "port": port, "hosts": hosts, **kwargs})
+    def start(self, out, port=8080, **kwargs):
+        self.start_calls.append({"out": out, "port": port, **kwargs})
         self.running = True
         self.out = out
         self.port = port
-        self.hosts = list(hosts or [])
         self.events.append("recorder.start")
         return self.status()
 
     def status(self):
         return {"running": self.running, "flows": 0, "out": self.out, "out_name": os.path.basename(self.out) if self.out else None,
-                "port": self.port, "hosts": list(self.hosts), "stdout_tail": "",
+                "port": self.port, "stdout_tail": "",
                 "stderr_tail": "", "error": None, "pid": 1 if self.running else None, "exit_code": None if self.running else 0,
                 "started_at": None, "stopped_at": None, "command": []}
 
@@ -1711,9 +1721,7 @@ def launched(monkeypatch, events):
 
 
 def _start(client, H, **extra):
-    body = {"hosts": [], "append": False}
-    body.update(extra)
-    return client.post("/api/record/start", json=body, headers=H)
+    return client.post("/api/record/start", json=dict(extra), headers=H)
 
 
 def _disabled_button(html: str, button_id: str) -> bool:
@@ -1733,14 +1741,14 @@ class TestStart:
         # recorder: extra args tunnel HTTPS on every port (no certificate needed)
         call = recorder.start_calls[0]
         assert call["extra_args"] == ["--ignore-hosts", ".*"] == list(routes_mod.HTTPS_PASSTHROUGH_ARGS)
-        assert call["port"] == j["port"] and j["port"] != 8765 and set(call) == {"out", "port", "hosts", "extra_args"}
+        assert call["port"] == j["port"] and j["port"] != 8765 and set(call) == {"out", "port", "extra_args"}  # no host filter
         # browser: launched after the recorder, against the recorder's proxy address, with the typed URL
         assert launched.calls == [{"workdir": str(workdir), "proxy_address": f"127.0.0.1:{j['port']}",
                                    "url": "http://kanri/top.aspx", "title": "reqrec 記録用ブラウザ"}]
         assert launched.calls[0]["proxy_address"] == j["proxy_address"]
         assert win == [EMULATION_LEVELS["ie11"]]
         assert j["browser"] == {"kind": "iehost", "pid": 1000, "running": True, "exit_code": None, "log": launched.browsers[0].log_path}
-        assert j["emulation"] == "ie11" and j["origin"] == "advanced" and j["warnings"] == []
+        assert j["emulation"] == "ie11" and j["warnings"] == [] and "origin" not in j
         # the fields of the removed manual / system-proxy / https modes are gone from the response
         assert not {"instructions", "auto_port", "system_proxy", "browser_kind", "https_passthrough"} & set(j)
         state = app.extensions["reqrec"]
@@ -1990,8 +1998,7 @@ class TestPageAndState:
         assert st["browser"] == {"kind": None, "running": False, "pid": None, "exit_code": None}
         html = client.get("/").get_data(as_text=True)
         assert 'data-iehost-available="true"' in html and 'data-iehost-reason=""' in html
-        assert 'id="rec-unavailable"' not in html
-        assert not _disabled_button(html, "easy-start") and not _disabled_button(html, "btn-rec-start")
+        assert not _disabled_button(html, "easy-start")
 
     def test_page_carries_reason_when_unavailable(self, client, monkeypatch):
         monkeypatch.setattr(routes_mod, "mitmproxy_available", lambda: True)
@@ -1999,10 +2006,8 @@ class TestPageAndState:
         html = client.get("/").get_data(as_text=True)
         assert 'data-iehost-available="false"' in html
         assert f'data-iehost-reason="{UNAVAILABLE["reason"]}"' in html
-        # no fallback: both start buttons are disabled on the server and 1 記録 says why
-        assert _disabled_button(html, "easy-start") and _disabled_button(html, "btn-rec-start")
-        notice = html[html.index('id="rec-unavailable"'):]
-        assert UNAVAILABLE["reason"] in notice[:notice.index("</div>")]
+        # no fallback: the start button is disabled on the server (the readiness list says why, from the reason)
+        assert _disabled_button(html, "easy-start")
         st = client.get("/api/state").get_json()["iehost"]
         assert st["available"] is False and st["reason"] == UNAVAILABLE["reason"] and st["exe"] is None
 
@@ -2010,15 +2015,14 @@ class TestPageAndState:
         monkeypatch.setattr(routes_mod, "mitmproxy_available", lambda: False)
         monkeypatch.setattr(routes_mod.iehost, "availability", lambda workdir, **kw: dict(AVAILABLE))
         html = client.get("/").get_data(as_text=True)
-        assert _disabled_button(html, "easy-start") and _disabled_button(html, "btn-rec-start")
+        assert _disabled_button(html, "easy-start")
         assert 'data-mitm-available="false"' in html
 
     def test_page_has_the_new_record_controls(self, client):
         html = client.get("/").get_data(as_text=True)
-        for marker in ('id="rec-emulation"', 'value="ie11_force"', 'id="rec-start-url"', 'id="rec-proxy-address"',
-                       'id="rec-browser-state"',
-                       'id="easy-browser-note"', 'accept=".har,.json"', "IEChooser.exe",
-                       "表示モード (記録用ブラウザ)", "最初に開くアドレス", "開くサイトのアドレス"):
+        for marker in ('id="easy-emulation"', 'value="ie11_force"', 'value="default"', 'id="easy-url"',
+                       'id="easy-browser-note"', 'accept=".har,.json"', "HAR ファイルから作る", "F12 開発者ツール",
+                       "表示モード", "開くサイトのアドレス", "HKCU"):
             assert marker in html, marker
         # the manual-proxy / system-proxy / certificate / https controls are gone
         for removed in ('id="rec-port"', 'id="rec-listen"', 'id="rec-sysproxy"', 'id="rec-browser"', 'id="rec-browser-hint"',
@@ -2065,7 +2069,7 @@ class TestReviewFixes:
 
     def test_recorder_stopped_while_waiting_is_not_followed_by_a_launch(self, client, H, recorder, win, launched):
         def stopped_meanwhile(timeout=None):
-            recorder.running = False  # e.g. [記録停止] pressed in the advanced panel during the wait
+            recorder.running = False  # e.g. [やめる] pressed during the wait
             return True
 
         recorder.wait_until_listening = stopped_meanwhile
@@ -2226,8 +2230,7 @@ class TestSecondReviewFixes:
         assert win == [] and calls == []
 
     def test_missing_emulation_means_keep(self, client, H, recorder, win, launched):
-        body = {"hosts": [], "append": False}
-        r = client.post("/api/record/start", json=body, headers=H)
+        r = client.post("/api/record/start", json={}, headers=H)
         assert r.status_code == 200 and r.get_json()["emulation"] == "keep" and win == []
 
     def test_launch_failure_is_remembered_for_the_page(self, client, H, recorder, win, monkeypatch):
@@ -2249,8 +2252,7 @@ def _assert_start_undone(client, recorder, events):
     assert recorder.running is False and recorder.out is None
     assert events[-2:] == ["recorder.stop", "recorder.forget"]
     st = client.get("/api/record/status").get_json()
-    assert st["out"] is None and st["browser"]["kind"] is None and st["origin"] is None
-    assert client.get("/api/state").get_json()["record_origin"] is None
+    assert st["out"] is None and st["browser"]["kind"] is None
 
 
 class TestErrorKinds:
@@ -2309,7 +2311,7 @@ class TestForgetAfterDiscard:
         assert r.status_code == 200 and r.get_json()["removed"] is True and not os.path.exists(out)
         assert "recorder.forget" in events and recorder.out is None
         st = client.get("/api/record/status").get_json()
-        assert st["out"] is None and st["running"] is False  # 詳細設定: 「停止中」, [記録停止] disabled
+        assert st["out"] is None and st["running"] is False
         assert client.post("/api/record/stop", json={}, headers=H).status_code == 409
 
     def test_discard_without_forget_support_still_works(self, client, H, recorder, win, launched):
@@ -2324,32 +2326,13 @@ class TestForgetAfterDiscard:
 _fake_forget = FakeRecorder.forget
 
 
-class TestRecordOrigin:
-    def test_origin_is_remembered_until_stop(self, client, H, recorder, win, launched):
-        r = _start(client, H, origin="easy")
-        assert r.status_code == 200 and r.get_json()["origin"] == "easy"
-        assert client.get("/api/record/status").get_json()["origin"] == "easy"
-        assert client.get("/api/state").get_json()["record_origin"] == "easy"
-        client.post("/api/record/stop", json={}, headers=H)
-        assert client.get("/api/record/status").get_json()["origin"] is None
-        assert client.get("/api/state").get_json()["record_origin"] is None
-
-    def test_default_origin_is_advanced(self, client, H, recorder, win, launched):
-        assert _start(client, H).get_json()["origin"] == "advanced"
-        assert client.get("/api/record/status").get_json()["origin"] == "advanced"
-
-    def test_bad_origin_is_400_before_anything_starts(self, client, H, recorder, win, launched):
-        r = _start(client, H, origin="robot")
-        assert r.status_code == 400 and recorder.start_calls == []
-
-    def test_stop_without_append_uses_the_start_flag(self, app, client, H, recorder, win, launched):
-        state = app.extensions["reqrec"]
-        state.set_recording(load_recording(str(LOGIN_HAR)), ["x.har"], append=False)
-        before = state.recording_summary()["flows"]
-        assert _start(client, H, append=True, origin="advanced").status_code == 200
-        r = client.post("/api/record/stop", json={}, headers=H)  # what the easy screen's [記録をおわる] sends now
-        assert r.status_code == 200 and r.get_json()["appended"] is True
-        assert r.get_json()["flows"] > before
+class TestNoOrigin:
+    def test_start_and_status_carry_no_origin(self, client, H, recorder, win, launched):
+        """Only the easy screen records now: every recording stops when its recording browser closes."""
+        r = _start(client, H, origin="advanced")  # an old page: the field is ignored
+        assert r.status_code == 200 and "origin" not in r.get_json()
+        assert "origin" not in client.get("/api/record/status").get_json()
+        assert "record_origin" not in client.get("/api/state").get_json()
 
 
 class TestWindowsAuthSecrets:
@@ -2603,7 +2586,7 @@ class TestPassword:
         page = c.get("/")
         assert page.status_code == 200 and 'id="logout-link"' not in page.get_data(as_text=True)
         assert c.get("/api/state").status_code == 200
-        assert c.post("/api/recordings/clear", json={}, headers={TOKEN_HEADER: "test-token-123"}).status_code == 200
+        assert c.post("/api/run/stop", json={}, headers={TOKEN_HEADER: "test-token-123"}).status_code == 200
         assert c.get("/api/state", environ_base={"REMOTE_ADDR": "::1"}).status_code == 200
         assert c.get("/api/state", environ_base={"REMOTE_ADDR": "::ffff:127.0.0.1"}).status_code == 200
         # the DNS-rebinding guard still applies to this PC
@@ -2615,7 +2598,7 @@ class TestPassword:
         assert r.status_code == 302 and r.headers["Location"].endswith("/login")
         r = c.get("/api/state")
         assert r.status_code == 401 and r.get_json()["login"] is True
-        assert c.post("/api/recordings/clear", json={}, headers={TOKEN_HEADER: "test-token-123"}).status_code == 401
+        assert c.post("/api/run/stop", json={}, headers={TOKEN_HEADER: "test-token-123"}).status_code == 401
         assert c.get("/api/scripts/x.py/download").status_code == 401
 
     def test_login_page(self, pw_app):
@@ -2635,7 +2618,7 @@ class TestPassword:
         page = c.get("/")
         assert page.status_code == 200 and 'id="logout-link"' in page.get_data(as_text=True)
         assert c.get("/api/state").status_code == 200
-        assert c.post("/api/recordings/clear", json={}, headers={TOKEN_HEADER: "test-token-123"}).status_code == 200
+        assert c.post("/api/run/stop", json={}, headers={TOKEN_HEADER: "test-token-123"}).status_code == 200
         assert c.get("/login").status_code == 302  # already logged in: back to the GUI
 
     def test_session_cookie(self, pw_app):
@@ -2645,8 +2628,8 @@ class TestPassword:
     def test_token_and_origin_still_checked_after_login(self, pw_app):
         c = _lan_client(pw_app)
         _login(c)
-        assert c.post("/api/recordings/clear", json={}).status_code == 403
-        r = c.post("/api/recordings/clear", json={}, headers={TOKEN_HEADER: "test-token-123", "Origin": "http://evil.example"})
+        assert c.post("/api/run/stop", json={}).status_code == 403
+        r = c.post("/api/run/stop", json={}, headers={TOKEN_HEADER: "test-token-123", "Origin": "http://evil.example"})
         assert r.status_code == 403
 
     def test_logout(self, pw_app):

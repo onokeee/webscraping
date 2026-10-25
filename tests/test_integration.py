@@ -866,7 +866,7 @@ def test_legacy_cli_generate_replays(tmp_path, capsys, monkeypatch):
 
 
 def test_legacy_fixture_through_the_gui_api_offers_ntlm_env_vars(tmp_path):
-    """The no-code path: upload -> plan -> generate; the 実行 panel needs REQREC_NTLM_USER / _PASSWORD."""
+    """The no-code path: upload -> plan -> build; 試しに実行 asks for REQREC_NTLM_USER / _PASSWORD."""
     app = create_app(str(tmp_path / "work"), token="t", TESTING=True)
     client = app.test_client()
     H = {TOKEN_HEADER: "t"}
@@ -880,14 +880,13 @@ def test_legacy_fixture_through_the_gui_api_offers_ntlm_env_vars(tmp_path):
     assert rows["f0001"]["kept"] and rows["f0002"]["kept"] and rows["f0001"]["step_index"] == rows["f0003"]["step_index"] == 1
     assert rows["f0004"]["kept"] is False and rows["f0004"]["reason"].startswith("static asset")
     assert plan["steps"][0]["flow_ids"] == "f0001+f0002+f0003" and plan["steps"][0]["status_chain"] == [401, 401, 200]
-    gen = client.post("/api/generate", json={}, headers=H).get_json()
+    gen = client.post("/api/easy/build", json={}, headers=H).get_json()
     compile(gen["code"], "gui_legacy.py", "exec")
     assert "Authorization" not in gen["code"]
     assert [s["env_var"] for s in gen["secrets"]] == ["REQREC_NTLM_USER", "REQREC_NTLM_PASSWORD"]
     user, password = gen["secrets"]
     assert user["secret"] is False and user["default"] == "EXAMPLE\\taro"
     assert password["secret"] is True and "reqrec[ntlm]" in password["comment"]
-    assert gen["env_vars"] == ["REQREC_NTLM_USER", "REQREC_NTLM_PASSWORD"]
     assert client.get("/api/state").get_json()["secrets"] == gen["secrets"]
     app.extensions["reqrec"].close()
 
@@ -2321,3 +2320,67 @@ def test_wrong_password_fails_with_a_plain_message(replay, tmp_path):
     assert proc.stderr.index(progress[1]) < proc.stderr.index("Traceback")
     # the menu's URL key cannot be found on the login page that came back
     assert "要素が見つかりません" in proc.stderr or "パターンに一致しませんでした" in proc.stderr
+
+
+# ===== the 受注管理 mock: a real IE-engine recording with every pattern at once, replayed =====
+# ``tests/fixtures/order_ie_recording.json`` was recorded through the GUI with the real recording browser
+# (tests/test_real_engine.py::test_order_site_with_every_pattern_through_the_gui): the session id the
+# login puts into every URL (``/oms/s/<SID>/...``, no cookie), one-time tokens in hidden fields, links, a
+# script variable and an XMLHttpRequest header, a ``window.open`` child window that writes the chosen
+# customer into its opener, a ``showModalDialog`` child window, a date picked in a calendar that pops up
+# over the field, an order opened in another tab and a CSV export that checks the Referer
+# (``order_site`` section of tests/ie_support.py).  The script is replayed against a fresh site with the
+# recorded data and with data that changed since (``drift``: a new customer listed FIRST in the picker,
+# the first order of the result cancelled, a new order).
+
+ORDER_RECORDING = FIXTURES / "order_ie_recording.json"
+ORDER_EVENTS = ["login_page", "login_ok", "menu", "search_page", "custpicker", "itempicker", "result", "order",
+                "shipment", "export"]
+
+
+@pytest.mark.parametrize("drift", [False, True], ids=["same_data", "changed_data"])
+def test_order_recording_with_every_pattern_replays_on_a_fresh_site(drift, tmp_path):
+    port = _free_port()
+    rec_path = tmp_path / "rec.json"
+    _retarget(ORDER_RECORDING, rec_path, port)
+    script = tmp_path / "scrape_order.py"
+    assert cli.main(["generate", str(rec_path), "-o", str(script)]) == 0
+    log = tmp_path / "site.log"
+    server = fs.order_serve_in_thread(str(log), port, drift=drift)
+    try:
+        proc = _run(script, tmp_path / "out", password=None)  # the password is written into the script
+    finally:
+        server.stop()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    entries = [e for e in fs.read_log(str(log)) if e.get("event") not in ("not_found", "redirect")]
+    assert [e["event"] for e in entries] == ORDER_EVENTS, entries
+    assert all(e["status"] < 400 for e in entries), entries
+    sc = fs.ORDER_SCENARIO
+    result = next(e["details"] for e in entries if e["event"] == "result")
+    # the user's choices: the customer of the child window (not the picker's first row), the item of the
+    # modal dialog, the date of the calendar and the default end of the period
+    assert (result["customer"], result["item"], result["date_from"], result["date_to"]) == (
+        sc["customer"], sc["item"], sc["date_from"], sc["date_to"])
+    assert next(e["details"]["no"] for e in entries if e["event"] == "order") == sc["order"]
+    csv = tmp_path / "out" / fs.order_export_filename(sc["customer"])
+    rows = [line.split(",") for line in csv.read_bytes().decode("cp932").splitlines()]
+    assert rows == fs.order_expected_csv(drift=drift)
+
+
+def test_order_recording_replays_no_recorded_session_value(tmp_path):
+    """Neither the session id of the URLs nor any one-time token of the recording is in the script."""
+    rec = Recording.load(str(ORDER_RECORDING))
+    script = tmp_path / "scrape_order.py"
+    assert cli.main(["generate", str(ORDER_RECORDING), "-o", str(script)]) == 0
+    source = _code_without_comments(script.read_text(encoding="utf-8"))  # comments may quote recorded values
+    values = set()
+    for flow in rec.flows:
+        m = re.search(r"/oms/s/([A-Za-z0-9]{24})/", flow.request.url)
+        if m:
+            values.add(m.group(1))
+        values.update(v for k, v in flow.request.query_pairs if k == "tk")
+        values.update(v for k, v in flow.request.headers if k.lower() == "x-api-token")
+        if flow.request.method == "POST":
+            values.update(v for k, v in parse_qsl(flow.request.text()) if k in ("token", "loginToken"))
+    assert len(values) >= 8, values
+    assert sorted(v for v in values if v in source) == []

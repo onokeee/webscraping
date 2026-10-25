@@ -1471,16 +1471,16 @@ def test_command_line(tmp_path):
 # ===== former tests/e2e/test_gui_recording.py: the GUI's recording path with the real mitmdump =====
 # End-to-end: the GUI's recording path with the **real** ``mitmdump`` (DESIGN.md §13.6, §13.12).
 #
-# [記録開始] starts ``mitmdump`` with the reqrec addon exactly as ``reqrec gui`` does (``RecorderManager``
+# [記録をはじめる] starts ``mitmdump`` with the reqrec addon exactly as ``reqrec gui`` does (``RecorderManager``
 # on a free port of 127.0.0.1 with ``HTTPS_PASSTHROUGH_ARGS``) and then opens the recording browser
 # through it.  The recording browser itself is faked (``iehost.availability`` / ``launch`` /
 # ``get_emulation`` / ``set_emulation`` patched, so this runs without RecBrowser.exe; the opt-in sections
 # above drive the real one): ``requests`` with ``proxies=`` stands in for it and browses the site of
-# ``tests/support.py`` through the proxy address the GUI handed to the browser.  「記録停止して読み込む」
-# closes the browser, loads the recording and the steps table lists the proxied requests.  The first
-# test drives the JSON API with Flask's test client and goes on to generate, save and *run* the script
-# from the GUI against a restarted site (fresh tokens); the last one clicks through 詳細設定「1 記録」
-# in a real browser with Playwright.
+# ``tests/support.py`` through the proxy address the GUI handed to the browser.  [記録をおわる]
+# closes the browser, loads the recording and makes the script; 詳細設定 lists the proxied requests.
+# The first test drives the JSON API with Flask's test client and goes on to build and *run* the script
+# from the GUI against a restarted site (fresh tokens); the last one clicks through the easy screen and
+# 詳細設定 in a real browser with Playwright.
 #
 # Runs on every OS; skipped when mitmproxy is not installed (the browser test also when Playwright /
 # Chromium are missing).
@@ -1591,15 +1591,15 @@ def test_record_with_real_mitmdump_then_plan_generate_and_run(gui):
     client, H, state = gui.client, gui.H, gui.state
     server, base_url = start_server()
     try:
-        # -- 記録開始: the proxy on a free port, then the recording browser through it ---------------
-        r = client.post("/api/record/start", json={"hosts": ["127.0.0.1"]}, headers=H)
+        # -- 記録をはじめる: the proxy on a free port, then the recording browser through it ---------
+        r = client.post("/api/record/start", json={}, headers=H)
         assert r.status_code == 200, r.get_json()
         started = r.get_json()
         proxy_port = started["port"]
         assert started["status"]["running"] is True and started["status"]["error"] is None
         assert started["proxy_address"] == f"127.0.0.1:{proxy_port}"
         assert re.fullmatch(r"rec_\d{8}_\d{6}\.json", started["out"])
-        assert started["status"]["hosts"] == ["127.0.0.1"]
+        assert "hosts" not in started["status"]  # every site opened in the recording browser is recorded
         assert started["browser"]["kind"] == "iehost" and started["browser"]["running"] is True
         assert [(c["proxy_address"], c["url"]) for c in gui.launched] == [(started["proxy_address"], None)]
         # the browser is opened only once mitmdump accepts connections
@@ -1614,7 +1614,7 @@ def test_record_with_real_mitmdump_then_plan_generate_and_run(gui):
         assert live["browser"]["kind"] == "iehost" and live["browser"]["running"] is True
         assert client.get("/api/state").get_json()["recorder"]["running"] is True
 
-        # -- 記録停止して読み込む (the recording browser is closed first) ------------------------------
+        # -- 記録をおわる (the recording browser is closed first) --------------------------------------
         r = client.post("/api/record/stop", json={}, headers=H)
         assert r.status_code == 200, r.get_json()
         stopped = r.get_json()
@@ -1627,16 +1627,14 @@ def test_record_with_real_mitmdump_then_plan_generate_and_run(gui):
         assert (gui.workdir / "recordings" / started["out"]).is_file()
         assert state.recorder.running is False and state.browser is None
         rec = Recording.load(str(gui.workdir / "recordings" / started["out"]))
-        assert rec.meta["source"] == "mitmproxy" and rec.meta["hosts"] == ["127.0.0.1"]
+        assert rec.meta["source"] == "mitmproxy" and "hosts" not in rec.meta
         assert [f.request.path for f in rec.flows] == [
             "/login", "/login", "/dashboard", "/api/items", "/api/items", "/api/items", "/export", "/static/app.css",
         ]
         assert rec.flows[1].request.text() == f"_token={tokens['login_token']}&username={USERNAME}&password=Secr3t%21"
         assert rec.flows[1].response.status == 302
-        listed = client.get("/api/recordings").get_json()["files"]
-        assert any(f["name"] == started["out"] and f["folder"] == "recordings" and f["flows"] == EXPECTED_FLOWS for f in listed)
 
-        # -- 3 ステップ: the table shows every proxied request --------------------------------
+        # -- 詳細設定: the table shows every proxied request ----------------------------------
         plan = client.post("/api/plan", json={}, headers=H).get_json()
         assert plan["steps_kept"] == 4 and plan["flows_total"] == EXPECTED_FLOWS and plan["dropped"] == 1
         rows = {(f["method"], f["url"].split(str(server.server_port), 1)[1]): f for f in plan["flows"]}
@@ -1657,16 +1655,15 @@ def test_record_with_real_mitmdump_then_plan_generate_and_run(gui):
         assert any(e["kind"] == "regex" and "API_TOKEN" in e["pattern"] for e in steps[1]["extractors"])
         assert plan["env_vars"] == [] and plan["auth"] is None  # the password is written into the script
 
-        # -- 4 コード -> 保存 -> 5 実行 against a RESTARTED site (all tokens change) -----------
-        gen = client.post("/api/generate", json={}, headers=H).get_json()
+        # -- the script (saved) -> 試しに実行 against a RESTARTED site (all tokens change) -------
+        gen = client.post("/api/easy/build", json={"name": "recorded_site"}, headers=H).get_json()
         compile(gen["code"], "gui_recorded.py", "exec")
         assert repr(PASSWORD) in gen["code"] and "REQREC_PASSWORD" not in gen["code"]
         executable = "\n".join(ln.split("  # ")[0] for ln in gen["code"].splitlines() if not ln.lstrip().startswith("#"))
         for value in (tokens["csrf"], tokens["api_token"], tokens["sig"], tokens["login_token"]):
             assert value not in executable  # recorded tokens survive only in comments (記録時の値)
         assert gen["secrets"] == []  # [試しに実行する] has nothing to ask
-        saved = client.post("/api/scripts/save", json={"name": "recorded_site", "code": gen["code"]}, headers=H).get_json()
-        assert saved["name"] == "recorded_site.py"
+        assert gen["name"] == "recorded_site.py" and (gui.workdir / "scripts" / "recorded_site.py").is_file()
 
         server, base_url = restart_server(server)
         r = client.post("/api/run", json={"name": "recorded_site.py", "env": {"NO_PROXY": "127.0.0.1,localhost"}}, headers=H)
@@ -1701,7 +1698,7 @@ def test_record_with_real_mitmdump_then_plan_generate_and_run(gui):
 def test_record_stop_without_traffic_reports_japanese_error(gui):
     """Stopping a recording nobody browsed through must not load an empty recording."""
     client, H, state = gui.client, gui.H, gui.state
-    r = client.post("/api/record/start", json={"hosts": ["127.0.0.1"]}, headers=H)
+    r = client.post("/api/record/start", json={}, headers=H)
     assert r.status_code == 200, r.get_json()
     assert len(gui.launched) == 1  # mitmdump listened, the recording browser was opened (and never used)
     try:
@@ -1734,11 +1731,11 @@ def _launch_chromium(pw):
 
 
 @needs_mitmdump
-def test_record_panel_in_real_browser_loads_recording_into_steps_table(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_easy_screen_in_real_browser_records_and_detail_screen_lists_the_steps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     pw_api = pytest.importorskip("playwright.sync_api", reason="playwright not installed")
     from werkzeug.serving import make_server
 
-    launched = _fake_recording_browser(monkeypatch)  # before the page is rendered: [記録開始] is enabled
+    launched = _fake_recording_browser(monkeypatch)  # before the page is rendered: [記録をはじめる] is enabled
     workdir = tmp_path / "gui_work"
     app = create_app(str(workdir), host="127.0.0.1", port=8765)
     srv = make_server("127.0.0.1", 0, app, threaded=True)
@@ -1760,29 +1757,32 @@ def test_record_panel_in_real_browser_loads_recording_into_steps_table(tmp_path:
                 page.on("console", lambda msg: js_errors.append(msg.text) if msg.type == "error" else None)
                 page.goto(f"http://127.0.0.1:{gui_port}/", wait_until="networkidle")
 
-                page.click("#mode-toggle")  # 詳細設定: the default かんたん画面 hides the five panels
-                page.click('.nav-step[data-panel="record"]')
-                page.fill("#rec-hosts", "127.0.0.1")
-                page.click("#btn-rec-start")
-                expect(page.locator("#rec-state-text")).to_contain_text("記録中")
-                address = page.locator("#rec-proxy-address")
-                expect(address).to_have_text(re.compile(r"^127\.0\.0\.1:\d+$"))
-                proxy_port = int(address.inner_text().rsplit(":", 1)[1])
-                assert [c["proxy_address"] for c in launched] == [f"127.0.0.1:{proxy_port}"]
-                expect(page.locator("#status-text")).to_contain_text("記録を開始しました")
-                expect(page.locator("#rec-browser-state")).to_contain_text("起動中")
-                expect(page.locator("#btn-rec-start")).to_be_disabled()
-                expect(page.locator("#btn-rec-stop")).to_be_enabled()
+                page.click("#easy-start")
+                expect(page.locator("#easy-recording")).to_be_visible()
+                expect(page.locator("#status-text")).to_contain_text("記録中です")
+                expect(page.locator("#mode-toggle")).to_be_disabled()  # 詳細設定 waits for the script
+                assert len(launched) == 1
+                proxy_port = int(launched[0]["proxy_address"].rsplit(":", 1)[1])
                 state = app.extensions["reqrec"]
 
                 _drive_site_through_proxy(base_url, proxy_port)
-                expect(page.locator("#rec-flow-count")).to_have_text(str(EXPECTED_FLOWS))  # live count
+                expect(page.locator("#easy-count")).to_have_text(str(EXPECTED_FLOWS))  # live count
 
-                page.click("#btn-rec-stop")
-                expect(page.locator("#panel-steps")).to_have_class(re.compile(r"\bactive\b"))
+                page.click("#easy-stop")
+                expect(page.locator("#easy-done")).to_be_visible()
+                expect(page.locator("#easy-done-steps")).to_contain_text("4 手順")
+                assert state.recorder.running is False and state.browser is None
+                assert len(list((workdir / "recordings").glob("rec_*.json"))) == 1
+
+                page.click("#easy-open-detail")
+                expect(page.locator("#panel-detail")).to_be_visible()
+                expect(page.locator("#detail-source")).to_contain_text("recordings/rec_")
+                expect(page.locator("#detail-script")).to_have_text(re.compile(r"^scrape_.*\.py$"))
+                expect(page.locator("#code-editor")).to_have_value(re.compile(r"def step_01_"))
                 rows = page.locator("#flow-tbody tr[data-flow-id]")
+                expect(rows).to_have_count(7)  # the flows the script uses
+                page.check("#show-dropped")
                 expect(rows).to_have_count(EXPECTED_FLOWS)
-                expect(page.locator("#status-text")).to_contain_text("解析完了")
                 expect(page.locator("#sum-steps")).to_have_text("4")
                 expect(page.locator("#sum-kept")).to_have_text("7")
                 expect(page.locator("#sum-dropped")).to_have_text("1")
@@ -1793,12 +1793,6 @@ def test_record_panel_in_real_browser_loads_recording_into_steps_table(tmp_path:
                 expect(page.locator('#flow-tbody tr[data-flow-id="f0007"] .col-url')).to_contain_text("/export")
                 expect(page.locator('#flow-tbody tr[data-flow-id="f0008"]')).to_have_class(re.compile(r"\bdropped\b"))
                 expect(page.locator('#flow-tbody tr[data-flow-id="f0008"] .col-reason')).to_contain_text("静的ファイル")
-                expect(page.locator("#cur-sources")).to_contain_text("recordings/rec_")
-                page.click('.nav-step[data-panel="record"]')
-                expect(page.locator("#rec-state-text")).to_contain_text("停止中")
-                expect(page.locator("#rec-flow-count")).to_have_text(str(EXPECTED_FLOWS))
-                assert state.recorder.running is False and state.browser is None
-                assert len(list((workdir / "recordings").glob("rec_*.json"))) == 1
                 context.close()
             finally:
                 browser.close()
@@ -1875,3 +1869,106 @@ def test_record_generate_and_replay_the_factory_scenario(tmp_path):
     xlsx = out / fs.export_filename("01", "L11")
     rows = fs.read_xlsx_rows(xlsx.read_bytes())
     assert [tuple(r) for r in rows[1:-1]] == [tuple(r) for r in fs.expected_rows(*sc.SCENARIO_FILTER)]
+
+
+# ===== the 受注管理 mock through the GUI with the real recording browser (opt-in) =====
+# Every pattern at once, recorded the way a user does it on the かんたん画面: the session id the login
+# puts into every URL (``/oms/s/<SID>/...``, no cookie), one-time tokens in hidden fields, links, a
+# script variable and an XMLHttpRequest header, a ``window.open`` child window that writes into its
+# opener, a ``showModalDialog`` child window, a date picked in a calendar that pops up over the field
+# (no request), an order opened in another tab (``target=_blank``) and a CSV download that checks the
+# Referer (``order_site`` section of tests/ie_support.py).  ``/api/record/start`` opens the real
+# RecBrowser.exe through the real mitmdump; the test driver operates it; ``/api/record/stop`` +
+# ``/api/easy/build`` make the script, which ``/api/run`` replays against a FRESH site (new session id
+# and tokens) - once with the recorded data, once with data that changed since (``drift``: a new
+# customer listed first in the picker, an order cancelled, a new order).  Windows + ``REQREC_IEHOST_TESTS=1``.
+# The always-on replay of such a recording is in tests/test_integration.py (``order_ie_recording.json``).
+
+
+def _order_events(sup, log: Path) -> list:
+    return [e["event"] for e in sup.read_log(str(log)) if e.get("event") not in ("not_found", "redirect")]
+
+
+ORDER_EVENTS = ["login_page", "login_ok", "menu", "search_page", "custpicker", "itempicker", "result", "order",
+                "shipment", "export"]
+
+
+@live_opt_in
+def test_order_site_with_every_pattern_through_the_gui(tmp_path, monkeypatch):
+    from reqrec import iehost
+
+    work = tmp_path / "gui_work"
+    if not iehost.availability(str(work))["available"]:
+        pytest.skip("recording browser unavailable (no csc.exe)")
+    pytest.importorskip("mitmproxy")
+    sup = _live_load("order_support_live", LIVE_ROOT / "tests" / "ie_support.py")
+    host, bypass = sup.site_host()
+    if bypass:
+        pytest.skip("127.0.0.1.nip.io does not resolve: WinINet would not send the site through the proxy")
+    driver = sup.build_driver(str(tmp_path / "iedriver_bin"))
+    monkeypatch.setattr(reqrec, "PROXY_READY_TIMEOUT", 60.0)  # a cold first mitmdump import can be slow
+    sc = sup.ORDER_SCENARIO
+    port = sup.free_port()
+    record_log = tmp_path / "record.log"
+    site = sup.order_serve_in_thread(str(record_log), port)
+    app = create_app(str(work), host="127.0.0.1", port=sup.free_port(), token="t", TESTING=True)
+    client, H = app.test_client(), {TOKEN_HEADER: "t"}
+
+    def replay(log: Path, drift: bool, outdir: Path) -> dict:
+        server = sup.order_serve_in_thread(str(log), port, drift=drift)  # new session id and new tokens
+        try:
+            r = client.post("/api/run", json={"name": b["name"], "env": {"REQREC_OUTPUT_DIR": str(outdir)}}, headers=H)
+            assert r.status_code == 200, r.get_json()
+            deadline = time.time() + 120
+            while client.get("/api/run/status").get_json()["running"] and time.time() < deadline:
+                time.sleep(0.5)
+            return client.get("/api/run/status").get_json()
+        finally:
+            server.stop()
+
+    try:
+        try:
+            r = client.post("/api/record/start", json={"start_url": f"http://{host}:{port}/oms/login"}, headers=H)
+            assert r.status_code == 200, r.get_json()
+            info = sup.operate_order_site(sup.IEDriver(driver, r.get_json()["browser"]["pid"]), timeout=30)
+            assert info["close"]["exited"] is True, info
+            stopped = client.post("/api/record/stop", json={}, headers=H)
+            assert stopped.status_code == 200, stopped.get_json()
+        finally:
+            site.stop()
+        recorded = sup.read_log(str(record_log))
+        assert _order_events(sup, record_log) == ORDER_EVENTS, recorded
+        searched = next(e["details"] for e in recorded if e["event"] == "result")
+        assert (searched["date_from"], searched["date_to"]) == (sc["date_from"], sc["date_to"])  # from the calendar
+        sid = next(e["session"] for e in recorded if e["event"] == "login_ok")
+
+        built = client.post("/api/easy/build", json={}, headers=H)
+        assert built.status_code == 200, built.get_json()
+        b = built.get_json()
+        assert b["secrets"] == []  # the password is written into the script: nothing to type
+
+        for drift in (False, True):
+            log, out = tmp_path / f"replay_drift_{drift}.log", tmp_path / f"out_drift_{drift}"
+            st = replay(log, drift, out)
+            assert st["exit_code"] == 0, st["output_tail"] + "\n" + st["errors_tail"]
+            assert "[完了] すべての手順が終わりました" in st["output_tail"]
+            replayed = sup.read_log(str(log))
+            assert _order_events(sup, log) == ORDER_EVENTS, replayed
+            assert all(e["status"] < 400 for e in replayed if e.get("event") in ORDER_EVENTS), replayed
+            new_sid = next(e["session"] for e in replayed if e["event"] == "login_ok")
+            assert new_sid != sid and all(e["session"] in (None, new_sid) for e in replayed)
+            result = next(e["details"] for e in replayed if e["event"] == "result")
+            assert (result["customer"], result["item"], result["date_from"], result["date_to"]) == (
+                sc["customer"], sc["item"], sc["date_from"], sc["date_to"])  # the user's choices, not the first rows
+            assert next(e["details"]["no"] for e in replayed if e["event"] == "order") == sc["order"]
+            # the CSV of the search is saved under the server's file name with the rows of that day's data
+            csv = out / sup.order_export_filename(sc["customer"])
+            assert csv.is_file(), sorted(os.listdir(out)) if out.is_dir() else out
+            rows = [line.split(",") for line in csv.read_bytes().decode("cp932").splitlines()]
+            assert rows == sup.order_expected_csv(drift=drift)
+    finally:
+        app.extensions["reqrec"].close()
+    # nothing recorded for this session is replayed: not the session id, not a token
+    code = (work / "scripts" / b["name"]).read_text(encoding="utf-8")
+    executable = "\n".join(ln.split("  # ")[0] for ln in code.splitlines() if not ln.lstrip().startswith("#"))
+    assert sid not in executable

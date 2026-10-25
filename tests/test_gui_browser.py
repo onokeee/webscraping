@@ -1,12 +1,14 @@
 """Browser-level tests of the GUI with Playwright (Chromium).  Contract: DESIGN.md §13.6.
 
 The Flask app runs in a daemon thread on a free port (``werkzeug.serving.make_server``); a real
-Chromium drives the page: upload the fixture HAR, watch the step table, uncheck a flow, pick the
-result step, generate, save.  Skipped cleanly when Playwright or a Chromium binary is unavailable.
+Chromium drives the page: a HAR file becomes a script on the かんたん画面, then 詳細設定 shows the steps,
+unchecks a flow, picks the result step, rebuilds from the settings, edits the code by hand, saves and
+runs it.  Skipped cleanly when Playwright or a Chromium binary is unavailable.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -92,178 +94,50 @@ def page(browser, server):
         context.close()
 
 
-@pytest.fixture
-def advanced(page):
-    """The page switched from the default かんたん画面 to 詳細設定 (the five panels)."""
+def _build_from_har(page, path: Path = LOGIN_HAR) -> str:
+    """かんたん画面 [HAR ファイルから作る]: the file is uploaded and turned into a saved script at once."""
     expect(page.locator("#panel-easy")).to_be_visible()
-    page.click("#mode-toggle")
-    expect(page.locator("#nav")).to_be_visible()
+    page.set_input_files("#easy-har-input", str(path))
+    expect(page.locator("#easy-done")).to_be_visible()
+    return page.locator("#easy-done-name").inner_text().strip()
+
+
+def _open_detail(page):
+    page.click("#easy-open-detail")
+    expect(page.locator("#panel-detail")).to_be_visible()
+    expect(page.locator("#panel-easy")).to_be_hidden()
     expect(page.locator("#mode-toggle")).to_have_text("かんたん画面に戻る")
-    return page
-
-
-def _upload_fixture(page):
-    page.click('.nav-step[data-panel="load"]')
-    page.set_input_files("#file-input", str(LOGIN_HAR))
-    expect(page.locator("#btn-upload")).to_be_enabled()
-    page.click("#btn-upload")
     rows = page.locator("#flow-tbody tr[data-flow-id]")
-    expect(rows).to_have_count(14)
-    expect(page.locator("#panel-steps")).to_have_class(re.compile(r"\bactive\b"))
+    expect(rows).to_have_count(8)  # the flows the script uses (the others only with 「使わない通信も表示」)
     return rows
 
 
 # --------------------------------------------------------------------------- tests
 
-def test_page_loads_in_japanese(advanced):
-    page = advanced
+def test_page_loads_in_japanese(page):
     expect(page).to_have_title(re.compile("reqrec"))
     expect(page.locator("#status-text")).to_contain_text("準備完了")
-    for label in ("記録", "読み込み", "ステップ", "コード", "実行"):
-        expect(page.locator("#nav")).to_contain_text(label)
-    assert page.evaluate("document.body.dataset.token").strip() != ""
-    assert page.js_errors == []
-
-
-def test_upload_shows_step_table(advanced, server):
-    page = advanced
-    _upload_fixture(page)
-    expect(page.locator("#status-text")).to_contain_text("解析完了")
-    expect(page.locator("#sum-steps")).to_have_text("5")
-    expect(page.locator("#sum-kept")).to_have_text("8")
-    expect(page.locator("#sum-dropped")).to_have_text("6")
-    first = page.locator('#flow-tbody tr[data-flow-id="f0001"]')
-    expect(first).to_have_class(re.compile(r"\bkept\b"))
-    expect(first.locator("input[type=checkbox]")).to_be_checked()
-    expect(first.locator(".step-no")).to_have_text("1")
-    static = page.locator('#flow-tbody tr[data-flow-id="f0002"]')
-    expect(static).to_have_class(re.compile(r"\bdropped\b"))
-    expect(static.locator("input[type=checkbox]")).not_to_be_checked()
-    expect(static.locator(".col-reason")).to_contain_text("静的ファイル")
-    expect(static.locator(".col-ref")).to_contain_text("shop.example.test/login")
-    expect(page.locator("#cur-flows")).to_contain_text("14")
-    assert (server.workdir / "uploads" / "login_flow_chrome.har").is_file()
-    # detail drawer
-    first.click()
-    expect(page.locator("#drawer")).to_be_visible()
-    expect(page.locator("#dr-url")).to_contain_text("https://shop.example.test/login")
-    expect(page.locator("#dr-resp-body")).to_contain_text("<")
-    page.click('#drawer .tab[data-tab="req"]')
-    expect(page.locator("#dr-req-headers")).to_contain_text("user-agent")
-    page.click("#drawer-close")
-    expect(page.locator("#drawer")).to_be_hidden()
-    assert page.js_errors == []
-
-
-def test_uncheck_kept_flow_marks_it_dropped(advanced):
-    page = advanced
-    _upload_fixture(page)
-    row = page.locator('#flow-tbody tr[data-flow-id="f0010"]')
-    expect(row).to_have_class(re.compile(r"\bkept\b"))
-    row.locator("input[type=checkbox]").uncheck()
-    row = page.locator('#flow-tbody tr[data-flow-id="f0010"]')  # table re-renders
-    expect(row).to_have_class(re.compile(r"\bdropped\b"))
-    expect(row.locator(".col-reason")).to_contain_text("手動で除外")
-    expect(row.locator("input[type=checkbox]")).not_to_be_checked()
-    expect(page.locator("#sum-steps")).to_have_text("4")
-    # and back again
-    page.locator('#flow-tbody tr[data-flow-id="f0010"] input[type=checkbox]').check()
-    expect(page.locator('#flow-tbody tr[data-flow-id="f0010"]')).to_have_class(re.compile(r"\bkept\b"))
-    expect(page.locator("#sum-steps")).to_have_text("5")
-    # a dropped flow can be forced in
-    page.locator('#flow-tbody tr[data-flow-id="f0002"] input[type=checkbox]').check()
-    expect(page.locator('#flow-tbody tr[data-flow-id="f0002"]')).to_have_class(re.compile(r"\bkept\b"))
-    expect(page.locator("#sum-steps")).to_have_text("6")
-    assert page.js_errors == []
-
-
-def test_choose_result_step(advanced):
-    page = advanced
-    _upload_fixture(page)
-    page.locator('#flow-tbody tr[data-flow-id="f0009"] input[type=radio]').check()
-    expect(page.locator("#sum-final")).to_contain_text("ステップ 2")
-    expect(page.locator('#flow-tbody tr[data-flow-id="f0009"]')).to_have_class(re.compile(r"\bfinal\b"))
-    expect(page.locator('#flow-tbody tr[data-flow-id="f0009"] .col-reason')).to_contain_text("結果")
-    page.click("#btn-final-clear")
-    expect(page.locator("#sum-final")).to_contain_text("最後のステップ")
-    assert page.js_errors == []
-
-
-def test_generate_save_and_run_panel(advanced, server):
-    page = advanced
-    _upload_fixture(page)
-    # opt in to 「パスワードなどをスクリプトに書き込まず、実行するときに入力する」 (off by default)
-    page.click('.nav-step[data-panel="steps"]')
-    page.check('input.opt[data-opt="redact_secrets"]')
-    page.click("#btn-goto-code")
-    expect(page.locator("#panel-code")).to_have_class(re.compile(r"\bactive\b"))
-    page.click("#btn-generate")
-    preview = page.locator("#code-preview")
-    expect(preview).to_contain_text("def step_01_")
-    expect(preview).to_contain_text("import requests")
-    expect(page.locator("#gen-secrets")).to_contain_text("REQREC_PASSWORD")
-    expect(page.locator("#script-name")).to_have_value(re.compile(r"^scrape_"))
-    page.fill("#script-name", "browser_test")
-    page.click("#btn-save")
-    expect(page.locator("#save-result")).to_contain_text("保存しました")
-    saved = server.workdir / "scripts" / "browser_test.py"
-    assert saved.is_file()
-    compile(saved.read_text(encoding="utf-8"), str(saved), "exec")
-    download = page.locator("#btn-download")
-    expect(download).not_to_have_class(re.compile(r"\bdisabled\b"))
-    assert download.get_attribute("href") == "/api/scripts/browser_test.py/download"
-    # the run panel knows the script and asks for the secret
-    page.click("#btn-goto-run")
-    expect(page.locator("#panel-run")).to_have_class(re.compile(r"\bactive\b"))
-    expect(page.locator("#run-script")).to_have_value("browser_test.py")
-    expect(page.locator('#env-inputs input[data-env="REQREC_PASSWORD"]')).to_have_attribute("type", "password")
-    assert page.js_errors == []
-
-
-def test_run_tiny_script_in_browser(advanced, server):
-    page = advanced
-    script = server.workdir / "scripts" / "hello_env.py"
-    script.write_text("import os\nprint('ENV=' + os.environ.get('REQREC_PASSWORD', '(unset)'))\n", encoding="utf-8")
-    page.click('.nav-step[data-panel="run"]')
-    page.click("#btn-refresh-scripts")
-    page.select_option("#run-script", "hello_env.py")
-    page.click("#btn-run")
-    expect(page.locator("#run-state")).to_contain_text("正常終了")
-    expect(page.locator("#run-stdout")).to_contain_text("ENV=(unset)")
-    page.fill("#output-name", "browser_out.txt")
-    page.click("#btn-save-output")
-    expect(page.locator("#save-output-result")).to_contain_text("保存しました")
-    assert (server.workdir / "outputs" / "browser_out.txt").read_text(encoding="utf-8") == "ENV=(unset)\n"
-    assert page.js_errors == []
-
-
-# --------------------------------------------------------------------------- かんたん画面 (DESIGN.md §13.11)
-
-def test_easy_screen_is_the_default(page):
     expect(page.locator("#panel-easy")).to_be_visible()
-    expect(page.locator("#nav")).to_be_hidden()
+    expect(page.locator("#panel-detail")).to_be_hidden()
     expect(page.locator("#easy-start")).to_contain_text("記録をはじめる")
     expect(page.locator("#easy-ready")).to_contain_text("記録")
+    expect(page.locator("#easy-har-pick")).to_be_visible()
+    assert page.evaluate("document.body.dataset.token").strip() != ""
+    # nothing recorded yet: 詳細設定 says how to get a script
+    page.click("#mode-toggle")
+    expect(page.locator("#detail-empty")).to_be_visible()
+    expect(page.locator("#detail-body")).to_be_hidden()
     assert page.js_errors == []
 
 
-def test_easy_builds_from_a_loaded_recording_and_runs_it(page, server):
-    # load a HAR in 詳細設定, come back, and turn it into a script from the easy screen
-    page.click("#mode-toggle")
-    _upload_fixture(page)
-    page.click("#mode-toggle")
-    expect(page.locator("#panel-easy")).to_be_visible()
-    expect(page.locator("#easy-loaded")).to_be_visible()
-    expect(page.locator("#easy-loaded-count")).to_have_text("14")
-    page.click("#easy-build-loaded")
-    expect(page.locator("#easy-done")).to_be_visible()
-    expect(page.locator("#easy-done-name")).to_contain_text(".py")
+def test_har_file_becomes_a_script_on_the_easy_screen(page, server):
+    name = _build_from_har(page)
+    assert name.endswith(".py") and (server.workdir / "scripts" / name).is_file()
+    assert (server.workdir / "uploads" / "login_flow_chrome.har").is_file()
     expect(page.locator("#easy-done-steps")).to_contain_text("5 手順")
     expect(page.locator("#easy-done-secrets")).to_be_hidden()  # the password is written into the script
     expect(page.locator("#easy-done-files")).to_be_visible()  # the CSV export is listed as a saved file
     expect(page.locator("#easy-done-files")).to_contain_text("export.csv")
-    name = page.locator("#easy-done-name").inner_text().strip()
-    assert (server.workdir / "scripts" / name).is_file()
     assert page.locator("#easy-download").get_attribute("href") == f"/api/scripts/{name}/download"
     # 試しに実行: nothing to type; the fixture hosts do not exist, so the run fails with a plain hint and
     # the result box says at which step it stopped
@@ -278,20 +152,148 @@ def test_easy_builds_from_a_loaded_recording_and_runs_it(page, server):
     assert page.js_errors == []
 
 
-def test_mode_choice_is_remembered(page, server):
-    page.click("#mode-toggle")
-    expect(page.locator("#nav")).to_be_visible()
+def test_detail_screen_shows_the_script_and_its_steps(page, server):
+    name = _build_from_har(page)
+    rows = _open_detail(page)
+    expect(page.locator("#detail-script")).to_have_text(name)
+    expect(page.locator("#detail-source")).to_contain_text("uploads/login_flow_chrome")
+    editor = page.locator("#code-editor")
+    expect(editor).to_have_value(re.compile(r"import requests[\s\S]*def step_01_"))
+    expect(editor).to_be_editable()
+    expect(page.locator("#code-dirty")).to_be_hidden()
+    expect(page.locator("#sum-steps")).to_have_text("5")
+    expect(page.locator("#sum-kept")).to_have_text("8")
+    expect(page.locator("#sum-dropped")).to_have_text("6")
+    page.check("#show-dropped")
+    expect(rows).to_have_count(14)
+    first = page.locator('#flow-tbody tr[data-flow-id="f0001"]')
+    expect(first).to_have_class(re.compile(r"\bkept\b"))
+    expect(first.locator("input[type=checkbox]")).to_be_checked()
+    expect(first.locator(".step-no")).to_have_text("1")
+    static = page.locator('#flow-tbody tr[data-flow-id="f0002"]')
+    expect(static).to_have_class(re.compile(r"\bdropped\b"))
+    expect(static.locator("input[type=checkbox]")).not_to_be_checked()
+    expect(static.locator(".col-reason")).to_contain_text("静的ファイル")
+    expect(static.locator(".col-ref")).to_contain_text("shop.example.test/login")
+    # detail drawer
+    first.click()
+    expect(page.locator("#drawer")).to_be_visible()
+    expect(page.locator("#dr-url")).to_contain_text("https://shop.example.test/login")
+    expect(page.locator("#dr-resp-body")).to_contain_text("<")
+    page.click('#drawer .tab[data-tab="req"]')
+    expect(page.locator("#dr-req-headers")).to_contain_text("user-agent")
+    page.click("#drawer-close")
+    expect(page.locator("#drawer")).to_be_hidden()
+    assert page.js_errors == []
+
+
+def test_detail_steps_and_settings_rebuild_the_same_script(page, server):
+    name = _build_from_har(page)
+    _open_detail(page)
+    script = server.workdir / "scripts" / name
+    note = page.locator("#regen-note")
+    expect(note).to_be_hidden()
+    # uncheck a step's flow: the table follows at once, the code only after [設定から作り直す]
+    row = page.locator('#flow-tbody tr[data-flow-id="f0010"]')
+    expect(row).to_have_class(re.compile(r"\bkept\b"))
+    page.check("#show-dropped")
+    row.locator("input[type=checkbox]").uncheck()
+    row = page.locator('#flow-tbody tr[data-flow-id="f0010"]')  # table re-renders
+    expect(row).to_have_class(re.compile(r"\bdropped\b"))
+    expect(row.locator(".col-reason")).to_contain_text("手動で除外")
+    expect(page.locator("#sum-steps")).to_have_text("4")
+    expect(note).to_be_visible()
+    assert script.read_text(encoding="utf-8").count("\ndef step_0") == 5  # not rebuilt yet
+    # a setting of the script itself
+    page.fill("#gopt-delay", "1.5")
+    page.locator("#gopt-delay").dispatch_event("change")
+    page.click("#btn-regenerate")  # nothing was edited by hand: no question
+    expect(page.locator("#status-text")).to_contain_text("作り直して保存しました")
+    expect(note).to_be_hidden()
+    expect(page.locator("#detail-script")).to_have_text(name)  # the same file is replaced
+    code = script.read_text(encoding="utf-8")
+    assert code.count("\ndef step_0") == 4 and "DELAY = 1.5" in code
+    expect(page.locator("#code-editor")).to_have_value(re.compile(r"DELAY = 1\.5"))
+    expect(page.locator("#easy-done-steps")).to_contain_text("4 手順")  # the easy screen follows
+    # a dropped flow can be forced in, and the result step chosen
+    page.locator('#flow-tbody tr[data-flow-id="f0002"] input[type=checkbox]').check()
+    expect(page.locator('#flow-tbody tr[data-flow-id="f0002"]')).to_have_class(re.compile(r"\bkept\b"))
+    expect(page.locator("#sum-steps")).to_have_text("5")
+    page.locator('#flow-tbody tr[data-flow-id="f0009"] input[type=radio]').check()
+    expect(page.locator("#sum-final")).to_contain_text("手順 3")
+    expect(page.locator('#flow-tbody tr[data-flow-id="f0009"]')).to_have_class(re.compile(r"\bfinal\b"))
+    expect(page.locator('#flow-tbody tr[data-flow-id="f0009"] .col-reason')).to_contain_text("結果")
+    page.click("#btn-final-clear")
+    expect(page.locator("#sum-final")).to_contain_text("最後の手順")
+    assert page.js_errors == []
+
+
+def test_detail_opt_in_redaction_asks_for_the_password(page, server):
+    _build_from_har(page)
+    _open_detail(page)
+    page.check('input.opt[data-opt="redact_secrets"]')
+    page.click("#btn-regenerate")
+    expect(page.locator("#status-text")).to_contain_text("作り直して保存しました")
+    expect(page.locator('#detail-env input[data-env="REQREC_PASSWORD"]')).to_have_attribute("type", "password")
+    expect(page.locator("#detail-env")).to_contain_text("REQREC_PASSWORD")  # 詳細設定 names the variable
+    expect(page.locator("#code-editor")).not_to_have_value(re.compile("Secr3t!"))
+    expect(page.locator("#easy-done-secrets")).to_contain_text("パスワード")  # the easy screen: friendly name only
+    expect(page.locator("#easy-done-secrets")).not_to_contain_text("REQREC_")
+    assert page.js_errors == []
+
+
+def test_detail_hand_edits_are_saved_and_run(page, server):
+    name = _build_from_har(page)
+    _open_detail(page)
+    script = server.workdir / "scripts" / name
+    editor = page.locator("#code-editor")
+    expect(page.locator("#btn-save")).to_be_disabled()
+    editor.fill("import os\nprint('HELLO from the editor')\n")
+    expect(page.locator("#code-dirty")).to_be_visible()
+    expect(page.locator("#btn-save")).to_be_enabled()
+    editor.press("Tab")  # Python indentation, not a focus change
+    expect(editor).to_have_value("import os\nprint('HELLO from the editor')\n    ")
+    editor.press("Control+s")
+    expect(page.locator("#save-result")).to_contain_text("保存しました")
+    expect(page.locator("#code-dirty")).to_be_hidden()
+    assert script.read_text(encoding="utf-8") == "import os\nprint('HELLO from the editor')\n    \n"
+    page.click("#detail-run-btn")
+    expect(page.locator("#detail-run-state")).to_contain_text("正常に終わりました")
+    expect(page.locator("#detail-run-out")).to_contain_text("HELLO from the editor")
+    page.click("#detail-save-output")
+    expect(page.locator("#detail-save-output-result")).to_contain_text("保存しました")
+    # an unsaved edit is saved before 試しに実行
+    editor.fill("print('second version')\n")
+    page.click("#detail-run-btn")
+    expect(page.locator("#detail-run-out")).to_contain_text("second version")
+    assert script.read_text(encoding="utf-8") == "print('second version')\n"
+    # [設定から作り直す] after hand edits asks first; declining keeps them
+    page.once("dialog", lambda dialog: dialog.dismiss())
+    page.click("#btn-regenerate")
+    expect(editor).to_have_value("print('second version')\n")
+    page.once("dialog", lambda dialog: dialog.accept())
+    page.click("#btn-regenerate")
+    expect(editor).to_have_value(re.compile(r"def step_01_"))
+    # saved under another name: that file becomes the current script on both screens
+    page.fill("#script-name", "edited_copy")
+    page.click("#btn-save")
+    expect(page.locator("#detail-script")).to_have_text("edited_copy.py")
+    assert (server.workdir / "scripts" / "edited_copy.py").is_file()
+    expect(page.locator("#easy-done-name")).to_have_text("edited_copy.py")
+    # a reload brings the saved script back into the editor
     page.reload(wait_until="networkidle")
-    expect(page.locator("#nav")).to_be_visible()
+    expect(page.locator("#panel-detail")).to_be_visible()  # the screen choice is remembered
+    expect(page.locator("#detail-script")).to_have_text("edited_copy.py")
+    expect(editor).to_have_value(re.compile(r"def step_01_"))
     page.click("#mode-toggle")
     expect(page.locator("#panel-easy")).to_be_visible()
     assert page.js_errors == []
 
 
-# --------------------------------------------------------------------------- review fixes (easy screen)
+# --------------------------------------------------------------------------- かんたん画面 (DESIGN.md §13.11)
 
 def _load_into_server(server, recording):
-    server.app.extensions["reqrec"].set_recording(recording, ["test"], append=False)
+    server.app.extensions["reqrec"].set_recording(recording, ["test"])
 
 
 def _build_from_loaded(page):
@@ -337,22 +339,28 @@ def test_easy_windows_auth_inputs_keep_their_instruction(page, server):
     assert page.js_errors == []
 
 
-def _fail_start(page, kind, message):
-    import json
-
-    page.route("**/api/record/start", lambda route: route.fulfill(
-        status=500, content_type="application/json", body=json.dumps({"error": message, "kind": kind})))
-
-
-def test_easy_start_errors_are_explained_by_kind(page, server, monkeypatch):
-    # [記録をはじめる] is enabled only with mitmproxy and a usable recording browser: pretend both (any OS)
+def _pretend_recording_is_possible(page, monkeypatch, emulation_value=None):
+    """[記録をはじめる] is enabled only with mitmproxy and a usable recording browser: pretend both (any OS)."""
     import reqrec
 
     monkeypatch.setattr(reqrec, "mitmproxy_available", lambda: True)
     monkeypatch.setattr(reqrec.iehost, "availability", lambda workdir, **kw: dict(RECBROWSER_AVAILABLE))
-    monkeypatch.setattr(reqrec.iehost, "get_emulation", lambda *a, **kw: None)  # the registry is never read
+    monkeypatch.setattr(reqrec.iehost, "get_emulation", lambda *a, **kw: emulation_value)  # the registry is never read
     page.reload(wait_until="networkidle")
     expect(page.locator("#easy-start")).to_be_enabled()
+
+
+def _fail_start(page, kind, message, bodies=None):
+    def answer(route):
+        if bodies is not None:
+            bodies.append(json.loads(route.request.post_data))
+        route.fulfill(status=500, content_type="application/json", body=json.dumps({"error": message, "kind": kind}))
+
+    page.route("**/api/record/start", answer)
+
+
+def test_easy_start_errors_are_explained_by_kind(page, server, monkeypatch):
+    _pretend_recording_is_possible(page, monkeypatch)
     _fail_start(page, "proxy", "記録用プロキシを起動できませんでした: port busy")
     page.click("#easy-start")
     err = page.locator("#easy-error")
@@ -364,7 +372,31 @@ def test_easy_start_errors_are_explained_by_kind(page, server, monkeypatch):
     page.click("#easy-start")
     expect(err).to_contain_text("RecBrowser.exe")
     expect(page.locator("#easy-ready")).to_contain_text("前回、起動できませんでした")
-    # the browser logs the two (intended) 500 responses; nothing else may fail
+    page.unroute("**/api/record/start")
+    _fail_start(page, "emulation", "記録用ブラウザの表示モードを設定できませんでした: locked")
+    page.click("#easy-start")
+    expect(err).to_contain_text("「表示モード」を「既定」にして")
+    # the browser logs the (intended) 500 responses; nothing else may fail
+    assert [e for e in page.js_errors if "status of 500" not in e] == []
+
+
+def test_easy_display_mode_is_sent_only_when_changed(page, server, monkeypatch):
+    _pretend_recording_is_possible(page, monkeypatch, emulation_value=11000)  # IE11 相当, chosen earlier
+    select = page.locator("#easy-emulation")
+    expect(select).to_have_value("ie11")
+    bodies: list[dict] = []
+    _fail_start(page, "proxy", "記録用プロキシを起動できませんでした: test", bodies)
+    page.click("#easy-start")
+    expect(page.locator("#easy-error")).to_be_visible()
+    select.select_option("default")
+    page.click("#easy-start")
+    page.wait_for_function("() => !document.querySelector('#easy-start').disabled")
+    for _ in range(50):
+        if len(bodies) == 2:
+            break
+        page.wait_for_timeout(100)
+    assert [b["emulation"] for b in bodies] == ["keep", "default"]  # unchanged: the registry is not touched
+    assert all(set(b) == {"start_url", "emulation"} for b in bodies)  # no host filter, no 追加モード
     assert [e for e in page.js_errors if "status of 500" not in e] == []
 
 
@@ -381,7 +413,7 @@ class _FakeRecorder:
     def status(self):
         return {"running": self.running, "flows": 3, "out": self.out, "out_name": os.path.basename(self.out),
                 "pid": 1, "exit_code": None if self.running else 0, "started_at": 1.0, "stopped_at": None,
-                "port": self.port, "hosts": [], "stdout_tail": "",
+                "port": self.port, "stdout_tail": "",
                 "stderr_tail": "", "error": None, "command": []}
 
     def stop(self, timeout=None):
@@ -418,8 +450,7 @@ class _FakeBrowser:
         return self.code
 
 
-@pytest.mark.parametrize("origin, auto_stops", [("advanced", False), ("easy", True)])
-def test_auto_stop_only_for_easy_started_recordings(page, server, origin, auto_stops):
+def test_closing_the_recording_browser_stops_and_builds(page, server):
     state = server.app.extensions["reqrec"]
     real_recorder = state.recorder
     fake, browser = _FakeRecorder(str(server.workdir / "recordings" / "rec_fake.json")), _FakeBrowser()
@@ -429,23 +460,16 @@ def test_auto_stop_only_for_easy_started_recordings(page, server, origin, auto_s
         with state.lock:
             state.recorder = fake
             state.browser = browser
-            state.record_origin = origin
-            state.record_append = False
         page.reload(wait_until="networkidle")  # the page picks the recording up after a reload
         expect(page.locator("#easy-recording")).to_be_visible()
+        expect(page.locator("#mode-toggle")).to_be_disabled()  # 詳細設定 waits for the script
         page.wait_for_timeout(1500)  # the poller sees the recording browser running
         browser.code = 0  # the user closes the recording browser
-        if auto_stops:
-            expect(page.locator("#easy-done")).to_be_visible()
-            assert stops and all("append" not in (s or "") for s in stops), stops
-        else:
-            expect(page.locator("#status-text")).to_contain_text("記録用ブラウザが閉じられました")
-            page.wait_for_timeout(2500)
-            expect(page.locator("#easy-recording")).to_be_visible()  # still recording: only pointed out
-            assert stops == []
+        expect(page.locator("#easy-done")).to_be_visible()
+        assert stops and all("append" not in (s or "") for s in stops), stops
+        expect(page.locator("#mode-toggle")).to_be_enabled()
     finally:
         with state.lock:
             state.recorder = real_recorder
             state.browser = None
-            state.record_origin = None
     assert page.js_errors == []

@@ -2,7 +2,9 @@
 
 * ``testsite``: tiny intranet-like site for ``RecBrowser.exe --selftest``,
 * ``factory_site``: mock legacy factory intranet (ASP.NET WebForms, Shift_JIS, one-time __VIEWSTATE),
-* ``factory_scenario``: records the factory site through the real recording browser,
+* ``order_site``: mock 受注管理システム (session id in the URL, tokens, another tab, child windows),
+* ``factory_scenario``: records the factory site through the real recording browser (and
+  :func:`operate_order_site` operates the order site),
 * ``iedriver``: Python wrapper for the test driver ``IEDriver.exe`` (source: ``IEDriver.cs`` next to
   this file).
 
@@ -12,6 +14,7 @@ effects.  Command line (see :func:`main`)::
 
     python -I tests/ie_support.py testsite LOGFILE PORT
     python -I tests/ie_support.py factory-site LOGFILE PORT [HOST]
+    python -I tests/ie_support.py order-site LOGFILE PORT [HOST]
     python -I tests/ie_support.py iedriver OUT_DIR
 """
 
@@ -53,8 +56,12 @@ __all__ = [
     "EXPORT_DATE", "EXPORT_HEADER", "EXPORT_ID_LABEL", "XLSX_CONTENT_TYPE", "VIEWSTATE_GENERATORS", "FactoryServer",
     "make_server", "serve_in_thread", "factory_site_main", "dataset", "expected_rows", "export_filename",
     "build_xlsx", "read_xlsx_rows", "read_log", "hidden_fields", "parse_form",
+    # order_site (mock 受注管理システム)
+    "ORDER_CREDENTIALS", "ORDER_SCENARIO", "ORDER_CUSTOMERS", "ORDER_ITEMS", "OrderServer", "order_serve_in_thread",
+    "order_site_main", "order_customers", "order_dataset", "order_rows", "order_expected_csv", "order_export_filename",
     # factory_scenario
     "SCENARIO_FILTER", "STEPS", "ScenarioError", "run_factory_recording", "site_host", "free_port",
+    "ORDER_STEPS", "operate_order_site",
     # iedriver (IEDriver.exe wrapper)
     "DRIVER_SOURCE", "CSC", "IEDriverError", "build_command", "build_driver", "IEDriver",
     # command line
@@ -1565,6 +1572,547 @@ def factory_site_main(argv: Optional[Sequence[str]] = None) -> None:
         server.server_close()
 
 
+# ===== order site: mock 受注管理システム (session id in the URL, tokens, another tab, child windows) =====
+# A second mock intranet that puts the patterns a recorded script must reproduce into ONE flow:
+#
+# * **session id in the URL** - ``POST /oms/login`` creates the session and answers
+#   ``302 /oms/s/<SID>/menu``; every page after the login lives under ``/oms/s/<SID>/`` and there is no
+#   cookie at all (URL rewriting, as in cookieless ASP.NET / Java ``;jsessionid`` sites).  An unknown SID
+#   gets 「セッションの有効期限が切れました」 (403).
+# * **tokens that must be passed back** (all random, one-time unless noted, bound to the session):
+#   ``loginToken`` (hidden field of the login form); ``tk`` in the menu link to the search page;
+#   ``CUST_TK`` in the search page's script, appended by ``window.open`` to the customer picker URL;
+#   ``tk`` in the item picker URL inside an ``onclick``; ``token`` (hidden field of the search form);
+#   one ``tk`` per order link (reusable for that order); ``API_TOKEN`` in the detail page's script, sent
+#   by its XMLHttpRequest as the ``X-Api-Token`` header; ``tk`` of the CSV link, which also needs a
+#   ``Referer`` of the same session's result page.
+# * **another tab** - the order number opens 受注詳細 with ``target="_blank"``.
+# * **child windows** - 取引先検索 is a ``window.open`` popup that writes the chosen code into the
+#   opener's form and closes itself; 品目選択 is a ``showModalDialog`` returning the item code.
+# * **a date picker** - clicking 受注日 shows a small calendar above the field (a ``<div>`` drawn by the
+#   page's script, with 前月 / 次月); clicking a day writes ``yyyy/mm/dd`` into the field.  No request at
+#   all: only the posted ``dateFrom`` / ``dateTo`` filter the orders.
+# * **download** - CSV (Shift_JIS, ``Content-Disposition: attachment`` with a UTF-8 ``filename*``).
+# * **data that changed since the recording** (``drift=True``) - a new customer C-0001 is listed first in
+#   the picker, order 10009 (the first row of the scenario's search) was cancelled and a new order
+#   10049 was taken: a script must still choose C-0042, open order 10026 and export the current rows.
+#
+# Pages are UTF-8 and IE7-document-mode safe (no JSON object, no addEventListener).  Every request is
+# appended to the log file as one JSON line ``{"t", "method", "path", "query", "session", "event",
+# "status", "details"}``; ``event`` is ``login_page``, ``login_ok``, ``login_fail``, ``menu``,
+# ``search_page``, ``custpicker``, ``itempicker``, ``result``, ``order``, ``shipment``, ``export`` or a
+# rejection (``bad_session``, ``token_reject``, ``referer_reject``, ``input_error``, ``not_found``).
+#
+#     python -I tests/ie_support.py order-site LOGFILE PORT [HOST]
+#
+# From a test: ``server = order_serve_in_thread(log_path, port)`` ... ``server.stop()``; the expected
+# CSV of the scenario is :func:`order_expected_csv`.
+
+ORDER_CREDENTIALS = ("suzuki", "Juchu-2026!")
+ORDER_USER_NAME = "鈴木 一郎"
+ORDER_BASE = "/oms"
+ORDER_CODEC = "cp932"  # of the CSV only; the pages are UTF-8
+ORDER_CUSTOMERS: Tuple[Tuple[str, str], ...] = (("C-0042", "東和精機"), ("C-0107", "丸山商事"), ("C-0211", "北陸産業"))
+ORDER_ITEMS: Tuple[Tuple[str, str], ...] = (("P-100", "ギアボックス"), ("P-200", "シャフト"), ("P-300", "ベアリング"))
+ORDER_STATUSES: Tuple[Tuple[str, str], ...] = (("ALL", "全て"), ("OPEN", "未出荷"), ("SHIPPED", "出荷済"))
+ORDER_CSV_HEADER = ("受注番号", "受注日", "取引先", "品目", "数量", "状態")
+#: What the recording scenario chooses: customer, item, status, the period (``date_from`` picked in the
+#: calendar, ``date_to`` the field's default) and the order it opens in a tab.
+ORDER_SCENARIO = {"customer": "C-0042", "item": "P-200", "status": "ALL", "date_from": "2026/10/10",
+                  "date_to": "2026/10/31", "order": "10026"}
+#: The site's "today" (the calendar opens on its month) and the default end of the period.
+ORDER_TODAY = "2026/10/25"
+ORDER_DEFAULT_TO = "2026/10/31"
+#: ``drift=True``: what changed after the recording (see the section comment).
+_ORDER_NEW_CUSTOMER = ("C-0001", "朝日工業")
+_ORDER_CANCELLED = "10009"
+_ORDER_NEW_ROWS = (("10049", "2026/10/28", "C-0042", "P-200", 60, "OPEN"),
+                   ("10050", "2026/10/28", "C-0001", "P-200", 25, "OPEN"))
+
+_ORDER_SID_RE = re.compile(r"^/oms/s/([A-Za-z0-9]{24})(/[A-Za-z]+)$")
+
+
+def order_customers(drift: bool = False) -> Tuple[Tuple[str, str], ...]:
+    """The picker's customers, in their order on the page."""
+    return ((_ORDER_NEW_CUSTOMER,) if drift else ()) + ORDER_CUSTOMERS
+
+
+def order_dataset(drift: bool = False) -> Tuple[Tuple[str, str, str, str, int, str], ...]:
+    """Every order: ``(no, date, customer, item, quantity, status)`` (deterministic)."""
+    if drift:
+        return tuple(r for r in order_dataset() if r[0] != _ORDER_CANCELLED) + _ORDER_NEW_ROWS
+    rows = []
+    rng = random.Random(20261025)
+    no = 10001
+    for day in range(1, 29):
+        for cust, _name in ORDER_CUSTOMERS:
+            for item, _iname in ORDER_ITEMS:
+                if rng.random() < 0.18:
+                    status = "SHIPPED" if day < 20 or rng.random() < 0.3 else "OPEN"
+                    rows.append((str(no), f"2026/10/{day:02d}", cust, item, rng.randrange(5, 200, 5), status))
+                    no += 1
+    return tuple(rows)
+
+
+def order_rows(customer: str, item: str, status: str = "ALL", drift: bool = False, date_from: str = "",
+               date_to: str = "") -> List[Tuple[str, str, str, str, int, str]]:
+    return [r for r in order_dataset(drift) if r[2] == customer and r[3] == item and status in ("ALL", r[5])
+            and (not date_from or r[1] >= date_from) and (not date_to or r[1] <= date_to)]
+
+
+def order_expected_csv(customer: str = ORDER_SCENARIO["customer"], item: str = ORDER_SCENARIO["item"],
+                       status: str = ORDER_SCENARIO["status"], drift: bool = False,
+                       date_from: str = ORDER_SCENARIO["date_from"],
+                       date_to: str = ORDER_SCENARIO["date_to"]) -> List[List[str]]:
+    """The CSV the export returns for these filters, as rows of strings (header first)."""
+    names = dict(order_customers(drift))
+    inames = dict(ORDER_ITEMS)
+    labels = dict(ORDER_STATUSES)
+    return [list(ORDER_CSV_HEADER)] + [
+        [no, date, f"{cust} {names[cust]}", f"{item} {inames[item]}", str(qty), labels[st]]
+        for no, date, cust, item, qty, st in order_rows(customer, item, status, drift, date_from, date_to)
+    ]
+
+
+def order_export_filename(customer: str) -> str:
+    return f"受注一覧_{customer}.csv"
+
+
+class _OrderSession:
+    def __init__(self, sid: str, user: str) -> None:
+        self.sid = sid
+        self.user = user
+        self.tokens: Dict[str, Dict[str, Any]] = {}  # token -> {"purpose", "used", "once", "data"}
+
+
+class OrderState:
+    """Sessions (looked up by the SID in the URL) and their tokens."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.sessions: Dict[str, _OrderSession] = {}
+        self.login_tokens: Dict[str, bool] = {}
+
+    def new_login_token(self) -> str:
+        tok = _rand(_ALNUM, 20)
+        with self.lock:
+            self.login_tokens[tok] = False
+        return tok
+
+    def use_login_token(self, tok: str) -> bool:
+        with self.lock:
+            if self.login_tokens.get(tok) is False:
+                self.login_tokens[tok] = True
+                return True
+            return False
+
+    def login(self, user: str) -> _OrderSession:
+        sess = _OrderSession(_rand(_ALNUM, 24), user)
+        with self.lock:
+            self.sessions[sess.sid] = sess
+        return sess
+
+    def issue(self, sess: _OrderSession, purpose: str, once: bool = True, **data: Any) -> str:
+        tok = _rand(_ALNUM, 16)
+        with self.lock:
+            sess.tokens[tok] = {"purpose": purpose, "used": False, "once": once, "data": data}
+        return tok
+
+    def take(self, sess: _OrderSession, tok: Optional[str], purpose: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """The token's record when ``tok`` is a live token of this session for ``purpose`` (one-time
+        tokens are used up); otherwise ``(None, reason)``."""
+        with self.lock:
+            rec = sess.tokens.get(tok or "")
+            if rec is None:
+                return None, "missing" if not tok else "unknown"
+            if rec["purpose"] != purpose:
+                return None, "wrong_purpose"
+            if rec["once"] and rec["used"]:
+                return None, "used"
+            rec["used"] = True
+            return rec, ""
+
+
+_ORDER_CSS = """body{margin:0;font-family:"MS PGothic",sans-serif;font-size:13px;background:#f6f7fb}
+#hd{background:#24527a;color:#fff;padding:6px 10px}#hd .u{float:right}#ct{padding:10px 14px}
+h2{font-size:15px;border-left:6px solid #24527a;padding-left:6px}table.g{border-collapse:collapse;background:#fff}
+table.g th{background:#24527a;color:#fff;padding:2px 8px}table.g td{padding:2px 8px;border-bottom:1px solid #ccd}
+.msg{color:#c00;font-weight:bold}.calbox{position:absolute;background:#fff;border:1px solid #888;padding:2px}
+table.cal th,table.cal td{padding:1px 4px;text-align:center}"""
+
+#: The date picker of the search page (ES3: a ``<div>`` filled through innerHTML, shown above the field).
+_ORDER_CALENDAR_JS = """
+var calField = null, calYear = 0, calMonth = 0;
+function pad2(n){ return (n < 10 ? '0' : '') + n; }
+function showCal(field){
+  calField = field;
+  var p = (field.value || CAL_TODAY).split('/');
+  calYear = parseInt(p[0], 10); calMonth = parseInt(p[1], 10);
+  drawCal();
+  var cal = document.getElementById('calendar');
+  cal.style.display = 'block';
+  cal.style.left = field.offsetLeft + 'px';
+  cal.style.top = (field.offsetTop - cal.offsetHeight - 4) + 'px';
+}
+function moveCal(step){
+  calMonth += step;
+  if (calMonth < 1) { calMonth = 12; calYear--; }
+  if (calMonth > 12) { calMonth = 1; calYear++; }
+  drawCal(); return false;
+}
+function drawCal(){
+  var first = new Date(calYear, calMonth - 1, 1).getDay(), days = new Date(calYear, calMonth, 0).getDate();
+  var h = '<table class="cal"><tr><th><a id="calPrev" href="#" onclick="return moveCal(-1);">&lt;</a></th>'
+        + '<th colspan="5" id="calTitle">' + calYear + '年' + calMonth + '月</th>'
+        + '<th><a id="calNext" href="#" onclick="return moveCal(1);">&gt;</a></th></tr><tr>';
+  var names = ['日', '月', '火', '水', '木', '金', '土'], i, d;
+  for (i = 0; i < 7; i++) { h += '<th>' + names[i] + '</th>'; }
+  h += '</tr><tr>';
+  for (i = 0; i < first; i++) { h += '<td></td>'; }
+  for (d = 1; d <= days; d++) {
+    h += '<td><a id="cal_' + d + '" href="#" onclick="return pickDay(' + d + ');">' + d + '</a></td>';
+    if ((first + d) % 7 == 0) { h += '</tr><tr>'; }
+  }
+  document.getElementById('calendar').innerHTML = h + '</tr></table>';
+}
+function pickDay(d){
+  calField.value = calYear + '/' + pad2(calMonth) + '/' + pad2(d);
+  document.getElementById('calendar').style.display = 'none';
+  return false;
+}
+"""
+
+
+def _order_page(title: str, body: str, user: Optional[str] = None, script: str = "") -> str:
+    who = f'<span class="u">{_esc(user)} さん</span>' if user else ""
+    tag = f'<script type="text/javascript">{script}</script>' if script else ""
+    return ('<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">\n'
+            '<html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8">'
+            f"<title>{_esc(title)} - 受注管理システム</title><style>{_ORDER_CSS}</style>{tag}</head>"
+            f'<body><div id="hd">受注管理システム{who}</div><div id="ct"><h2>{_esc(title)}</h2>{body}</div></body></html>')
+
+
+class _OrderHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "Apache-Coyote/1.1"
+    sys_version = ""
+    server: "OrderServer"
+
+    def version_string(self) -> str:
+        return self.server_version
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - silence stderr access log
+        pass
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._dispatch("GET")
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._dispatch("POST")
+
+    def _dispatch(self, method: str) -> None:
+        self._method = method
+        parts = urlsplit(self.path)
+        self._path = parts.path or "/"
+        self._qs = dict(parse_qsl(parts.query, keep_blank_values=True))
+        self._entry: Dict[str, Any] = {"t": None, "method": method, "path": self._path, "query": parts.query,
+                                       "session": None, "event": None, "status": None, "details": {}}
+        try:
+            self._form: Dict[str, str] = {}
+            if method == "POST":
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length > 0 else b""
+                self._form = dict(parse_qsl(body.decode("ascii", "replace"), keep_blank_values=True))
+            self._route()
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            self._entry["event"] = "server_error"
+            self._entry["details"]["error"] = repr(exc)
+            try:
+                self._html(500, _order_page("システムエラー", "<p>システムエラーが発生しました。</p>"))
+            except OSError:
+                pass
+        finally:
+            self._entry["t"] = round(time.time(), 3)
+            self.server.write_log(self._entry)
+
+    # ---- responses ---------------------------------------------------------------------------
+
+    def _event(self, name: str, **details: Any) -> None:
+        self._entry["event"] = name
+        self._entry["details"].update(details)
+
+    def _send(self, status: int, body: bytes, ctype: str, headers: Sequence[Tuple[str, str]] = ()) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in headers:
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+        self._entry["status"] = status
+
+    def _html(self, status: int, text: str, headers: Sequence[Tuple[str, str]] = ()) -> None:
+        self._send(status, text.encode("utf-8"), "text/html; charset=utf-8",
+                   [("Cache-Control", "no-cache, no-store"), ("Pragma", "no-cache")] + list(headers))
+
+    def _reject(self, event: str, status: int, message: str, **details: Any) -> None:
+        self._event(event, **details)
+        self._html(status, _order_page("エラー", f'<p class="msg">{_esc(message)}</p>'
+                                                   f'<p><a href="{ORDER_BASE}/login">ログイン画面へ</a></p>'))
+
+    # ---- routing -----------------------------------------------------------------------------
+
+    def _route(self) -> None:
+        p = self._path
+        if p in ("/", ORDER_BASE, ORDER_BASE + "/"):
+            self._event("redirect")
+            return self._send(302, b"", "text/html", [("Location", ORDER_BASE + "/login")])
+        if p == ORDER_BASE + "/login":
+            return self._login_post() if self._method == "POST" else self._login_get()
+        m = _ORDER_SID_RE.match(p)
+        if not m:
+            self._event("not_found")
+            return self._html(404, _order_page("ページが見つかりません", "<p>404 Not Found</p>"))
+        sid, page = m.group(1), m.group(2)
+        sess = self.server.state.sessions.get(sid)
+        if sess is None:
+            return self._reject("bad_session", 403, "セッションの有効期限が切れました。もう一度ログインしてください。",
+                                sid=sid[:6])
+        self._entry["session"] = sid
+        self._sess = sess
+        self._root = f"{ORDER_BASE}/s/{sid}"
+        handler = {
+            ("GET", "/menu"): self._menu, ("GET", "/search"): self._search, ("GET", "/custpicker"): self._custpicker,
+            ("GET", "/itempicker"): self._itempicker, ("POST", "/result"): self._result,
+            ("GET", "/order"): self._order, ("GET", "/shipment"): self._shipment, ("GET", "/export"): self._export,
+        }.get((self._method, page))
+        if handler is None:
+            self._event("not_found")
+            return self._html(404, _order_page("ページが見つかりません", "<p>404 Not Found</p>"))
+        return handler()
+
+    def _token(self, value: Optional[str], purpose: str) -> Optional[Dict[str, Any]]:
+        rec, reason = self.server.state.take(self._sess, value, purpose)
+        if rec is None:
+            self._reject("token_reject", 403, "不正な画面遷移です。最初からやり直してください。",
+                         purpose=purpose, reason=reason, token=_prefix(value, 6))
+        return rec
+
+    # ---- pages -------------------------------------------------------------------------------
+
+    def _login_get(self, message: str = "", user: str = "") -> None:
+        tok = self.server.state.new_login_token()
+        msg = f'<p class="msg">{_esc(message)}</p>' if message else ""
+        body = (f'{msg}<form id="frmLogin" method="post" action="{ORDER_BASE}/login">'
+                f'<input type="hidden" name="loginToken" value="{tok}">'
+                f'<table><tr><th>ユーザー ID</th><td><input id="userId" name="userId" value="{_esc(user)}"></td></tr>'
+                f'<tr><th>パスワード</th><td><input id="password" name="password" type="password"></td></tr></table>'
+                f'<input id="btnLogin" type="submit" value="ログイン"></form>')
+        if self._method == "GET":
+            self._event("login_page")
+        self._html(200, _order_page("ログイン", body))
+
+    def _login_post(self) -> None:
+        f = self._form
+        if not self.server.state.use_login_token(f.get("loginToken", "")):
+            self._event("token_reject", purpose="login", token=_prefix(f.get("loginToken"), 6))
+            return self._login_get("画面の有効期限が切れました。もう一度ログインしてください。")
+        if (f.get("userId"), f.get("password")) != ORDER_CREDENTIALS:
+            self._event("login_fail", user=f.get("userId"))
+            return self._login_get("ユーザー ID またはパスワードが違います。", f.get("userId", ""))
+        sess = self.server.state.login(ORDER_USER_NAME)
+        self._entry["session"] = sess.sid
+        self._event("login_ok")
+        self._send(302, b"", "text/html", [("Location", f"{ORDER_BASE}/s/{sess.sid}/menu")])
+
+    def _menu(self) -> None:
+        tk = self.server.state.issue(self._sess, "search")
+        self._event("menu")
+        body = (f'<p>{_esc(self._sess.user)} さん、こんにちは。</p><ul>'
+                f'<li><a id="lnkSearch" href="{self._root}/search?tk={tk}">受注照会</a></li>'
+                f'<li><a id="lnkLogout" href="{ORDER_BASE}/login">ログアウト</a></li></ul>')
+        self._html(200, _order_page("メニュー", body, self._sess.user))
+
+    def _search(self) -> None:
+        if self._token(self._qs.get("tk"), "search") is None:
+            return
+        st = self.server.state
+        form_tk = st.issue(self._sess, "result")
+        cust_tk = st.issue(self._sess, "custpicker")
+        item_tk = st.issue(self._sess, "itempicker")
+        self._event("search_page")
+        script = (f"var CUST_TK = '{cust_tk}';\n"
+                  "function openCust(){ window.open('" + self._root + "/custpicker?tk=' + CUST_TK, 'cust',"
+                  " 'width=460,height=360,resizable=yes'); }\n"
+                  "function pickItem(url){ var r = window.showModalDialog(url, null, 'dialogWidth:380px;dialogHeight:320px');"
+                  " if (r) { document.getElementById('itemCode').value = r; } }\n"
+                  "function check(){ if (!document.getElementById('custCode').value) {"
+                  " alert('取引先を選択してください。'); return false; } return true; }\n"
+                  f"var CAL_TODAY = '{ORDER_TODAY}';\n" + _ORDER_CALENDAR_JS)
+        status_opts = "".join(f'<option value="{v}">{_esc(t)}</option>' for v, t in ORDER_STATUSES)
+        body = (f'<form id="frmSearch" method="post" action="{self._root}/result" onsubmit="return check();">'
+                f'<input type="hidden" name="token" value="{form_tk}"><table>'
+                f'<tr><th>取引先</th><td><input id="custCode" name="custCode" readonly size="8"> '
+                f'<span id="custName"></span> <input id="btnCust" type="button" value="取引先検索" onclick="openCust();"></td></tr>'
+                f'<tr><th>品目</th><td><input id="itemCode" name="itemCode" readonly size="8"> '
+                f'<input id="btnItem" type="button" value="品目選択" '
+                f'onclick="pickItem(\'{self._root}/itempicker?tk={item_tk}\');"></td></tr>'
+                f'<tr><th>状態</th><td><select id="status" name="status">{status_opts}</select></td></tr>'
+                f'<tr><th>受注日</th><td><input id="dateFrom" name="dateFrom" size="10" onclick="showCal(this);"> ～ '
+                f'<input id="dateTo" name="dateTo" size="10" value="{ORDER_DEFAULT_TO}" onclick="showCal(this);">'
+                f' <span class="hint">(クリックするとカレンダーが出ます)</span></td></tr></table>'
+                f'<input id="btnSearch" type="submit" value="検索"></form><div id="calendar" class="calbox" style="display:none"></div>')
+        self._html(200, _order_page("受注照会", body, self._sess.user, script))
+
+    def _custpicker(self) -> None:
+        if self._token(self._qs.get("tk"), "custpicker") is None:
+            return
+        self._event("custpicker")
+        script = ("function pick(code, name){ var d = window.opener.document;"
+                  " d.getElementById('custCode').value = code; d.getElementById('custName').innerText = name;"
+                  " window.close(); return false; }")
+        rows = "".join(f'<tr><td><a id="c_{c}" href="#" onclick="return pick(\'{c}\', \'{_esc(n)}\');">{c}</a></td>'
+                       f'<td>{_esc(n)}</td></tr>' for c, n in order_customers(self.server.drift))
+        self._html(200, _order_page("取引先検索", f'<table class="g"><tr><th>コード</th><th>取引先名</th></tr>{rows}</table>',
+                                    self._sess.user, script))
+
+    def _itempicker(self) -> None:
+        if self._token(self._qs.get("tk"), "itempicker") is None:
+            return
+        self._event("itempicker")
+        script = "function pick(code){ window.returnValue = code; window.close(); return false; }"
+        rows = "".join(f'<tr><td><a id="i_{c}" href="#" onclick="return pick(\'{c}\');">{c}</a></td>'
+                       f'<td>{_esc(n)}</td></tr>' for c, n in ORDER_ITEMS)
+        self._html(200, _order_page("品目選択", f'<table class="g"><tr><th>品目</th><th>品名</th></tr>{rows}</table>',
+                                    self._sess.user, script))
+
+    def _result(self) -> None:
+        f = self._form
+        if self._token(f.get("token"), "result") is None:
+            return
+        cust, item, status = f.get("custCode", ""), f.get("itemCode", ""), f.get("status", "ALL")
+        date_from, date_to = f.get("dateFrom", "").strip(), f.get("dateTo", "").strip()
+        dates_ok = all(not v or re.match(r"^\d{4}/\d{2}/\d{2}$", v) for v in (date_from, date_to))
+        if (cust not in dict(order_customers(self.server.drift)) or item not in dict(ORDER_ITEMS)
+                or status not in dict(ORDER_STATUSES) or not dates_ok):
+            return self._reject("input_error", 400, "検索条件が正しくありません。", customer=cust, item=item,
+                                status=status, date_from=date_from, date_to=date_to)
+        st = self.server.state
+        rows = order_rows(cust, item, status, self.server.drift, date_from, date_to)
+        export_tk = st.issue(self._sess, "export", customer=cust, item=item, status=status, date_from=date_from,
+                             date_to=date_to)
+        labels = dict(ORDER_STATUSES)
+        lines = []
+        for no, date, _c, _i, qty, stt in rows:
+            row_tk = st.issue(self._sess, "order", once=False, no=no)
+            lines.append(f'<tr><td><a id="o_{no}" href="{self._root}/order?no={no}&amp;tk={row_tk}" target="_blank">{no}</a></td>'
+                         f'<td>{date}</td><td>{qty}</td><td>{labels[stt]}</td></tr>')
+        self._event("result", customer=cust, item=item, status=status, date_from=date_from, date_to=date_to,
+                    rows=len(rows))
+        body = (f'<p id="count">{len(rows)} 件</p><table class="g"><tr><th>受注番号</th><th>受注日</th><th>数量</th><th>状態</th></tr>'
+                f'{"".join(lines)}</table><p><a id="lnkCsv" href="{self._root}/export?tk={export_tk}">CSV 出力</a></p>')
+        self._html(200, _order_page("受注一覧", body, self._sess.user))
+
+    def _order(self) -> None:
+        rec = self._token(self._qs.get("tk"), "order")
+        if rec is None:
+            return
+        no = self._qs.get("no", "")
+        if rec["data"].get("no") != no:
+            return self._reject("token_reject", 403, "不正な画面遷移です。", purpose="order", reason="other_order", no=no)
+        row = next((r for r in order_dataset(self.server.drift) if r[0] == no), None)
+        if row is None:
+            return self._reject("input_error", 404, "受注が見つかりません。", no=no)
+        api_tk = self.server.state.issue(self._sess, "shipment", once=False, no=no)
+        self._event("order", no=no)
+        names, inames = dict(order_customers(self.server.drift)), dict(ORDER_ITEMS)
+        script = (f"var API_TOKEN = '{api_tk}';\n"
+                  "function loadShipment(){ var x = new XMLHttpRequest();"
+                  f" x.open('GET', '{self._root}/shipment?no={no}', true);"
+                  " x.setRequestHeader('X-Api-Token', API_TOKEN);"
+                  " x.onreadystatechange = function(){ if (x.readyState == 4) {"
+                  " var el = document.getElementById('ship');"
+                  " if (x.status == 200) { var d = eval('(' + x.responseText + ')'); el.innerText = d.status + ' ' + d.carrier; }"
+                  " else { el.innerText = 'error ' + x.status; } } };"
+                  " x.send(null); }\n"
+                  "window.onload = loadShipment;")
+        body = (f'<table class="g"><tr><th>受注番号</th><td id="no">{no}</td></tr>'
+                f'<tr><th>取引先</th><td>{row[2]} {_esc(names[row[2]])}</td></tr>'
+                f'<tr><th>品目</th><td>{row[3]} {_esc(inames[row[3]])}</td></tr>'
+                f'<tr><th>数量</th><td>{row[4]}</td></tr>'
+                f'<tr><th>出荷状況</th><td id="ship">読み込み中...</td></tr></table>')
+        self._html(200, _order_page("受注詳細", body, self._sess.user, script))
+
+    def _shipment(self) -> None:
+        no = self._qs.get("no", "")
+        tok = self.headers.get("X-Api-Token")
+        rec, reason = self.server.state.take(self._sess, tok, "shipment")
+        if rec is None or rec["data"].get("no") != no:
+            self._event("token_reject", purpose="shipment", reason=reason or "other_order", token=_prefix(tok, 6))
+            return self._send(403, b'{"error":"invalid token"}', "application/json; charset=utf-8")
+        row = next(r for r in order_dataset(self.server.drift) if r[0] == no)
+        shipped = row[5] == "SHIPPED"
+        data = {"no": no, "status": "出荷済" if shipped else "未出荷", "carrier": "西濃運輸" if shipped else "-"}
+        self._event("shipment", no=no)
+        self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8",
+                   [("Cache-Control", "no-cache")])
+
+    def _export(self) -> None:
+        referer = urlsplit(self.headers.get("Referer") or "").path
+        if referer != self._root + "/result":
+            return self._reject("referer_reject", 403, "不正な画面遷移です。", referer=referer[:40])
+        rec = self._token(self._qs.get("tk"), "export")
+        if rec is None:
+            return
+        d = rec["data"]
+        rows = order_expected_csv(d["customer"], d["item"], d["status"], self.server.drift, d["date_from"], d["date_to"])
+        text = "".join(",".join(r) + "\r\n" for r in rows)
+        name = order_export_filename(d["customer"])
+        self._event("export", rows=len(rows) - 1, filename=name, **d)
+        self._send(200, text.encode(ORDER_CODEC), "text/csv; charset=Shift_JIS", [
+            ("Content-Disposition", "attachment; filename=\"juchu.csv\"; filename*=UTF-8''" + quote(name, safe="")),
+            ("Cache-Control", "private")])
+
+
+class OrderServer(FactoryServer):
+    """The 受注管理システム.  Same plumbing as :class:`FactoryServer` (log, start / stop);
+    ``drift=True`` serves the data that changed after the recording."""
+
+    def __init__(self, address: Tuple[str, int], log_path: str, drift: bool = False) -> None:
+        self.drift = bool(drift)
+        self.log_path = log_path
+        self.state = OrderState()  # type: ignore[assignment]
+        self._log_lock = threading.Lock()
+        self._thread = None
+        ThreadingHTTPServer.__init__(self, address, _OrderHandler)
+
+
+def order_serve_in_thread(log_path: str, port: int = 0, host: str = HOST, truncate_log: bool = True,
+                          drift: bool = False) -> OrderServer:
+    """Bind the order site (``port=0`` = a free port) and serve it from a daemon thread; ``.stop()`` ends it."""
+    server = OrderServer((host, int(port)), log_path, drift)
+    if truncate_log:
+        open(log_path, "w", encoding="utf-8").close()
+    return server.start()
+
+
+def order_site_main(argv: Optional[Sequence[str]] = None) -> None:
+    """Command line: ``ie_support.py order-site [LOGFILE [PORT [HOST]]]``."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    log_path = args[0] if args else "order_site.log"
+    port = int(args[1]) if len(args) > 1 else 8097
+    host = args[2] if len(args) > 2 else HOST
+    server = OrderServer((host, port), log_path)
+    open(log_path, "w", encoding="utf-8").close()
+    print(f"order_site listening on {server.base_url} (log: {log_path})", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
 # ===== former tests/iehost_fixtures/factory_scenario.py: records the factory site in the real recording browser =====
 # Records the factory mock site (the ``factory_site`` section above) through the real recording browser - TEST ONLY.
 #
@@ -1908,6 +2456,95 @@ def run_factory_recording(
     return info
 
 
+#: Step names of :func:`operate_order_site`, in order.
+ORDER_STEPS = ("start", "login", "search_page", "customer", "item", "date", "search", "order_tab", "csv", "close")
+
+
+def operate_order_site(drv: Any, timeout: float = 30.0) -> Dict[str, Any]:
+    """Operate the 受注管理 mock (``order_site`` section) in a running recording browser like a user:
+    log in, open 受注照会, choose the customer in the ``window.open`` child window (it writes the code
+    into the search form and closes itself) and the item in the ``showModalDialog`` child window,
+    pick the start date in the calendar that pops up over 受注日 (前月, 次月, then the day), search, open :data:`ORDER_SCENARIO`'s order in another tab (``target=_blank``; its
+    XMLHttpRequest loads the shipment status with the ``X-Api-Token`` header), export the CSV (the
+    engine's download dialog is cancelled) and close the browser.  The browser must have been started
+    at ``/oms/login``.  Returns ``{"timings", "download_dialog", "close"}``; raises
+    :class:`ScenarioError` / :class:`IEDriverError` (``exc.step`` = the step, ``exc.timings``) when a
+    step does not complete in time."""
+    user, password = ORDER_CREDENTIALS
+    sc = ORDER_SCENARIO
+    search = "/search?tk="
+    order = f"/order?no={sc['order']}"
+    steps = _Steps()
+    info: Dict[str, Any] = {"download_dialog": None, "close": None}
+    pending: List[subprocess.Popen] = []
+
+    def field(url: str, id: str) -> str:
+        return drv.attr(url, id=id, name="value", kind="tab", timeout=2)["value"] or ""
+
+    try:
+        with steps("start"):
+            drv.wait("/oms/login", text="ログイン", kind="tab", timeout=max(timeout, 60.0))
+        with steps("login"):  # POST -> 302 /oms/s/<SID>/menu: the session id lives in the URL from here on
+            drv.value("/oms/login", id="userId", value=user, kind="tab")
+            drv.value("/oms/login", id="password", value=password, kind="tab")
+            drv.click("/oms/login", id="btnLogin", kind="tab")
+            drv.wait("/menu", text="こんにちは", kind="tab", timeout=timeout)
+        with steps("search_page"):
+            drv.click("/menu", id="lnkSearch", kind="tab")
+            drv.wait(search, text="受注照会", kind="tab", timeout=timeout)
+        with steps("customer"):  # window.open child window: writes into the opener, then window.close()
+            drv.click(search, id="btnCust", kind="tab")
+            drv.wait("/custpicker", text=sc["customer"], kind="tab", timeout=timeout)
+            try:
+                drv.click("/custpicker", id="c_" + sc["customer"], kind="tab")
+            except IEDriverError:
+                pass  # the tab may already be gone when the click returns; the opener's field tells
+            _poll(f"custCode = {sc['customer']}", lambda: field(search, "custCode") == sc["customer"], timeout)
+        with steps("item"):  # showModalDialog child window returning the code (window.returnValue)
+            clicking = drv.click_async(search, id="btnItem", kind="tab")
+            pending.append(clicking)
+            drv.wait("/itempicker", text=sc["item"], kind="dialog", timeout=timeout)
+            drv.click("/itempicker", id="i_" + sc["item"], kind="dialog")
+            drv.finish(clicking, timeout=timeout)
+            pending.remove(clicking)
+            _poll(f"itemCode = {sc['item']}", lambda: field(search, "itemCode") == sc["item"], timeout)
+        with steps("date"):  # the calendar is drawn by the page's script: no request, only the field's text
+            year, month, day = (int(x) for x in sc["date_from"].split("/"))
+            drv.click(search, id="dateFrom", kind="tab")
+            drv.wait(search, text=f"{int(ORDER_TODAY[:4])}年{int(ORDER_TODAY[5:7])}月", kind="tab", timeout=timeout)
+            drv.click(search, id="calPrev", kind="tab")
+            drv.click(search, id="calNext", kind="tab")
+            drv.wait(search, text=f"{year}年{month}月", kind="tab", timeout=timeout)
+            drv.click(search, id=f"cal_{day}", kind="tab")
+            _poll(f"dateFrom = {sc['date_from']}", lambda: field(search, "dateFrom") == sc["date_from"], timeout)
+        with steps("search"):
+            drv.click(search, id="btnSearch", kind="tab")
+            drv.wait("/result", text="件", kind="tab", timeout=timeout)
+        with steps("order_tab"):  # target=_blank: another tab; its XMLHttpRequest sends X-Api-Token
+            drv.click("/result", id="o_" + sc["order"], kind="tab")
+            drv.wait(order, text="受注詳細", kind="tab", timeout=timeout)
+            _poll("the shipment status (XMLHttpRequest)",
+                  lambda: "読み込み中" not in drv.text(order, id="ship", kind="tab", timeout=2)["text"], timeout)
+        with steps("csv"):
+            drv.click("/result", id="lnkCsv", kind="tab")
+            info["download_dialog"] = drv.dialog(title=DOWNLOAD_DIALOG_TITLE, button=DOWNLOAD_CANCEL,
+                                                 timeout=max(timeout, 20.0))
+        with steps("close"):
+            info["close"] = drv.close(timeout=max(timeout, 20.0))
+    except BaseException as exc:
+        try:
+            exc.timings = dict(steps.timings)  # type: ignore[attr-defined]
+            exc.step = steps.current  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        raise
+    finally:
+        for proc in pending:
+            _kill(proc)
+    info["timings"] = dict(steps.timings)
+    return info
+
+
 # ===== former tests/iehost_fixtures/iedriver.py: Python wrapper for IEDriver.exe =====
 # Python wrapper for ``IEDriver.exe`` (source: ``IEDriver.cs`` next to this file) - TEST ONLY.
 #
@@ -2190,6 +2827,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
         python -I tests/ie_support.py testsite [LOGFILE [PORT]]              # testsite_main
         python -I tests/ie_support.py factory-site [LOGFILE [PORT [HOST]]]   # factory_site_main
+        python -I tests/ie_support.py order-site [LOGFILE [PORT [HOST]]]     # order_site_main
         python -I tests/ie_support.py iedriver [OUT_DIR]                     # build IEDriver.exe, print its path
     """
     args = list(sys.argv[1:] if argv is None else argv)
@@ -2198,10 +2836,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         testsite_main(args)
     elif command == "factory-site":
         factory_site_main(args)
+    elif command == "order-site":
+        order_site_main(args)
     elif command == "iedriver":  # pragma: no cover - manual use
         print(build_driver(args[0] if args else os.path.join(os.getcwd(), "iedriver_bin")))
     else:
-        print("usage: python -I ie_support.py testsite|factory-site|iedriver [ARGS...]", file=sys.stderr)
+        print("usage: python -I ie_support.py testsite|factory-site|order-site|iedriver [ARGS...]", file=sys.stderr)
         raise SystemExit(2)
 
 
