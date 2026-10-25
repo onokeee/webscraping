@@ -99,6 +99,15 @@ from werkzeug.exceptions import HTTPException
 
 __version__ = "0.1.0"
 
+# 他の PC から GUI を開くときのパスワード（この PC の中から使うときは不要）。ここを書き換えてください。
+# 環境変数 REQREC_GUI_PASSWORD を設定した場合は、そちらが優先されます。"" にすると他の PC からは使えません。
+#: Password for opening the GUI from ANOTHER PC (``reqrec gui --host 0.0.0.0`` /
+#: ``flask --app reqrec run --host 0.0.0.0``); requests from this PC itself never need it.  The
+#: environment variable ``REQREC_GUI_PASSWORD`` wins when set; ``""`` = other PCs cannot use the GUI.
+GUI_PASSWORD = "adminpass"
+#: The initial value of :data:`GUI_PASSWORD`: a warning is printed while it is still in use.
+_DEFAULT_GUI_PASSWORD = "adminpass"
+
 __all__ = [
     # core
     "RECORDING_FORMAT_VERSION", "Headers", "header_get", "header_get_all", "RecordedRequest",
@@ -135,7 +144,7 @@ __all__ = [
     "open_folder", "validate_url", "ApiError", "AppState", "ScriptRunner", "SUBDIRS", "safe_name",
     "plan_options_from_json", "gen_options_from_json", "options_to_plain", "load_sources", "exclude_netlocs",
     "normalise_netloc", "RECORDING_EXTENSIONS", "bp", "get_state", "create_app", "run_gui", "TOKEN_HEADER",
-    "GUI_PASSWORD_ENV", "WORKDIR_ENV", "LOGIN_HTML",
+    "GUI_PASSWORD", "GUI_PASSWORD_ENV", "WORKDIR_ENV", "LOGIN_HTML",
     "GUI_HTML",
     # cli
     "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "main", "build_parser", "add_filter_options",
@@ -8925,6 +8934,12 @@ GUI_PASSWORD_ENV = "REQREC_GUI_PASSWORD"
 #: Environment variable with the work folder when the app is built without arguments (Flask CLI).
 WORKDIR_ENV = "REQREC_WORKDIR"
 
+
+def _gui_password() -> str:
+    """The GUI password in effect: ``REQREC_GUI_PASSWORD`` when set (``""`` included), else :data:`GUI_PASSWORD`."""
+    env = os.environ.get(GUI_PASSWORD_ENV)
+    return str(env if env is not None else (GUI_PASSWORD or ""))
+
 #: What the upload / open endpoints accept (``importers.load_recording`` dispatches on these).
 RECORDING_EXTENSIONS = frozenset({".har", ".json"})
 
@@ -10061,7 +10076,7 @@ def index() -> str:
         workdir=state.workdir,
         mitmproxy_available=mitmproxy_available(),
         iehost=_iehost_info(state),
-        login_enabled=bool(current_app.config.get("REQREC_LOGIN_ENABLED")),
+        logged_in=bool(flask_session.get(_SESSION_AUTH_KEY)),
     )
 
 
@@ -10773,12 +10788,11 @@ def easy_build() -> Response:
 #
 # Security model (the user's browser visits arbitrary sites while this GUI runs):
 #
-# * without a password (environment variable ``REQREC_GUI_PASSWORD``) only this PC may use the GUI:
-#   requests from any other address are refused, and every request's ``Host`` must be the bound
-#   address / ``127.0.0.1`` / ``localhost`` / ``::1`` (DNS-rebinding guard);
-# * with a password every page and API needs a login session (``/login``: a signed HttpOnly,
-#   SameSite=Strict cookie; wrong passwords in a row lock the address out for a while), so the GUI may
-#   be opened from other PCs on the LAN;
+# * requests from this PC itself need no login; their ``Host`` must be the bound address /
+#   ``127.0.0.1`` / ``localhost`` / ``::1`` (DNS-rebinding guard);
+# * requests from other PCs need a login session (``/login`` with :data:`GUI_PASSWORD` or the
+#   environment variable ``REQREC_GUI_PASSWORD``: a signed HttpOnly, SameSite=Strict cookie; wrong
+#   passwords in a row lock the address out for a while); with an empty password they are refused;
 # * every ``POST`` / ``PUT`` / ``DELETE`` must carry ``X-Reqrec-Token`` equal to a per-process random
 #   token the page receives through the template (``<body data-token>``), and a state-changing request
 #   with an ``Origin`` header must come from the page itself;
@@ -10808,6 +10822,9 @@ _LOGIN_LOCK_SECONDS = 60.0
 _LOGIN_FAIL_DELAY = 1.0
 #: How long a login lasts (seconds): one work shift.
 _LOGIN_LIFETIME = 12 * 60 * 60
+#: Printed at start-up while the initial password is still in use.
+_DEFAULT_PASSWORD_WARNING = (f"注意: GUI のパスワードが初期値 ({_DEFAULT_GUI_PASSWORD}) のままです。他の PC から使う前に、"
+                             "reqrec.py の GUI_PASSWORD を書き換えてください。")
 
 #: The login page (Jinja template; plain HTML and CSS, no script, so it also works in the IE engine).
 LOGIN_HTML = r'''<!DOCTYPE html>
@@ -10927,9 +10944,10 @@ def create_app(workdir: Optional[str] = None, **config: Any) -> Flask:
     (recorder, recording browser, script run) are then stopped at exit.  ``config`` may hold
     ``host`` / ``port`` (what the server binds; used for the Host check and for excluding the GUI's
     own traffic from recordings), ``token`` (per-process CSRF token; generated when omitted),
-    ``password`` (the GUI password; defaults to the environment variable ``REQREC_GUI_PASSWORD``;
-    empty = no login and this PC only), ``recorder`` / ``runner`` (test doubles) and any upper-case
-    Flask config key (``MAX_CONTENT_LENGTH``, ``TESTING``, ``LOGIN_FAIL_DELAY`` ...).
+    ``password`` (the login password for other PCs; defaults to the environment variable
+    ``REQREC_GUI_PASSWORD``, else :data:`GUI_PASSWORD`; empty = other PCs are refused), ``recorder`` /
+    ``runner`` (test doubles) and any upper-case Flask config key (``MAX_CONTENT_LENGTH``, ``TESTING``,
+    ``LOGIN_FAIL_DELAY`` ...).  Requests from this PC itself never need a login.
     """
     from_cli = workdir is None
     if workdir is None:
@@ -10939,7 +10957,7 @@ def create_app(workdir: Optional[str] = None, **config: Any) -> Flask:
     token = config.pop("token", None)
     password = config.pop("password", None)
     if password is None:
-        password = os.environ.get(GUI_PASSWORD_ENV, "")
+        password = _gui_password()
     password = str(password or "")
     recorder = config.pop("recorder", None)
     runner = config.pop("runner", None)
@@ -11035,25 +11053,27 @@ def create_app(workdir: Optional[str] = None, **config: Any) -> Flask:
     @app.before_request
     def _guard():  # type: ignore[no-untyped-def]
         api_like = flask_request.path.startswith("/api/") or flask_request.method in _UNSAFE_METHODS
-        if password:
-            if flask_request.path == "/login":
-                if flask_request.method in _UNSAFE_METHODS and not origin_allowed(
-                        flask_request.headers.get("Origin"), flask_request.host, flask_request.scheme):
-                    return jsonify({"error": "別のオリジンからのリクエストは拒否しました (CSRF 対策)"}), 403
-                return None
-            if not flask_session.get(_SESSION_AUTH_KEY):
-                if api_like:
-                    return jsonify({"error": "ログインしていません。ページを再読み込みしてログインしてください。", "login": True}), 401
-                return redirect("/login")
-        else:
-            if not _is_loopback_addr(flask_request.remote_addr):
-                message = (f"パスワードが設定されていないため、この PC 以外からは使えません。"
-                           f"環境変数 {GUI_PASSWORD_ENV} にパスワードを設定して起動し直してください。")
-                if api_like:
-                    return jsonify({"error": message}), 403
-                return Response(message, status=403, mimetype="text/plain")
+        local = _is_loopback_addr(flask_request.remote_addr)
+        if local:
+            # this PC itself: no login (the easy screen stays "記録をはじめる → 操作 → おわる"), but
+            # the DNS-rebinding guard applies
             if not host_allowed(flask_request.host, host):
                 return jsonify({"error": f"この Host ヘッダーからのアクセスは許可されていません: {flask_request.host}"}), 403
+        elif not password:
+            message = ("この PC 以外から使うにはパスワードが必要ですが、設定されていません。"
+                       f"reqrec.py の GUI_PASSWORD か環境変数 {GUI_PASSWORD_ENV} にパスワードを設定して起動し直してください。")
+            if api_like:
+                return jsonify({"error": message}), 403
+            return Response(message, status=403, mimetype="text/plain")
+        if password and flask_request.path == "/login":
+            if flask_request.method in _UNSAFE_METHODS and not origin_allowed(
+                    flask_request.headers.get("Origin"), flask_request.host, flask_request.scheme):
+                return jsonify({"error": "別のオリジンからのリクエストは拒否しました (CSRF 対策)"}), 403
+            return None
+        if not local and not flask_session.get(_SESSION_AUTH_KEY):
+            if api_like:
+                return jsonify({"error": "ログインしていません。ページを再読み込みしてログインしてください。", "login": True}), 401
+            return redirect("/login")
         if flask_request.method in _UNSAFE_METHODS:
             if not origin_allowed(flask_request.headers.get("Origin"), flask_request.host, flask_request.scheme):
                 return jsonify({"error": "別のオリジンからのリクエストは拒否しました (CSRF 対策)"}), 403
@@ -11102,9 +11122,11 @@ def create_app(workdir: Optional[str] = None, **config: Any) -> Flask:
         import atexit
 
         atexit.register(_shutdown, state)
-        login = ("ログイン: パスワードが必要です" if password else
-                 f"ログイン: なし (この PC の中からだけ使えます。他の PC から使うときは {GUI_PASSWORD_ENV} を設定)")
+        login = ("他の PC からはパスワードでログインして使います" if password else
+                 "パスワードが未設定のため、この PC の中からだけ使えます")
         print(f"reqrec: 作業フォルダ: {state.workdir} / {login}", file=sys.stderr, flush=True)
+        if password == _DEFAULT_GUI_PASSWORD:
+            print(_DEFAULT_PASSWORD_WARNING, file=sys.stderr, flush=True)
     return app
 
 
@@ -11160,10 +11182,12 @@ def _open_browser_later(url: str, host: str, port: int, delay: float = _BROWSER_
 def run_gui(host: str = "127.0.0.1", port: int = 8765, workdir: str = "reqrec_work", open_browser: bool = True) -> int:
     """Start the GUI server (blocking) and return a process exit code (``0`` after Ctrl+C)."""
     port = int(port)
-    password = os.environ.get(GUI_PASSWORD_ENV, "")
-    if (host or "").strip().lower() not in _LOCAL_HOSTS and not password:
+    password = _gui_password()
+    exposed = (host or "").strip().lower() not in _LOCAL_HOSTS
+    if exposed and not password:
         print(f"GUI を起動できません: --host {host} で他の PC から使えるようにするときは、パスワードが必要です。"
-              f"環境変数 {GUI_PASSWORD_ENV} にパスワードを設定してから起動してください。", file=sys.stderr)
+              f"reqrec.py の GUI_PASSWORD か環境変数 {GUI_PASSWORD_ENV} にパスワードを設定してから起動してください。",
+              file=sys.stderr)
         return 1
     try:
         app = create_app(workdir, host=host, port=port)
@@ -11177,8 +11201,10 @@ def run_gui(host: str = "127.0.0.1", port: int = 8765, workdir: str = "reqrec_wo
         return 1
     print(f"GUI を起動しました: {url}  (Ctrl+C で終了)", flush=True)
     print(f"作業フォルダ: {app.extensions['reqrec'].workdir}", flush=True)
-    if password:
-        print(f"ログイン: パスワードが必要です (環境変数 {GUI_PASSWORD_ENV})", flush=True)
+    if exposed:
+        print("他の PC からはパスワードでログインして使います", flush=True)
+        if password == _DEFAULT_GUI_PASSWORD:
+            print(_DEFAULT_PASSWORD_WARNING, flush=True)
     if open_browser:
         _open_browser_later(url, _display_host(host), port)
     state: AppState = app.extensions["reqrec"]
@@ -11611,7 +11637,7 @@ select.w-full { width: 100%; max-width: 100%; }
       <span id="status-text">準備完了。</span>
     </div>
     <button type="button" id="mode-toggle" class="btn tiny ghost mode-toggle" title="フィルタ設定や通信の一覧など、細かい設定を表示します">詳細設定を表示</button>
-    {% if login_enabled %}<a href="/logout" id="logout-link" class="btn tiny ghost" title="ログアウトします">ログアウト</a>{% endif %}
+    {% if logged_in %}<a href="/logout" id="logout-link" class="btn tiny ghost" title="ログアウトします">ログアウト</a>{% endif %}
   </div>
   <nav class="steps-nav" id="nav" aria-label="作業の流れ">
     <button type="button" class="nav-step active" data-panel="record"><span class="nav-num">1</span><span class="nav-label">記録</span><span class="nav-badge" id="badge-record" hidden></span></button>

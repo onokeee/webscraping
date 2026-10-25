@@ -688,12 +688,15 @@ offline). UI language: **Japanese**. Served only on the bind address; default `1
 * every state-changing request (`POST`) must carry header `X-Reqrec-Token` equal to a per-process
   random token (`secrets.token_urlsafe(32)`) that the page receives via the template; missing/wrong
   token → 403 JSON `{"error": "..."}`.
-* without a GUI password: requests from any address other than this PC (loopback) → 403, and requests
-  whose `Host` header is not `127.0.0.1[:port]` / `localhost[:port]` / the bound host (DNS-rebinding
-  guard) → 403. `run_gui` refuses a non-loopback `--host` without a password.
-* with a GUI password (env `REQREC_GUI_PASSWORD`, or `create_app(..., password=...)`; added 2026-10-25 for
-  a personal GUI on a LAN server, e.g. started from a JupyterLab terminal with `flask --app reqrec run`):
-  every page and API needs a login session. `GET/POST /login` (plain form, `Referrer-Policy:
+* requests from this PC (loopback) need no login; their `Host` header must be `127.0.0.1[:port]` /
+  `localhost[:port]` / the bound host (DNS-rebinding guard) → else 403.
+* requests from other PCs (added 2026-10-25 for a personal GUI on a LAN server, e.g. started from a
+  JupyterLab terminal with `flask --app reqrec run`) need a login with the GUI password: the module
+  constant `GUI_PASSWORD` (plain text at the top of reqrec.py, initial value `adminpass`; a start-up
+  warning is printed while it is unchanged), overridden by env `REQREC_GUI_PASSWORD`, or
+  `create_app(..., password=...)`. An empty password refuses other PCs (403), and `run_gui` then
+  refuses a non-loopback `--host`. With a password every page and API from another PC needs a login
+  session. `GET/POST /login` (plain form, `Referrer-Policy:
   same-origin` so the form post carries a real `Origin`; cross-origin or `null` Origin → 403),
   `GET /logout`. Session = Flask signed cookie `reqrec_session_<hash of workdir>`, HttpOnly,
   SameSite=Strict, 12 h, secret key per process. 5 wrong passwords in a row lock that address for 60 s

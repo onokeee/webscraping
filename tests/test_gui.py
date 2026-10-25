@@ -2508,11 +2508,12 @@ def test_module_imports_without_winreg():
     assert "winreg" not in vars(module)
 
 
-# ===== GUI password (REQREC_GUI_PASSWORD) and ``flask --app reqrec run`` =====
-# A personal GUI on a LAN server (e.g. started from a JupyterLab terminal): with a password every page
-# and API needs a login; without one only this PC may use the GUI.
+# ===== GUI password (GUI_PASSWORD / REQREC_GUI_PASSWORD) and ``flask --app reqrec run`` =====
+# A personal GUI on a LAN server (e.g. started from a JupyterLab terminal): requests from other PCs need
+# a login with the password; requests from this PC itself never do.
 
 PASSWORD = "pw-for-tests"
+LAN = {"REMOTE_ADDR": "192.168.1.30"}
 
 
 @pytest.fixture
@@ -2522,13 +2523,63 @@ def pw_app(workdir: Path):
     application.extensions["reqrec"].close()
 
 
+def _lan_client(application, addr="192.168.1.30"):
+    """A test client whose requests come from another PC on the LAN."""
+    c = application.test_client()
+    c.environ_base["REMOTE_ADDR"] = addr
+    return c
+
+
 def _login(client, password=PASSWORD, origin="http://localhost", **kw):
     return client.post("/login", data={"password": password}, headers={"Origin": origin}, **kw)
 
 
 class TestPassword:
-    def test_without_login_the_page_redirects_and_the_api_is_401(self, pw_app):
-        c = pw_app.test_client()
+    def test_initial_password_is_adminpass(self, workdir):
+        assert webapp.GUI_PASSWORD == "adminpass"
+        application = create_app(str(workdir), TESTING=True, LOGIN_FAIL_DELAY=0)
+        try:
+            c = _lan_client(application)
+            assert c.get("/").status_code == 302
+            assert _login(c, "adminpass").status_code == 302
+            assert c.get("/api/state").status_code == 200
+        finally:
+            application.extensions["reqrec"].close()
+
+    def test_password_written_in_reqrec_py(self, workdir, monkeypatch):
+        monkeypatch.setattr(webapp, "GUI_PASSWORD", "changed-in-file")
+        application = create_app(str(workdir), TESTING=True, LOGIN_FAIL_DELAY=0)
+        try:
+            c = _lan_client(application)
+            assert _login(c, "adminpass").status_code == 401
+            assert _login(c, "changed-in-file").status_code == 302
+        finally:
+            application.extensions["reqrec"].close()
+
+    def test_environment_variable_wins(self, workdir, monkeypatch):
+        monkeypatch.setenv("REQREC_GUI_PASSWORD", "from-env")
+        application = create_app(str(workdir), TESTING=True, LOGIN_FAIL_DELAY=0)
+        try:
+            c = _lan_client(application)
+            assert _login(c, "adminpass").status_code == 401
+            assert _login(c, "from-env").status_code == 302
+            assert application.config["REQREC_LOGIN_ENABLED"] is True
+        finally:
+            application.extensions["reqrec"].close()
+
+    def test_this_pc_needs_no_login(self, pw_app):
+        c = pw_app.test_client()  # 127.0.0.1
+        page = c.get("/")
+        assert page.status_code == 200 and 'id="logout-link"' not in page.get_data(as_text=True)
+        assert c.get("/api/state").status_code == 200
+        assert c.post("/api/recordings/clear", json={}, headers={TOKEN_HEADER: "test-token-123"}).status_code == 200
+        assert c.get("/api/state", environ_base={"REMOTE_ADDR": "::1"}).status_code == 200
+        assert c.get("/api/state", environ_base={"REMOTE_ADDR": "::ffff:127.0.0.1"}).status_code == 200
+        # the DNS-rebinding guard still applies to this PC
+        assert c.get("/api/state", headers={"Host": "evil.example"}).status_code == 403
+
+    def test_other_pc_without_login(self, pw_app):
+        c = _lan_client(pw_app)
         r = c.get("/")
         assert r.status_code == 302 and r.headers["Location"].endswith("/login")
         r = c.get("/api/state")
@@ -2537,7 +2588,7 @@ class TestPassword:
         assert c.get("/api/scripts/x.py/download").status_code == 401
 
     def test_login_page(self, pw_app):
-        r = pw_app.test_client().get("/login")
+        r = _lan_client(pw_app).get("/login")
         html = r.get_data(as_text=True)
         assert r.status_code == 200 and 'type="password"' in html and 'action="/login"' in html
         assert "<script" not in html  # plain form: works in any browser engine
@@ -2545,7 +2596,7 @@ class TestPassword:
         assert r.headers["Referrer-Policy"] == "same-origin" and 'content="same-origin"' in html
 
     def test_wrong_then_right_password(self, pw_app):
-        c = pw_app.test_client()
+        c = _lan_client(pw_app)
         r = _login(c, "nope")
         assert r.status_code == 401 and "パスワードが違います" in r.get_data(as_text=True)
         r = _login(c)
@@ -2557,31 +2608,31 @@ class TestPassword:
         assert c.get("/login").status_code == 302  # already logged in: back to the GUI
 
     def test_session_cookie(self, pw_app):
-        cookie = _login(pw_app.test_client()).headers["Set-Cookie"]
+        cookie = _login(_lan_client(pw_app)).headers["Set-Cookie"]
         assert cookie.startswith("reqrec_session_") and "HttpOnly" in cookie and "SameSite=Strict" in cookie
 
     def test_token_and_origin_still_checked_after_login(self, pw_app):
-        c = pw_app.test_client()
+        c = _lan_client(pw_app)
         _login(c)
         assert c.post("/api/recordings/clear", json={}).status_code == 403
         r = c.post("/api/recordings/clear", json={}, headers={TOKEN_HEADER: "test-token-123", "Origin": "http://evil.example"})
         assert r.status_code == 403
 
     def test_logout(self, pw_app):
-        c = pw_app.test_client()
+        c = _lan_client(pw_app)
         _login(c)
         r = c.get("/logout")
         assert r.status_code == 302 and r.headers["Location"].endswith("/login")
         assert c.get("/api/state").status_code == 401
 
     def test_login_posted_from_another_site_is_refused(self, pw_app):
-        c = pw_app.test_client()
+        c = _lan_client(pw_app)
         assert _login(c, origin="http://evil.example").status_code == 403
         assert _login(c, origin="null").status_code == 403
         assert c.get("/api/state").status_code == 401
 
     def test_lockout_after_wrong_passwords(self, pw_app):
-        c = pw_app.test_client()
+        c = _lan_client(pw_app)
         for _ in range(4):
             assert _login(c, "nope").status_code == 401
         r = _login(c, "nope")
@@ -2589,11 +2640,10 @@ class TestPassword:
         r = _login(c)  # even the right password has to wait until the lock ends
         assert r.status_code == 429 and c.get("/api/state").status_code == 401
         # the lock belongs to that address only
-        r = _login(c, environ_base={"REMOTE_ADDR": "192.168.1.30"})
-        assert r.status_code == 302
+        assert _login(_lan_client(pw_app, "192.168.1.31")).status_code == 302
 
     def test_lock_ends(self, pw_app, monkeypatch):
-        c = pw_app.test_client()
+        c = _lan_client(pw_app)
         now = [1000.0]
         monkeypatch.setattr(webapp.time, "time", lambda: now[0])
         for _ in range(5):
@@ -2607,7 +2657,7 @@ class TestPassword:
         monkeypatch.setattr(webapp.time, "sleep", sleeps.append)
         application = create_app(str(workdir), password=PASSWORD, TESTING=True)
         try:
-            c = application.test_client()
+            c = _lan_client(application)
             _login(c, "nope")
             assert sleeps == [1.0]
             _login(c)
@@ -2615,53 +2665,57 @@ class TestPassword:
         finally:
             application.extensions["reqrec"].close()
 
-    def test_other_pcs_and_server_names_work_after_login(self, pw_app):
-        c = pw_app.test_client()
-        env = {"REMOTE_ADDR": "192.168.1.30"}
-        r = c.post("/login", data={"password": PASSWORD}, environ_base=env,
+    def test_any_server_name_works_after_login(self, pw_app):
+        c = _lan_client(pw_app)
+        r = c.post("/login", data={"password": PASSWORD},
                    headers={"Origin": "http://jupyter-srv:8765", "Host": "jupyter-srv:8765"})
         assert r.status_code == 302
-        assert c.get("/api/state", headers={"Host": "jupyter-srv:8765"}, environ_base=env).status_code == 200
-
-    def test_password_from_the_environment(self, workdir, monkeypatch):
-        monkeypatch.setenv("REQREC_GUI_PASSWORD", "from-env")
-        application = create_app(str(workdir), TESTING=True, LOGIN_FAIL_DELAY=0)
-        try:
-            c = application.test_client()
-            assert c.get("/").status_code == 302
-            assert _login(c, "from-env").status_code == 302
-            assert application.config["REQREC_LOGIN_ENABLED"] is True
-        finally:
-            application.extensions["reqrec"].close()
+        assert c.get("/api/state", headers={"Host": "jupyter-srv:8765"}).status_code == 200
 
     def test_the_page_goes_to_the_login_when_the_session_ends(self):
         js = APP_JS
         assert "if (resp.status === 401 && data.login) window.location.href = '/login';" in js
 
 
-class TestWithoutPassword:
-    def test_only_this_pc(self, client):
-        env = {"REMOTE_ADDR": "192.168.1.30"}
-        r = client.get("/", environ_base=env)
-        assert r.status_code == 403 and "REQREC_GUI_PASSWORD" in r.get_data(as_text=True)
-        r = client.get("/api/state", environ_base=env)
-        assert r.status_code == 403 and "REQREC_GUI_PASSWORD" in r.get_json()["error"]
-        assert client.get("/").status_code == 200
-        assert client.get("/api/state", environ_base={"REMOTE_ADDR": "::1"}).status_code == 200
-        assert client.get("/api/state", environ_base={"REMOTE_ADDR": "::ffff:127.0.0.1"}).status_code == 200
+class TestEmptyPassword:
+    @pytest.fixture
+    def open_app(self, workdir):
+        application = create_app(str(workdir), token="test-token-123", password="", TESTING=True)
+        yield application
+        application.extensions["reqrec"].close()
 
-    def test_no_login_routes_and_no_logout_link(self, client):
-        assert client.get("/login").status_code == 404 and client.get("/logout").status_code == 404
-        assert 'id="logout-link"' not in client.get("/").get_data(as_text=True)
+    def test_other_pcs_are_refused(self, open_app):
+        c = _lan_client(open_app)
+        r = c.get("/")
+        assert r.status_code == 403 and "GUI_PASSWORD" in r.get_data(as_text=True)
+        r = c.get("/api/state")
+        assert r.status_code == 403 and "REQREC_GUI_PASSWORD" in r.get_json()["error"]
+        assert open_app.test_client().get("/").status_code == 200  # this PC
+
+    def test_empty_environment_variable_turns_the_login_off(self, workdir, monkeypatch):
+        monkeypatch.setenv("REQREC_GUI_PASSWORD", "")
+        application = create_app(str(workdir), TESTING=True)
+        try:
+            assert application.config["REQREC_LOGIN_ENABLED"] is False
+            assert _lan_client(application).get("/api/state").status_code == 403
+        finally:
+            application.extensions["reqrec"].close()
+
+    def test_no_login_routes(self, open_app):
+        c = open_app.test_client()
+        assert c.get("/login").status_code == 404 and c.get("/logout").status_code == 404
 
     def test_run_gui_refuses_the_lan_without_a_password(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(webapp, "GUI_PASSWORD", "")
         monkeypatch.setattr(flask.Flask, "run", lambda self, **kw: pytest.fail("server must not start"))
         rc = run_gui(host="0.0.0.0", port=_free_port(), workdir=str(tmp_path / "w"), open_browser=False)
-        assert rc == 1 and "REQREC_GUI_PASSWORD" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert rc == 1 and "GUI_PASSWORD" in err and "REQREC_GUI_PASSWORD" in err
         assert not (tmp_path / "w").exists()
 
-    def test_run_gui_on_the_lan_with_a_password(self, tmp_path, capsys, monkeypatch):
-        monkeypatch.setenv("REQREC_GUI_PASSWORD", "x")
+
+class TestRunGuiPassword:
+    def _run(self, tmp_path, monkeypatch, host):
         calls = {}
 
         def fake_run(self, host, port, **kw):
@@ -2669,42 +2723,57 @@ class TestWithoutPassword:
             raise KeyboardInterrupt
 
         monkeypatch.setattr(flask.Flask, "run", fake_run)
-        rc = run_gui(host="0.0.0.0", port=_free_port(), workdir=str(tmp_path / "w"), open_browser=False)
+        rc = run_gui(host=host, port=_free_port(), workdir=str(tmp_path / "w"), open_browser=False)
+        return rc, calls
+
+    def test_lan_with_the_initial_password_warns(self, tmp_path, capsys, monkeypatch):
+        rc, calls = self._run(tmp_path, monkeypatch, "0.0.0.0")
+        out = capsys.readouterr().out
         assert rc == 0 and calls == {"host": "0.0.0.0"}
-        assert "パスワードが必要です" in capsys.readouterr().out
+        assert "パスワードでログイン" in out and "初期値 (adminpass) のまま" in out
+
+    def test_lan_with_a_changed_password(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(webapp, "GUI_PASSWORD", "changed")
+        rc, _ = self._run(tmp_path, monkeypatch, "0.0.0.0")
+        out = capsys.readouterr().out
+        assert rc == 0 and "パスワードでログイン" in out and "初期値" not in out
+
+    def test_this_pc_only_says_nothing_about_passwords(self, tmp_path, capsys, monkeypatch):
+        rc, _ = self._run(tmp_path, monkeypatch, "127.0.0.1")
+        out = capsys.readouterr().out
+        assert rc == 0 and "パスワード" not in out
 
 
 class TestFlaskCli:
-    def test_flask_cli_finds_the_factory(self, tmp_path, monkeypatch, capsys):
+    def _load(self, tmp_path, monkeypatch, registered=None):
         from flask.cli import ScriptInfo
         import atexit
 
         monkeypatch.setenv("REQREC_WORKDIR", str(tmp_path / "w"))
+        monkeypatch.setattr(atexit, "register", lambda fn, *a, **k: (registered if registered is not None else []).append((fn, a)))
+        return ScriptInfo(app_import_path="reqrec").load_app()  # what ``flask --app reqrec run`` does
+
+    def test_flask_cli_finds_the_factory(self, tmp_path, monkeypatch, capsys):
         registered = []
-        monkeypatch.setattr(atexit, "register", lambda fn, *a, **k: registered.append((fn, a)))
-        application = ScriptInfo(app_import_path="reqrec").load_app()  # what ``flask --app reqrec run`` does
+        application = self._load(tmp_path, monkeypatch, registered)
         state = application.extensions["reqrec"]
         try:
             assert isinstance(application, flask.Flask)
             assert state.workdir == str(tmp_path / "w") and (tmp_path / "w" / "scripts").is_dir()
             assert registered == [(webapp._shutdown, (state,))]  # children stopped at exit
             err = capsys.readouterr().err
-            assert "作業フォルダ" in err and "ログイン: なし" in err
-            assert application.test_client().get("/").status_code == 200
+            assert "作業フォルダ" in err and "パスワードでログイン" in err and "初期値 (adminpass) のまま" in err
+            assert application.test_client().get("/").status_code == 200  # this PC: no login
+            assert _lan_client(application).get("/").status_code == 302  # other PCs: login
         finally:
             state.close()
 
-    def test_flask_cli_with_a_password(self, tmp_path, monkeypatch, capsys):
-        from flask.cli import ScriptInfo
-        import atexit
-
-        monkeypatch.setenv("REQREC_WORKDIR", str(tmp_path / "w"))
+    def test_flask_cli_with_the_environment_password(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("REQREC_GUI_PASSWORD", "x")
-        monkeypatch.setattr(atexit, "register", lambda fn, *a, **k: None)
-        application = ScriptInfo(app_import_path="reqrec").load_app()
+        application = self._load(tmp_path, monkeypatch)
         try:
-            assert "パスワードが必要です" in capsys.readouterr().err
-            assert application.test_client().get("/").status_code == 302
+            err = capsys.readouterr().err
+            assert "パスワードでログイン" in err and "初期値" not in err
         finally:
             application.extensions["reqrec"].close()
 
