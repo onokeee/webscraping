@@ -16,3 +16,9 @@ venv/
 # 記録用ブラウザの事前ビルド（reqrec browser build。reqrec.py と同じフォルダにできる）
 /RecBrowser.exe
 /RecBrowser.exe.sha256
+
+# GitHub に載せるのはアプリ（reqrec.py）と requirements.txt・README.md だけ。
+# テスト・設計メモ・パッケージ設定はこの PC にだけ置く
+/tests/
+/DESIGN.md
+/pyproject.toml
