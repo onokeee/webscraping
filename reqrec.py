@@ -12329,7 +12329,7 @@ textarea.code-editor[readonly] { opacity: .7; }
     }
     // plain-language hint for the most common failures of a generated script (the raw traceback stays available below)
     const ERROR_HINTS = [
-      [/getaddrinfo failed|Name or service not known|NameResolutionError|nodename nor servname/i, 'サイトに接続できません (アドレスが見つかりません)。社内ネットワークに接続しているか、VPN が必要なサイトではないか確認してください。'],
+      [/getaddrinfo failed|Name or service not known|NameResolutionError|nodename nor servname/i, 'サイトに接続できません (アドレスが見つかりません)。LAN環境内のネットワークに接続しているか、VPN が必要なサイトではないか確認してください。'],
       [/ConnectTimeout|Read timed out|timed out/i, 'サイトの応答がありません (タイムアウト)。しばらくしてからもう一度実行してください。'],
       [/CERTIFICATE_VERIFY_FAILED|SSLError|SSLCertVerificationError/i, 'https:// のサイトの証明書を確認できませんでした。このツールが対象とするのは http:// のサイトです。'],
       [/ConnectionRefused|Connection refused|WinError 10061/i, 'サイトに接続できません (接続が拒否されました)。サイトが動いているか確認してください。'],
