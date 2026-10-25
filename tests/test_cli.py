@@ -183,7 +183,7 @@ def test_subcommand_help(capsys):
     assert cli.main(["generate", "--help"]) == 0
     out = capsys.readouterr().out
     for flag in ("--include-host", "--exclude-host", "--keep-static", "--keep-trackers", "--keep-all",
-                 "--no-collapse-redirects", "--no-loops", "--min-value-length", "--max-steps", "--no-redact",
+                 "--no-collapse-redirects", "--no-loops", "--min-value-length", "--max-steps", "--redact",
                  "--html-parser", "--no-comments", "--delay", "--timeout", "--strict-status", "--dump-plan", "--run",
                  # phase 2 (DESIGN §13.1 / §13.3)
                  "--exclude-flow", "--include-flow", "--final-flow", "--exclude-step", "--final-step",
@@ -299,7 +299,7 @@ def test_generate_every_flag_maps_to_options(fakes, capsys):
         "--exclude-host", "ads.example.com", "--exclude-host", "x.com,y.com",
         "--keep-static", "--keep-trackers", "--keep-all",
         "--no-collapse-redirects", "--no-loops",
-        "--min-value-length", "6", "--max-steps", "10", "--no-redact",
+        "--min-value-length", "6", "--max-steps", "10", "--redact",
         "--html-parser", "lxml", "--no-comments", "--delay", "1.5", "--timeout", "12", "--strict-status",
         "--exclude-flow", "f0002, 3", "--include-flow", "F0001", "--final-flow", "4", "--no-detect-auth",
     ]
@@ -312,7 +312,7 @@ def test_generate_every_flag_maps_to_options(fakes, capsys):
         keep_all=True,
         collapse_redirects=False,
         detect_loops=False,
-        redact_secrets=False,
+        redact_secrets=True,
         min_value_length=6,
         max_steps=10,
         exclude_flow_ids=["f0002", "f0003"],
@@ -328,11 +328,11 @@ def test_generate_every_flag_maps_to_options(fakes, capsys):
 
 def test_inspect_filter_flags_map_to_plan_options(fakes, capsys):
     argv = ["inspect", "rec.json", "--include-host", "shop.example.test", "--exclude-host", "a.com,b.com",
-            "--keep-static", "--no-loops", "--min-value-length", "8", "--max-steps", "3", "--no-redact"]
+            "--keep-static", "--no-loops", "--min-value-length", "8", "--max-steps", "3", "--redact"]
     assert cli.main(argv) == 0
     assert fakes["plan_opts"] == PlanOptions(
         include_hosts=["shop.example.test"], exclude_hosts=["a.com", "b.com"], keep_static=True,
-        detect_loops=False, redact_secrets=False, min_value_length=8, max_steps=3,
+        detect_loops=False, redact_secrets=True, min_value_length=8, max_steps=3,
     )
 
 

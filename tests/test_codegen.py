@@ -318,9 +318,15 @@ class TestLoginFlow:
         assert c3.header("X-User-Id") == "42"
 
         # final output: pretty JSON with ensure_ascii=False
-        assert json.loads(out) == {"ok": True, "name": "太郎"}
+        assert json.loads(out) == {"ok": True, "name": "太郎"}  # stdout carries only the result
         assert "太郎" in out
-        assert capsys.readouterr().err == ""
+        # progress goes to stderr: one line per step (with the title of an HTML page) and a final line
+        assert capsys.readouterr().err.splitlines() == [
+            "[1/3] OK  GET /login (200)  「ログイン」",
+            "[2/3] OK  POST /submit (200)",
+            "[3/3] OK  GET /users/{user_id}/me (200)",
+            "[完了] すべての手順が終わりました（3 手順）",
+        ]
 
     def test_secret_value_never_in_source(self):
         src = generate(login_plan())
@@ -387,7 +393,16 @@ class TestLoginFlow:
         assert "for c in INITIAL_COOKIES:" in src
         assert "session.cookies.set(c['name'], c['value'], domain=c['domain'], path=c['path'])" in src
         assert "ctx = {}" in src and "ctx.update(out)" in src
-        assert src.rstrip().endswith('if __name__ == "__main__":\n    main()')
+        assert "_step_start(1, 3, 'GET /login')" in src and "_step_start(3, 3, 'GET /users/{user_id}/me')" in src
+        assert src.count("\n    _step_ok(resp)\n") == 3  # one call per step in main()
+        assert 'print("[完了] すべての手順が終わりました（3 手順）", file=sys.stderr, flush=True)' in src
+        # the __main__ block names the step that failed, then lets the error through (traceback kept)
+        assert src.rstrip().endswith(
+            'if __name__ == "__main__":\n    try:\n        main()\n    except Exception:\n'
+            '        # どの手順で止まったかを表示してから、エラーの詳細を出す\n'
+            '        if _STEP["no"] and not _STEP["ok"]:\n'
+            '            print("[{}/{}] 失敗  {}".format(_STEP["no"], _STEP["total"], _STEP["label"]), file=sys.stderr, flush=True)\n'
+            '        raise')
         assert "time.sleep" not in src  # delay 0 -> no sleeps
 
 

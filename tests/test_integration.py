@@ -75,7 +75,7 @@ REC = {
 @pytest.fixture(scope="module")
 def chrome():
     recording = load_recording(CHROME_HAR)
-    plan = build_plan(recording, PlanOptions())
+    plan = build_plan(recording, PlanOptions(redact_secrets=True))
     source = generate(plan, GenOptions())
     compile(source, "chrome_scrape.py", "exec")
     return recording, plan, source
@@ -84,7 +84,7 @@ def chrome():
 @pytest.fixture(scope="module")
 def firefox():
     recording = load_recording(FIREFOX_HAR)
-    plan = build_plan(recording, PlanOptions())
+    plan = build_plan(recording, PlanOptions(redact_secrets=True))
     source = generate(plan, GenOptions())
     compile(source, "firefox_scrape.py", "exec")
     return recording, plan, source
@@ -388,7 +388,7 @@ def test_chrome_script_replays_with_fresh_tokens(chrome):
 def test_chrome_script_variants_replay_with_fresh_tokens(chrome):
     """Comment-free / strict-status / delayed output goes through the same conversation."""
     recording, _plan, _source = chrome
-    plan = build_plan(recording, PlanOptions())
+    plan = build_plan(recording, PlanOptions(redact_secrets=True))
     source = generate(plan, GenOptions(comments=False, strict_status=True, delay=0.5, timeout=5))
     compile(source, "variant.py", "exec")
     assert "time.sleep(DELAY)" in source and "DELAY = 0.5" in source
@@ -400,7 +400,7 @@ def test_chrome_script_variants_replay_with_fresh_tokens(chrome):
 def test_chrome_script_from_cli_replays(tmp_path, capsys):
     out_file = tmp_path / "scrape.py"
     dump = tmp_path / "plan.json"
-    assert cli.main(["generate", CHROME_HAR, "-o", str(out_file), "--dump-plan", str(dump)]) == 0
+    assert cli.main(["generate", CHROME_HAR, "-o", str(out_file), "--dump-plan", str(dump), "--redact"]) == 0
     err = capsys.readouterr().err
     assert "REQREC_PASSWORD" in err and REC["password"] not in err
     dump_text = dump.read_text(encoding="utf-8")
@@ -606,7 +606,7 @@ JAPANESE_RE = re.compile(r"[぀-ヿ一-鿿]")
 @pytest.fixture(scope="module")
 def legacy():
     recording = load_recording(LEGACY_HAR)
-    plan = build_plan(recording, PlanOptions())
+    plan = build_plan(recording, PlanOptions(redact_secrets=True))
     source = generate(plan, GenOptions())
     compile(source, "legacy_scrape.py", "exec")
     return recording, plan, source
@@ -615,7 +615,7 @@ def legacy():
 @pytest.fixture(scope="module")
 def merged():
     recording = load_recordings([CHROME_HAR, FIREFOX_HAR])
-    plan = build_plan(recording, PlanOptions())
+    plan = build_plan(recording, PlanOptions(redact_secrets=True))
     source = generate(plan, GenOptions())
     compile(source, "merged_scrape.py", "exec")
     return recording, plan, source
@@ -806,7 +806,7 @@ def test_legacy_script_replays_with_fresh_viewstate(legacy, monkeypatch):
 
 def test_legacy_script_strict_variant_replays(legacy, monkeypatch):
     recording, _plan, _source = legacy
-    source = generate(build_plan(recording, PlanOptions()), GenOptions(comments=False, strict_status=True))
+    source = generate(build_plan(recording, PlanOptions(redact_secrets=True)), GenOptions(comments=False, strict_status=True))
     monkeypatch.setitem(sys.modules, "requests_negotiate_sspi", _stub_module("requests_negotiate_sspi", HttpNegotiateAuth=_NoAuth))
     site = IntranetSite()
     out = run_generated(source, site.adapter, env={})
@@ -1027,7 +1027,7 @@ def test_override_exclude_include_and_final_at_plan_level(chrome):
 
 def test_override_final_step_changes_only_the_printed_result(chrome, tmp_path, monkeypatch):
     recording, _plan, _source = chrome
-    plan = build_plan(recording, PlanOptions(final_flow_id="f0009"))
+    plan = build_plan(recording, PlanOptions(final_flow_id="f0009", redact_secrets=True))
     source = generate(plan, GenOptions())
     compile(source, "final.py", "exec")
     assert "結果として表示するステップ: 2（POST https://shop.example.test/login）" in source
@@ -1047,7 +1047,8 @@ def test_override_final_step_changes_only_the_printed_result(chrome, tmp_path, m
 def test_override_exclude_step_via_cli_replays_without_the_export(tmp_path, capsys):
     target = tmp_path / "no_export.py"
     dump = tmp_path / "plan.json"
-    assert cli.main(["generate", CHROME_HAR, "-o", str(target), "--exclude-step", "5", "--final-step", "3", "--dump-plan", str(dump)]) == 0
+    assert cli.main(["generate", CHROME_HAR, "-o", str(target), "--exclude-step", "5", "--final-step", "3", "--dump-plan", str(dump),
+                     "--redact"]) == 0
     err = capsys.readouterr().err
     assert "ステップ 4 件を生成します" in err and "結果にするステップ: 3（GET https://api.example.test/v1/me）" in err
     plan_json = json.loads(dump.read_text(encoding="utf-8"))
@@ -1108,7 +1109,7 @@ HOST = "http://intra.example.local"
 @pytest.fixture(scope="module")
 def legacy_plan():
     recording = load_recording(LEGACY_HAR)
-    plan = build_plan(recording, PlanOptions())
+    plan = build_plan(recording, PlanOptions(redact_secrets=True))
     return recording, plan
 
 
@@ -1515,7 +1516,7 @@ def _kept_sequence(recording: Recording) -> list[tuple[str, str]]:
 # --------------------------------------------------------------------------- tests
 
 def test_generated_script_replays_against_fresh_tokens(captured: Captured, tmp_path: Path) -> None:
-    plan, source = _plan_and_generate(captured.recording, PlanOptions())
+    plan, source = _plan_and_generate(captured.recording, PlanOptions(redact_secrets=True))
 
     # the plan dropped exactly the static noise and hid the password behind an env var
     dropped = {d.url.replace(captured.base_url, "") for d in plan.dropped}
@@ -1562,7 +1563,7 @@ def test_generated_script_with_embedded_password(captured: Captured, tmp_path: P
 
 def test_redacted_script_fails_loudly_without_the_secret(captured: Captured, tmp_path: Path) -> None:
     """Without REQREC_PASSWORD the script stops before sending anything, naming the variable."""
-    _plan, source = _plan_and_generate(captured.recording, PlanOptions())
+    _plan, source = _plan_and_generate(captured.recording, PlanOptions(redact_secrets=True))
     script = _write_script(tmp_path, source)
 
     site_b = _fresh_server(captured)
@@ -1580,7 +1581,7 @@ def test_redacted_script_fails_loudly_without_the_secret(captured: Captured, tmp
 
 def test_generated_script_runs_twice_in_a_row(captured: Captured, tmp_path: Path) -> None:
     """Tokens are per *session*: a second run on the same server must log in afresh and succeed."""
-    _plan, source = _plan_and_generate(captured.recording, PlanOptions())
+    _plan, source = _plan_and_generate(captured.recording, PlanOptions(redact_secrets=True))
     script = _write_script(tmp_path, source)
     site_b = _fresh_server(captured)
     env = {**os.environ, "REQREC_PASSWORD": PASSWORD}
@@ -2194,7 +2195,7 @@ def replay(request, tmp_path):
     rec_path = tmp_path / "rec.json"
     _retarget(RECORDINGS[request.param], rec_path, port)
     script = tmp_path / "scrape_factory.py"
-    assert cli.main(["generate", str(rec_path), "-o", str(script)]) == 0
+    assert cli.main(["generate", str(rec_path), "-o", str(script), "--redact"]) == 0  # password from the environment
     log = tmp_path / "site.log"
     server = fs.serve_in_thread(str(log), port)
     try:
@@ -2240,6 +2241,13 @@ def test_generated_script_replays_the_whole_scenario_on_a_fresh_server(replay, t
     export = [e for e in fs.read_log(str(log)) if e.get("event") == "excel_export"][0]
     assert rows[-1] == ["出力ID", export["details"]["export_id"]]
     assert f"{xlsx.name} に保存しました" in proc.stdout
+    # how far it got: one "[n/N] OK" line per step on stderr, then the final line
+    progress = [ln for ln in proc.stderr.splitlines() if ln.startswith("[")]
+    total = len(progress) - 1
+    assert progress[0] == f"[1/{total}] OK  GET /Login.aspx (200)  「生産管理システム - ログイン」"
+    assert progress[1] == f"[2/{total}] OK  POST /Login.aspx (200)  「生産管理システム - メニュー」"
+    assert all(ln.startswith(f"[{n}/{total}] OK  ") for n, ln in enumerate(progress[:-1], start=1))
+    assert progress[-1] == f"[完了] すべての手順が終わりました（{total} 手順）"
 
 
 def test_no_recorded_session_value_is_replayed(replay):
@@ -2279,10 +2287,37 @@ def test_missing_password_stops_before_any_request(replay, tmp_path):
     assert _events(log) == []  # not even the login page was requested
 
 
+@pytest.mark.parametrize("key", sorted(RECORDINGS))
+def test_default_script_has_the_password_written_in_and_needs_no_input(key, tmp_path):
+    """Without ``--redact`` (the default, also the GUI's) the recorded password is written into the
+    script, so it replays the whole scenario with nothing to type: [試しに実行する] is one click."""
+    port = _free_port()
+    rec_path = tmp_path / "rec.json"
+    _retarget(RECORDINGS[key], rec_path, port)
+    script = tmp_path / "scrape_factory.py"
+    assert cli.main(["generate", str(rec_path), "-o", str(script)]) == 0
+    source = script.read_text(encoding="utf-8")
+    assert fs.CREDENTIALS[1] in source and PASSWORD_ENV not in source and "設定されていません" not in source
+    log = tmp_path / "site.log"
+    server = fs.serve_in_thread(str(log), port)
+    try:
+        proc = _run(script, tmp_path / "out", password=None)
+    finally:
+        server.stop()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert [e["event"] for e in _events(log)][:2] == ["login_page", "login_ok"]
+    assert (tmp_path / "out" / fs.export_filename("01", "L11")).is_file()
+
+
 def test_wrong_password_fails_with_a_plain_message(replay, tmp_path):
     script, _server, log, _rec = replay
     proc = _run(script, tmp_path / "out", password="wrong")
     assert proc.returncode != 0
     assert "login_fail" in [e["event"] for e in _events(log)]
+    # the progress lines show where it stopped: the login page came back, the login step failed
+    progress = [ln for ln in proc.stderr.splitlines() if ln.startswith("[")]
+    assert progress[0].startswith("[1/") and progress[0].endswith("「生産管理システム - ログイン」")
+    assert progress[1].startswith("[2/") and "失敗  POST /Login.aspx" in progress[1]
+    assert proc.stderr.index(progress[1]) < proc.stderr.index("Traceback")
     # the menu's URL key cannot be found on the login page that came back
     assert "要素が見つかりません" in proc.stderr or "パターンに一致しませんでした" in proc.stderr

@@ -431,6 +431,11 @@ dependency detection and treating the last flow of the loop as the step's respon
 
 ## 7. Plan builder (`reqrec/plan.py`)
 
+> 2026-10-25: `PlanOptions.redact_secrets` now defaults to **False** (the user's decision: recorded
+> passwords are written into the script so the GUI's [試しに実行する] runs with one click). The
+> redaction described below is the opt-in (`--redact`, GUI 詳細設定 「パスワードなどをスクリプトに書き込まず、
+> 実行するときに入力する」). Digest passwords (never on the wire) are always read from the environment.
+
 ```python
 def build_plan(recording: Recording, opts: PlanOptions | None = None) -> Plan
 ```
@@ -468,6 +473,15 @@ def build_plan(recording: Recording, opts: PlanOptions | None = None) -> Plan
 
 ## 8. Code generator (`reqrec/codegen.py`)
 
+> 2026-10-25: generated scripts report progress on **stderr** (stdout stays the result):
+> `_step_start(no, total, "METHOD /path")` before each step call in `main()` (inside the loop for
+> a looped step, label + `var=value`), `_step_ok(resp)` after it prints
+> `[no/total] OK  METHOD /path (status)  「<live HTML title>」`, `main()` ends with
+> `[完了] すべての手順が終わりました（N 手順）`, and the `__main__` block catches `Exception`, prints
+> `[no/total] 失敗  METHOD /path` for an unfinished step and re-raises (traceback kept). The GUI's
+> `ScriptRunner` matches these lines (`_PROGRESS_LINE_RE`) and reports `output_tail` (stdout + progress
+> lines in arrival order, shown in the run console) and `errors_tail` (stderr without them).
+
 ```python
 def generate(plan: Plan, opts: GenOptions | None = None) -> str
 ```
@@ -504,7 +518,7 @@ local server (see §10).
 ```
 reqrec import   INPUT(.har|.json) -o rec.json
 reqrec inspect  INPUT [filter options] [--json]
-reqrec generate INPUT -o scrape.py [filter options] [--html-parser html.parser|lxml] [--no-redact]
+reqrec generate INPUT -o scrape.py [filter options] [--html-parser html.parser|lxml] [--redact]
                 [--delay SEC] [--timeout SEC] [--no-comments] [--strict-status] [--dump-plan plan.json] [--run]
 reqrec gui      [--host 127.0.0.1] [--port 8765] [--workdir DIR] [--no-browser]
 reqrec browser  build | status
@@ -757,7 +771,7 @@ offline). UI language: **Japanese**. Served only on the bind address; default `1
   `GET /api/scripts/<name>/download`; `GET /api/scripts` list.
 * Run: `POST /api/run {name, env: {VAR: value}}` → starts `sys.executable scripts/<name>.py` in a
   thread (cwd `workdir/scripts/`, env = os.environ + given), max one at a time; `GET /api/run/status`
-  → `{running, exit_code, stdout_tail, stderr_tail, started_at}`; `POST /api/run/stop`.
+  → `{running, exit_code, stdout_tail, stderr_tail, output_tail, errors_tail, started_at}`; `POST /api/run/stop`.
   `POST /api/run/save_output {name}` writes the last stdout to `workdir/outputs/<name>`.
 * Windows: the endpoints `GET /api/win/status`, `POST /api/win/proxy`, `POST /api/win/proxy/restore`
   and `POST /api/win/cert/install` (system proxy and `certutil` CA install, §13.7) were removed on

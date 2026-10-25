@@ -1655,22 +1655,21 @@ def test_record_with_real_mitmdump_then_plan_generate_and_run(gui):
         kinds = {(e["kind"], e.get("name") or e.get("selector")) for e in steps[1]["extractors"]}
         assert ("html_meta", "csrf-token") in kinds and ("html_attr", "#export-link") in kinds
         assert any(e["kind"] == "regex" and "API_TOKEN" in e["pattern"] for e in steps[1]["extractors"])
-        assert plan["env_vars"] == ["REQREC_PASSWORD"] and plan["auth"] is None
+        assert plan["env_vars"] == [] and plan["auth"] is None  # the password is written into the script
 
         # -- 4 コード -> 保存 -> 5 実行 against a RESTARTED site (all tokens change) -----------
         gen = client.post("/api/generate", json={}, headers=H).get_json()
         compile(gen["code"], "gui_recorded.py", "exec")
-        assert PASSWORD not in gen["code"] and "os.environ.get('REQREC_PASSWORD'" in gen["code"]
+        assert repr(PASSWORD) in gen["code"] and "REQREC_PASSWORD" not in gen["code"]
         executable = "\n".join(ln.split("  # ")[0] for ln in gen["code"].splitlines() if not ln.lstrip().startswith("#"))
         for value in (tokens["csrf"], tokens["api_token"], tokens["sig"], tokens["login_token"]):
             assert value not in executable  # recorded tokens survive only in comments (記録時の値)
-        assert [s["env_var"] for s in gen["secrets"]] == ["REQREC_PASSWORD"]
+        assert gen["secrets"] == []  # [試しに実行する] has nothing to ask
         saved = client.post("/api/scripts/save", json={"name": "recorded_site", "code": gen["code"]}, headers=H).get_json()
         assert saved["name"] == "recorded_site.py"
 
         server, base_url = restart_server(server)
-        r = client.post("/api/run", json={"name": "recorded_site.py",
-                                          "env": {"REQREC_PASSWORD": PASSWORD, "NO_PROXY": "127.0.0.1,localhost"}}, headers=H)
+        r = client.post("/api/run", json={"name": "recorded_site.py", "env": {"NO_PROXY": "127.0.0.1,localhost"}}, headers=H)
         assert r.status_code == 200, r.get_json()
         _wait_until(lambda: client.get("/api/run/status").get_json()["running"] is False, 60, "the script to finish")
         status = client.get("/api/run/status").get_json()
@@ -1863,12 +1862,13 @@ def test_record_generate_and_replay_the_factory_scenario(tmp_path):
     try:
         out = tmp_path / "outputs"
         env = {k: v for k, v in os.environ.items() if not k.startswith("REQREC_")}
-        env.update(PYTHONIOENCODING="utf-8", REQREC_OUTPUT_DIR=str(out), REQREC_TXT_PASSWORD=fs.CREDENTIALS[1])
+        env.update(PYTHONIOENCODING="utf-8", REQREC_OUTPUT_DIR=str(out))  # nothing to type: the password is in the script
         proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, encoding="utf-8",
                               errors="replace", env=env, cwd=str(tmp_path), timeout=120)
     finally:
         server.stop()
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[完了] すべての手順が終わりました" in proc.stderr  # progress lines on stderr
     events = [e["event"] for e in fs.read_log(str(log)) if e.get("event") not in ("static", "not_found")]
     assert events == ["login_page", "login_ok", "menu", "search_page", "plant_change", "picker", "search", "page",
                       "excel_export", "news"], events

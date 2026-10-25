@@ -513,11 +513,16 @@ class TestPlan:
         assert by_id["f0010"]["mime"] == "application/json"
         # sorted by started_at then id
         assert [f["id"] for f in j["flows"]] == sorted((f["id"] for f in j["flows"]))
-        assert j["constants"][0]["name"] == "PASSWORD" and j["constants"][0]["value"] is None
-        assert "REQREC_PASSWORD" in j["env_vars"]
+        # default: the recorded password is written into the script, so nothing is read from the environment
+        assert j["constants"] == [] and j["env_vars"] == []
         assert j["auth"] is None
         assert "final_step_index" in j
         assert any("ステップ" in j["summary"] for _ in [0])
+        # opt-in (詳細設定): the password becomes a constant read from REQREC_PASSWORD, its value not sent to the page
+        r = client.post("/api/plan", json={"plan_options": {"redact_secrets": True}}, headers=H)
+        j = r.get_json()
+        assert j["constants"][0]["name"] == "PASSWORD" and j["constants"][0]["value"] is None
+        assert "REQREC_PASSWORD" in j["env_vars"]
         assert j["loops"] == [{"step_index": 4, "var": "page", "count": 3, "numeric_range": [1, 3]}]
         assert j["steps"][0]["func_name"].startswith("step_01_")
         assert isinstance(j["warnings"], list)
@@ -631,12 +636,16 @@ class TestGenerate:
         j = r.get_json()
         compile(j["code"], "<gen>", "exec")
         assert "def step_01_" in j["code"] and "DELAY = 0.5" in j["code"]
-        assert j["secrets"] == [{"name": "PASSWORD", "env_var": "REQREC_PASSWORD", "comment": j["secrets"][0]["comment"]}]
-        assert j["env_vars"] == ["REQREC_PASSWORD"]
+        # default: the recorded password is in the script, nothing has to be typed before running
+        assert j["secrets"] == [] and j["env_vars"] == [] and "'Secr3t!'" in j["code"] and "REQREC_PASSWORD" not in j["code"]
         assert "ステップ" in j["summary"] and isinstance(j["warnings"], list)
         assert j["steps"] == 5 and j["suggested_name"] == "scrape_shop_example_test"
         assert "legacy_tls" not in j["gen_options"]  # removed option: ignored, never echoed back
         assert "VERIFY_TLS" not in j["code"] and "_LegacyTLSAdapter" not in j["code"]
+        r = client.post("/api/generate", json={"plan_options": {"redact_secrets": True}, "gen_options": {"delay": "0.5"}}, headers=H)
+        j = r.get_json()
+        assert j["secrets"] == [{"name": "PASSWORD", "env_var": "REQREC_PASSWORD", "comment": j["secrets"][0]["comment"]}]
+        assert j["env_vars"] == ["REQREC_PASSWORD"] and "Secr3t!" not in j["code"]
         s = client.get("/api/state").get_json()
         assert s["gen_options"]["delay"] == 0.5 and s["secrets"] == j["secrets"]
 
@@ -779,6 +788,28 @@ class TestRun:
     def test_run_status_initial(self, client):
         st = client.get("/api/run/status").get_json()
         assert st == {**st, "running": False, "exit_code": None, "stdout_tail": "", "stderr_tail": ""}
+
+    def test_script_runner_puts_progress_lines_next_to_the_result(self, tmp_path):
+        script = tmp_path / "progress.py"
+        script.write_text(
+            "import sys, time\n"  # pauses: stdout and stderr are separate pipes read by separate threads
+            "print('[1/2] OK  GET /a (200)', file=sys.stderr, flush=True); time.sleep(0.3)\n"
+            "print('result line', flush=True); time.sleep(0.3)\n"
+            "print('[警告] something', file=sys.stderr, flush=True); time.sleep(0.3)\n"
+            "print('[2/2] OK  GET /b (200)', file=sys.stderr, flush=True); time.sleep(0.3)\n"
+            "print('[完了] すべての手順が終わりました（2 手順）', file=sys.stderr, flush=True)\n",
+            encoding="utf-8",
+        )
+        runner = ScriptRunner()
+        runner.start(str(script), {})
+        assert runner.wait(30) == 0
+        st = runner.status()
+        assert st["output_tail"].splitlines() == [
+            "[1/2] OK  GET /a (200)", "result line", "[2/2] OK  GET /b (200)", "[完了] すべての手順が終わりました（2 手順）",
+        ]
+        assert st["errors_tail"] == "[警告] something"
+        assert st["stdout_tail"] == "result line" and runner.last_stdout() == "result line\n"  # saved result: data only
+        assert "[警告] something" in st["stderr_tail"] and "[1/2] OK" in st["stderr_tail"]
 
     def test_script_runner_bounded_output(self, tmp_path):
         script = tmp_path / "many.py"
@@ -1226,8 +1257,8 @@ class TestEasyBuild:
         assert b["flows_total"] == loaded["flows"]
         assert "def step_01_" in b["code"]
         assert path.read_text(encoding="utf-8") == b["code"] if b["code"].endswith("\n") else b["code"] + "\n"
-        # secrets of the fixture (the login password) are reported so the easy screen can ask for them
-        assert any(s["env_var"] == "REQREC_PASSWORD" for s in b["secrets"])
+        # the login password of the fixture is written into the script: the easy screen has nothing to ask
+        assert b["secrets"] == []
         # the saved script is now the "last script" for the run panel
         state = app.extensions["reqrec"]
         assert state.last_script_name == b["name"]
@@ -1412,7 +1443,7 @@ class TestWarningsInJapanese:
         recordings.append(("synthetic", _synthetic_recording()))
         out = []
         for name, rec in recordings:
-            for opts in (PlanOptions(), PlanOptions(max_steps=1)):
+            for opts in (PlanOptions(), PlanOptions(redact_secrets=True), PlanOptions(max_steps=1)):
                 plan = build_plan(rec, opts)
                 generate(plan)  # codegen adds its own notes to plan.warnings
                 out.extend((name, w) for w in plan.warnings)
@@ -1453,10 +1484,10 @@ class TestWarningsInJapanese:
         assert routes_mod.warning_message("何かの注意") == "何かの注意"
 
     def test_easy_build_returns_messages_next_to_warnings(self, client, H, loaded):
-        b = client.post("/api/easy/build", json={}, headers=H).get_json()
+        b = client.post("/api/easy/build", json={"plan_options": {"redact_secrets": True}}, headers=H).get_json()
         assert [d["text"] for d in b["warning_details"]] == b["warnings"]
         assert [d["text"] for d in b["note_details"]] == b["notes"]
-        assert b["note_details"]  # the login password is a credential note
+        assert b["note_details"]  # with redaction on, the login password is a credential note
         assert all(_JAPANESE.search(d["message"]) for d in b["note_details"] + b["warning_details"])
 
     def test_page_script_uses_the_server_messages(self):

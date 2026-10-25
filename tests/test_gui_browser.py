@@ -192,6 +192,9 @@ def test_choose_result_step(advanced):
 def test_generate_save_and_run_panel(advanced, server):
     page = advanced
     _upload_fixture(page)
+    # opt in to 「パスワードなどをスクリプトに書き込まず、実行するときに入力する」 (off by default)
+    page.click('.nav-step[data-panel="steps"]')
+    page.check('input.opt[data-opt="redact_secrets"]')
     page.click("#btn-goto-code")
     expect(page.locator("#panel-code")).to_have_class(re.compile(r"\bactive\b"))
     page.click("#btn-generate")
@@ -256,20 +259,22 @@ def test_easy_builds_from_a_loaded_recording_and_runs_it(page, server):
     expect(page.locator("#easy-done")).to_be_visible()
     expect(page.locator("#easy-done-name")).to_contain_text(".py")
     expect(page.locator("#easy-done-steps")).to_contain_text("5 手順")
-    expect(page.locator("#easy-done-secrets")).to_contain_text("パスワード")  # friendly name, not the env var
-    expect(page.locator("#easy-done-secrets")).not_to_contain_text("REQREC_")
+    expect(page.locator("#easy-done-secrets")).to_be_hidden()  # the password is written into the script
     expect(page.locator("#easy-done-files")).to_be_visible()  # the CSV export is listed as a saved file
     expect(page.locator("#easy-done-files")).to_contain_text("export.csv")
     name = page.locator("#easy-done-name").inner_text().strip()
     assert (server.workdir / "scripts" / name).is_file()
     assert page.locator("#easy-download").get_attribute("href") == f"/api/scripts/{name}/download"
-    # 試しに実行: the secret is asked for; the fixture hosts do not exist, so the run fails with a plain hint
+    # 試しに実行: nothing to type; the fixture hosts do not exist, so the run fails with a plain hint and
+    # the result box says at which step it stopped
     page.click("#easy-test-run")
-    expect(page.locator('#easy-env input[data-env="REQREC_PASSWORD"]')).to_have_attribute("type", "password")
-    page.fill('#easy-env input[data-env="REQREC_PASSWORD"]', "x")
+    expect(page.locator("#easy-env")).to_contain_text("入力するものはありません")
+    assert page.locator("#easy-env input").count() == 0
     page.click("#easy-run-btn")
     expect(page.locator("#easy-run-state")).to_contain_text("エラー", timeout=60000)
     expect(page.locator("#easy-run-hint")).to_be_visible()
+    expect(page.locator("#easy-run-out")).to_contain_text("[1/5] 失敗  GET /login")
+    expect(page.locator("#easy-run-err")).not_to_contain_text("[1/5]")  # progress lines are not errors
     assert page.js_errors == []
 
 

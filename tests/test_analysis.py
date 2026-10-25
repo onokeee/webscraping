@@ -972,7 +972,8 @@ class Site:
         return Recording(flows=list(self.flows), meta=meta or {"source": "test"})
 
     def plan(self, opts=None, **meta):
-        return build_plan(self.recording(**meta), opts)
+        # these tests are about passwords read from the environment: the opt-in ``redact_secrets``
+        return build_plan(self.recording(**meta), opts if opts is not None else PlanOptions(redact_secrets=True))
 
 
 def hdr(step, name):
@@ -1035,7 +1036,7 @@ def test_password_secret_constant_and_literal_username():
     assert form(post_login, "password") == Ref.var("PASSWORD")
     assert "step 2" in pw.comment
     assert any("REQREC_PASSWORD" in w for w in plan.warnings)
-    # --no-redact keeps the literal
+    # without redaction (the default since 2026-10-25) the literal stays
     plan2 = login_site().plan(PlanOptions(redact_secrets=False))
     assert form(plan2.steps[1], "password") == Ref.lit("Secr3tPass!") and plan2.constants == []
 
@@ -1689,7 +1690,7 @@ def test_repeated_user_id_constant_is_not_turned_into_the_password():
     for _ in range(2):
         s.add("POST", "/Login.aspx", [FORM], body=b"txtUserId=tanaka01&txtPassword=tanaka01", resp_body=b"<html></html>")
         s.add("GET", "/Logout.aspx", resp_body=b"<html></html>")
-    plan = s.plan(PlanOptions(detect_loops=False))
+    plan = s.plan(PlanOptions(detect_loops=False, redact_secrets=True))
     consts = {c.name: c for c in plan.constants}
     assert (consts["TXT_USER_ID"].secret, consts["TXT_USER_ID"].env_var) == (False, None)
     assert (consts["TXT_PASSWORD"].secret, consts["TXT_PASSWORD"].env_var) == (True, "REQREC_TXT_PASSWORD")
@@ -1764,6 +1765,7 @@ class OverridesSite:
         return Recording(flows=list(self.flows), meta={"source": "test"})
 
     def plan(self, **opts):
+        opts.setdefault("redact_secrets", True)  # written for the opt-in redaction of passwords
         return build_plan(self.recording(), PlanOptions(**opts))
 
 
@@ -2092,7 +2094,8 @@ class AuthSite:
         return Recording(flows=list(self.flows), meta={"source": "test"})
 
     def plan(self, opts=None):
-        return build_plan(self.recording(), opts)
+        # written for the opt-in redaction of passwords / tokens (``redact_secrets``)
+        return build_plan(self.recording(), opts if opts is not None else PlanOptions(redact_secrets=True))
 
 
 def ids(groups):
@@ -2382,7 +2385,7 @@ class TestPlanNtlm:
         assert plan.constants == []
 
     def test_detect_auth_disabled_keeps_hops_and_never_leaks_tokens(self):
-        plan = self.site().plan(PlanOptions(detect_auth=False, detect_loops=False))
+        plan = self.site().plan(PlanOptions(detect_auth=False, detect_loops=False, redact_secrets=True))
         assert plan.auth is None and plan.final_step_index is None
         assert [st.expected_status for st in plan.steps] == [401, 401, 200, 200, 401, 401, 200]
         hdrs = auth_headers(plan)
@@ -2391,7 +2394,7 @@ class TestPlanNtlm:
             assert ref.kind == "expr" and ref.value.startswith('"NTLM " + AUTHORIZATION')
         assert all(c.secret and c.env_var and c.env_var.startswith("REQREC_AUTHORIZATION") for c in plan.constants)
         assert TYPE1 not in repr(plan.steps) and TYPE3 not in repr(plan.steps)
-        # --no-redact: tokens sent by several steps become plain (non-secret) constants, as any repeated literal
+        # without redaction: tokens sent by several steps become plain (non-secret) constants, as any repeated literal
         plain = self.site().plan(PlanOptions(detect_auth=False, detect_loops=False, redact_secrets=False))
         assert len(auth_headers(plain)) == 4
         assert all(ref.kind == "expr" and ref.value.startswith('"NTLM " + AUTHORIZATION') for _i, _n, ref in auth_headers(plain))
@@ -2698,7 +2701,7 @@ def test_short_and_user_id_equal_passwords_come_from_the_environment(password, t
         ("POST", "/api/confirm", [("Content-Type", "application/json")], json.dumps({"user": "tanaka01", "pin": 4321}).encode(),
          JSON_CT, b'{"ok": true}'),
     )
-    plan = build_plan(rec)
+    plan = build_plan(rec, PlanOptions(redact_secrets=True))
     secrets = {c.env_var: c.value for c in plan.constants if c.secret}
     assert secrets == {"REQREC_TXT_PASSWORD": password, "REQREC_PIN": "42", "REQREC_PIN_2": "4321"}
     # the user id (sent twice) is a plain shared constant, never bound to the password's variable

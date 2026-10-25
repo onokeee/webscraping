@@ -696,7 +696,9 @@ class PlanOptions:
     keep_all: bool = False  # disable every noise filter (host filters still apply)
     collapse_redirects: bool = True
     detect_loops: bool = True
-    redact_secrets: bool = True
+    # write recorded passwords into the script as they are (False, the default) or read them from
+    # environment variables at run time (True: 詳細設定 / ``--redact``)
+    redact_secrets: bool = False
     min_value_length: int = 4  # shortest request value considered for dependency detection
     max_steps: Optional[int] = None  # truncate (with a warning) - safety valve for huge recordings
     # --- manual overrides (GUI / CLI) ---
@@ -4532,7 +4534,9 @@ class _Builder:
         if ref is None and secret_name:
             ref = self._constant(cand, value, flow, step_no, force_secret=True)
         if ref is None:
-            if is_dynamic_looking(value):
+            # a password written into the script as recorded (no redaction) is meant to be replayed
+            # as it is: no "looks dynamic" warning for it
+            if is_dynamic_looking(value) and not looks_like_secret_name(cand.name):
                 label = f"path segment {cand.name}" if cand.location == "path" else cand.name
                 self.warnings.append(
                     f"step {step_no}: value of `{label}` looks dynamic but could not be traced to any earlier "
@@ -5211,7 +5215,7 @@ class _Generator:
             "os", "sys", "time", "unquote", "urlencode", "urljoin", "BeautifulSoup",
             "TIMEOUT", "DELAY", "BASE_HEADERS", "INITIAL_COOKIES",
             "_soup", "_check", "_regex", "_json_path", "_select", "_attr", "_elem_text", "_text", "_charset",
-            "_normalise_charset", "final_resp", "final_results", "final_saved",
+            "_normalise_charset", "final_resp", "final_results", "final_saved", "_STEP", "_step_start", "_step_ok",
             "HttpNegotiateAuth", "HttpNtlmAuth",
         } | _DOWNLOAD_HELPER_NAMES
         for step in self.plan.steps:
@@ -5513,7 +5517,16 @@ class _Generator:
         self.w.blank(2)
         self.w.line('if __name__ == "__main__":')
         with self.w.indent():
-            self.w.line("main()")
+            self.w.line("try:")
+            with self.w.indent():
+                self.w.line("main()")
+            self.w.line("except Exception:")
+            with self.w.indent():
+                self._c("どの手順で止まったかを表示してから、エラーの詳細を出す")
+                self.w.line('if _STEP["no"] and not _STEP["ok"]:')
+                with self.w.indent():
+                    self.w.line('print("[{}/{}] 失敗  {}".format(_STEP["no"], _STEP["total"], _STEP["label"]), file=sys.stderr, flush=True)')
+                self.w.line("raise")
         return self.w.text()
 
     def generate(self) -> str:
@@ -5721,6 +5734,8 @@ class _Generator:
                     w.line(")")
                 w.line("resp.raise_for_status()")
 
+        self._emit_progress_helpers()
+
         if "_regex" in self.helpers_needed:
             w.blank(2)
             w.line("def _regex(text, pattern):")
@@ -5787,6 +5802,39 @@ class _Generator:
             w.blank(2)
             for ln in _DOWNLOAD_HELPERS_SRC.strip("\n").split("\n"):
                 w.line(ln)
+
+    def _emit_progress_helpers(self) -> None:
+        """``_step_start`` / ``_step_ok``: one line per step on stderr while the script runs, so the
+        user sees how far it got ("[2/9] OK  POST /Login.aspx (200)  「メニュー」"); the ``__main__``
+        block adds "[3/9] 失敗 ..." when a step raises.  stderr keeps stdout for the result."""
+        w = self.w
+        w.blank(2)
+        self._c("どこまで進んだかの表示（標準エラー出力に出すので、結果の表示とは混ざらない）")
+        w.line('_STEP = {"no": 0, "total": 0, "label": "", "ok": True}')
+        w.blank(2)
+        w.line("def _step_start(no, total, label):")
+        with w.indent():
+            w.line('"""手順を始める前に呼ぶ（失敗したときに、どの手順で止まったかを表示するため）。"""')
+            w.line("_STEP.update(no=no, total=total, label=label, ok=False)")
+        w.blank(2)
+        w.line("def _step_ok(resp):")
+        with w.indent():
+            w.line('"""手順が成功したら「[2/9] OK ...」と表示する。HTML なら、受け取った画面のタイトルも出す。"""')
+            w.line('_STEP["ok"] = True')
+            w.line('title = ""')
+            w.line('if "html" in resp.headers.get("Content-Type", "").lower():')
+            with w.indent():
+                w.line('m = re.search(r"<title[^>]*>(.*?)</title>", _text(resp), re.I | re.S)')
+                w.line("if m and m.group(1).strip():")
+                with w.indent():
+                    w.line('title = "  「{}」".format(" ".join(m.group(1).split())[:60])')
+            w.line('line = "[{}/{}] OK  {} ({}){}".format(_STEP["no"], _STEP["total"], _STEP["label"], resp.status_code, title)')
+            w.line("print(line, file=sys.stderr, flush=True)")
+
+    def _progress_label(self, step: Step) -> str:
+        """``"POST /Login.aspx"``: the method and the path of the step's URL (no host, no query)."""
+        path = urlsplit(self._url_display(step.url)).path or "/"
+        return f"{str(step.method).upper()} {path}"
 
     def _emit_encoding_helpers(self) -> None:
         """``_charset`` / ``_normalise_charset`` / ``_text`` (DESIGN.md §13.4)."""
@@ -6141,6 +6189,7 @@ class _Generator:
                 w.line("return ctx")
                 return
             sleep = (self.opts.delay or 0) > 0
+            total = len(steps)
             for i, (step, fname) in enumerate(zip(steps, self.func_names)):
                 last = i == len(steps) - 1
                 w.blank()
@@ -6148,7 +6197,10 @@ class _Generator:
                     step, fname,
                     sleep=sleep and (not last or step.loop is not None),
                     final=self.opts.print_final and step is self.final_step,
+                    progress=(i + 1, total),
                 )
+            w.blank()
+            w.line(f'print("[完了] すべての手順が終わりました（{total} 手順）", file=sys.stderr, flush=True)')
             if self.opts.print_final and self.final_step is not None:
                 w.blank()
                 self._emit_final(self.final_step)
@@ -6223,13 +6275,18 @@ class _Generator:
         else:
             self._cl(target + "_save_if_attachment(resp)", "ファイル（Excel / CSV など）として返ってきたら保存する")
 
-    def _emit_main_step(self, step: Step, fname: str, *, sleep: bool, final: bool = False) -> None:
+    def _emit_main_step(self, step: Step, fname: str, *, sleep: bool, final: bool = False,
+                        progress: tuple[int, int] = (0, 0)) -> None:
         w = self.w
         desc = step.comment or f"{str(step.method).upper()} {self._url_display(step.url)}"
+        no, total = progress
+        label = self._progress_label(step)
         if step.loop is None:
             self._c(f"ステップ {step.index}: {desc}")
+            w.line(f"_step_start({no}, {total}, {_lit(label)})")
             w.block(self._call(step, fname))
             w.line("ctx.update(out)")
+            w.line("_step_ok(resp)")
             if final:
                 self._cl("final_resp = resp", "このステップの結果を最後に表示する")
             # a file is saved right after its own request, so a later failing step cannot lose it
@@ -6248,7 +6305,9 @@ class _Generator:
             w.line("out = {}")
         w.line(f"for {var} in {iterable}:")
         with w.indent():
+            w.line(f"_step_start({no}, {total}, {_lit(label + ' ' + var + '=')} + str({var}))")
             w.block(self._call(step, fname))
+            w.line("_step_ok(resp)")
             if step.response_kind == "binary":
                 self._cl("results.append(_save_download(resp))", "ファイルを保存し、保存先のパスを結果に入れる")
             else:
@@ -9225,11 +9284,18 @@ def load_sources(paths: list[str]) -> Recording:
 
 # --------------------------------------------------------------------------- script runner
 
+#: A progress line of a generated script on stderr: ``[2/9] OK  POST /Login.aspx ...``,
+#: ``[3/9] 失敗  ...`` or ``[完了] すべての手順が終わりました（9 手順）`` (codegen ``_emit_progress_helpers``).
+_PROGRESS_LINE_RE = re.compile(r"^\[(?:\d+/\d+|完了)\] ")
+
+
 class ScriptRunner:
     """Run one generated script at a time in a subprocess.
 
     stdout / stderr are read by daemon threads into line ring buffers (``tail``) and, for
     stdout, additionally kept in full up to ``max_output_bytes`` so the user can save the result.
+    ``output_tail`` interleaves stdout with the script's progress lines (stderr) in arrival order -
+    what the run panel shows - and ``errors_tail`` is stderr without them.
     Secrets arrive as environment variables for the child only; they are never stored or logged.
     """
 
@@ -9242,6 +9308,8 @@ class ScriptRunner:
         self._threads: list[threading.Thread] = []
         self._stdout_tail: deque[str] = deque(maxlen=self.max_lines)
         self._stderr_tail: deque[str] = deque(maxlen=self.max_lines)
+        self._output_tail: deque[str] = deque(maxlen=self.max_lines)
+        self._errors_tail: deque[str] = deque(maxlen=self.max_lines)
         self._stdout_full: list[str] = []
         self._stdout_bytes = 0
         self._stdout_truncated = False
@@ -9296,6 +9364,8 @@ class ScriptRunner:
             self._stop_requested = False
             self._stdout_tail = deque(maxlen=self.max_lines)
             self._stderr_tail = deque(maxlen=self.max_lines)
+            self._output_tail = deque(maxlen=self.max_lines)
+            self._errors_tail = deque(maxlen=self.max_lines)
             self._stdout_full = []
             self._stdout_bytes = 0
             self._stdout_truncated = False
@@ -9312,7 +9382,9 @@ class ScriptRunner:
             for line in iter(stream.readline, ""):
                 if not line:
                     break
-                self._stdout_tail.append(line.rstrip("\r\n"))
+                text = line.rstrip("\r\n")
+                self._stdout_tail.append(text)
+                self._output_tail.append(text)
                 if not self._stdout_truncated:
                     size = len(line.encode("utf-8", "replace"))
                     if self._stdout_bytes + size > self.max_output_bytes:
@@ -9330,7 +9402,12 @@ class ScriptRunner:
             for line in iter(stream.readline, ""):
                 if not line:
                     break
-                self._stderr_tail.append(line.rstrip("\r\n"))
+                text = line.rstrip("\r\n")
+                self._stderr_tail.append(text)
+                if _PROGRESS_LINE_RE.match(text):
+                    self._output_tail.append(text)
+                else:
+                    self._errors_tail.append(text)
         except (ValueError, OSError):
             pass
         finally:
@@ -9383,6 +9460,8 @@ class ScriptRunner:
                 "exit_code": None if running else self.exit_code,
                 "stdout_tail": "\n".join(self._stdout_tail),
                 "stderr_tail": "\n".join(self._stderr_tail),
+                "output_tail": "\n".join(self._output_tail),
+                "errors_tail": "\n".join(self._errors_tail),
                 "started_at": self.started_at,
                 "finished_at": None if running else self.finished_at,
                 "name": self.name,
@@ -11916,7 +11995,7 @@ select.w-full { width: 100%; max-width: 100%; }
         <label class="check"><input type="checkbox" class="opt" data-opt="keep_all"><span>すべて残す (自動のノイズ除外を無効にする)</span></label>
         <label class="check"><input type="checkbox" class="opt" data-opt="collapse_redirects" checked><span>リダイレクトを 1 つのステップに統合する</span></label>
         <label class="check"><input type="checkbox" class="opt" data-opt="detect_loops" checked><span>ループ (ページ送りなど) を検出してまとめる</span></label>
-        <label class="check"><input type="checkbox" class="opt" data-opt="redact_secrets" checked><span>パスワードなどの秘密情報を環境変数から読む (スクリプトに書き込まない)</span></label>
+        <label class="check"><input type="checkbox" class="opt" data-opt="redact_secrets"><span>パスワードなどをスクリプトに書き込まず、実行するときに入力する (環境変数から読む)</span></label>
         <label class="check"><input type="checkbox" class="opt" data-opt="detect_auth" checked><span>HTTP 認証 (Windows 統合認証 NTLM / Basic / Digest) のやり取りを検出して統合する</span></label>
       </div>
       <div class="form-grid compact">
@@ -12851,7 +12930,9 @@ select.w-full { width: 100%; max-width: 100%; }
     function renderEnvInputsInto(container, idPrefix = 'env-', friendly = false) {
       clear(container);
       if (!S.secrets.length) {
-        container.appendChild(el('p', { class: 'hint', text: '生成したスクリプトに秘密情報がなければ入力は不要です。' }));
+        container.appendChild(el('p', { class: 'hint', text: friendly
+          ? '入力するものはありません。[▶ 実行] を押すだけで動きます。'
+          : '生成したスクリプトに秘密情報がなければ入力は不要です。' }));
         return;
       }
       S.secrets.forEach((s) => {
@@ -12880,8 +12961,8 @@ select.w-full { width: 100%; max-width: 100%; }
       const running = !!st.running;
       btnRun.disabled = running;
       btnStop.disabled = !running;
-      outEl.textContent = st.stdout_tail || '';
-      errEl.textContent = st.stderr_tail || '';
+      outEl.textContent = (st.output_tail ?? st.stdout_tail) || '';  // result + progress lines ([2/9] OK ...)
+      errEl.textContent = (st.errors_tail ?? st.stderr_tail) || '';
       if (running) { stateEl.textContent = `実行中… (${st.name || ''})`; stateEl.className = 'run-state running'; }
       else if (st.exit_code === null || st.exit_code === undefined) { stateEl.textContent = '待機中'; stateEl.className = 'run-state'; }
       else if (st.exit_code === 0) { stateEl.textContent = `正常終了 (${st.name || ''})`; stateEl.className = 'run-state ok'; }
@@ -13314,10 +13395,11 @@ select.w-full { width: 100%; max-width: 100%; }
       $('#easy-run-stop').disabled = !running;
       $('#easy-save-output').disabled = running || !st.started_at;
       const out = $('#easy-run-out');
-      out.textContent = st.stdout_tail || (running ? '(実行中… 出力を待っています)' : '');
+      out.textContent = (st.output_tail ?? st.stdout_tail) || (running ? '(実行中… 出力を待っています)' : '');
       if (running) out.scrollTop = out.scrollHeight;
-      $('#easy-run-err').textContent = st.stderr_tail || '';
-      $('#easy-run-err-wrap').hidden = !st.stderr_tail;
+      const errors = (st.errors_tail ?? st.stderr_tail) || '';  // stderr without the progress lines
+      $('#easy-run-err').textContent = errors;
+      $('#easy-run-err-wrap').hidden = !errors;
       const s = $('#easy-run-state');
       const hint = $('#easy-run-hint');
       hint.hidden = true;
@@ -13694,8 +13776,8 @@ def add_filter_options(parser: argparse.ArgumentParser) -> None:
         help="ステップ数の上限（巨大な記録の安全弁。超えた分は警告付きで切り捨て）",
     )
     group.add_argument(
-        "--no-redact", action="store_true",
-        help="パスワード等を環境変数に置き換えず、記録した値をそのままコードに埋め込む（取り扱い注意）",
+        "--redact", action="store_true",
+        help="パスワード等をスクリプトに書き込まず、実行時に環境変数から読む（既定は記録した値をそのまま書き込む）",
     )
     group.add_argument(
         "--no-detect-auth", action="store_true",
@@ -13745,7 +13827,7 @@ def plan_options_from_args(args: argparse.Namespace) -> PlanOptions:
         keep_all=bool(getattr(args, "keep_all", False)),
         collapse_redirects=not getattr(args, "no_collapse_redirects", False),
         detect_loops=not getattr(args, "no_loops", False),
-        redact_secrets=not getattr(args, "no_redact", False),
+        redact_secrets=bool(getattr(args, "redact", False)),
         min_value_length=getattr(args, "min_value_length", None) or _PLAN_DEFAULTS.min_value_length,
         max_steps=getattr(args, "max_steps", None),
         exclude_flow_ids=split_flow_ids(getattr(args, "exclude_flow", None)),
@@ -13870,7 +13952,7 @@ _EPILOG = """\
   1. 記録する   reqrec gui                           （記録用ブラウザで操作。IE の F12 で保存した HAR も可）
   2. 確認する   reqrec inspect rec.json
   3. 生成する   reqrec generate rec.json -o scrape.py
-  4. 実行する   REQREC_PASSWORD=... python scrape.py
+  4. 実行する   python scrape.py
 
 別タブで開いた画面の HAR は複数指定して結合できます:  reqrec generate tab1.har tab2.har -o scrape.py
 手動で取捨選択:  reqrec generate rec.json -o scrape.py --exclude-flow f0012 --final-step 3
