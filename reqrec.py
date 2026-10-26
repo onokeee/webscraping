@@ -2,25 +2,25 @@
 
 Pipeline:  record (GUI) / import  ->  Recording  ->  build_plan  ->  Plan  ->  generate  ->  script.py
 
-Target: legacy intranet sites used in Edge's IE mode, over plain ``http://``.  Recording is done
-only through the GUI's own IE-engine recording browser (no Windows proxy change, no certificate).
+Target: legacy LAN sites used in Edge's IE mode, over plain ``http://``, from a Windows PC with
+Python installed.  Recording is done through the GUI's own IE-engine recording browser, which is
+this file running in python.exe (no exe of reqrec's own, no Windows setting, no certificate).
 
 The whole application is this one file (DESIGN.md "Module layout"):
 
-* ``reqrec ...`` / ``python -m reqrec ...`` - the command line (:func:`main`): ``import`` /
-  ``inspect`` / ``generate`` / ``gui`` / ``browser build|status``;
-* ``mitmdump -s reqrec.py`` - the recording proxy loads this very file as its addon (:data:`addons`,
-  :data:`ADDON_PATH`);
+* ``python reqrec.py`` - starts the GUI on this PC and opens it in the browser (:func:`main` without
+  arguments); ``python -m flask --app reqrec run`` uses :func:`create_app` the same way;
+* ``python reqrec.py <command>`` - the command line: ``import`` / ``inspect`` / ``generate`` / ``gui`` /
+  ``record`` (the recording browser; the GUI starts it as a child process);
 * ``import reqrec`` - the library (``load_recording``, ``build_plan``, ``generate``, ``create_app`` ...).
 
-Sections, in this order, each one a former module (search for ``# ===== former reqrec/``): core,
-importers, analysis, codegen, recorder, iehost (followed by the C# source ``RECBROWSER_CS``), gui
-(followed by the page ``GUI_HTML``), cli and the entry point (:func:`main`).  Every top-level name is
-defined once; names that clashed between former modules carry a section prefix, and the recording
-browser keeps its former module as the namespace class ``iehost`` (``iehost.launch(...)``).
+Sections, in this order (search for ``# ===== ``): core, importers, analysis, codegen, recorder (the
+recording proxy and the IE-engine window), gui (followed by the page ``GUI_HTML``), cli and the entry
+point (:func:`main`).  Every top-level name is defined once; names that clashed between former
+modules carry a section prefix.
 
 Importing has no side effects (nothing is started, written or read); bs4, winreg and ctypes are
-imported only where they are used, so the proxy (``mitmdump -s reqrec.py``) starts quickly.
+imported only where they are used.
 """
 
 from __future__ import annotations
@@ -35,7 +35,8 @@ import dataclasses
 import errno
 import hashlib
 import hmac
-import importlib.util
+import http.client
+import http.server
 import io
 import ipaddress
 import json
@@ -46,8 +47,6 @@ import os
 import re
 import secrets
 import shlex
-import shutil
-import signal
 import socket
 import struct
 import subprocess
@@ -56,6 +55,7 @@ import tempfile
 import threading
 import time
 import tokenize
+import traceback
 import types
 import typing
 import unicodedata
@@ -88,10 +88,8 @@ from flask import (
     render_template,
     send_from_directory,
 )
-# mitmdump registers this module itself as an addon (``mitmdump -s reqrec.py``) and calls every
-# top-level attribute named like one of its event hooks (``request``, ``response``, ``error``,
-# ``load``, ``running``, ``done`` ...), so no top-level name may be a hook name: Flask's ``request``
-# proxy is bound as ``flask_request`` (tests/test_recorder.py checks the names against mitmproxy's hooks).
+# Flask's ``request`` / ``session`` proxies are bound as ``flask_request`` / ``flask_session`` (the
+# analysis uses ``request`` for recorded requests).
 from flask import request as flask_request
 from flask import session as flask_session
 from jinja2 import DictLoader
@@ -116,8 +114,7 @@ __all__ = [
     "BodyKind", "ResponseKind", "to_plain", "NOT_WINDOWS_MESSAGE", "is_windows",
     # importers
     "load_recording", "load_recordings", "load_har", "recording_from_har", "HAR_EXTENSIONS",
-    "parse_har_timestamp", "flow_from_mitm",
-    "decode_header_fields", "infer_resource_type",
+    "parse_har_timestamp", "decode_header_fields", "infer_resource_type",
     # analysis
     "TRACKER_HOSTS", "STATIC_EXTENSIONS", "STATIC_RESOURCE_TYPES", "DROP_REQUEST_HEADERS",
     "SESSION_AUTH_SCHEMES", "AUTH_FAMILIES", "classify_noise", "filter_flows", "collapse_redirects",
@@ -135,11 +132,10 @@ __all__ = [
     # codegen
     "generate", "CodegenError", "MAX_INLINE_BODY",
     # recorder
-    "ReqRecAddon", "addons", "write_recording_atomic", "OPT_OUT", "DEFAULT_OUT",
-    "ADDON_PATH", "MITMDUMP_PYTHON_STUB", "RECORD_LISTEN_HOST", "mitmproxy_available", "mitmdump_launcher",
-    "build_command", "RecorderError", "RecorderManager", "count_flows_in_file",
-    # iehost
-    "iehost", "IEHostError", "BrowserProcess", "RECBROWSER_CS",
+    "BROWSER_TITLE", "RECORD_LISTEN_HOST", "SCRIPT_PATH", "EMULATION_MODES", "RECORD_EXIT_OK", "RECORD_EXIT_START",
+    "RECORD_EXIT_USAGE", "RECORD_EXIT_TIMEOUT", "RECORD_EXIT_PROXY", "RECORD_READY_TIMEOUT", "RecorderError",
+    "write_recording_atomic", "RecordingStore", "RecordingProxy", "recorder_availability", "emulation_user_agent",
+    "RecBrowserApp", "run_recorder", "recorder_command", "count_flows_in_file", "RecorderManager",
     # gui
     "open_folder", "validate_url", "ApiError", "AppState", "ScriptRunner", "SUBDIRS", "safe_name",
     "plan_options_from_json", "gen_options_from_json", "options_to_plain", "load_sources", "exclude_netlocs",
@@ -152,27 +148,6 @@ __all__ = [
     "split_flow_ids", "cli_normalise_flow_id", "load_inputs", "resolve_overrides", "build_inspect_report",
     "format_inspect_report", "format_plan_summary", "run_script",
 ]
-
-
-def _register_script_module() -> None:
-    """Put this module into ``sys.modules`` when it is executed without being registered there.
-
-    ``mitmdump -s reqrec.py`` (mitmproxy's script loader) executes this file as
-    ``__mitmproxy_script__.reqrec`` without registering it, but ``dataclasses`` looks the defining
-    module up in ``sys.modules`` (the annotations are strings, see the ``__future__`` import) and
-    fails without it.  The module object is the one holding this namespace, registered under its own
-    name exactly as a normal import does.
-    """
-    import gc
-
-    namespace = globals()
-    module = next((m for m in gc.get_referrers(namespace) if isinstance(m, types.ModuleType) and m.__dict__ is namespace), None)
-    if module is not None:
-        sys.modules[__name__] = module
-
-
-if __name__ not in sys.modules:
-    _register_script_module()
 
 
 # ===== former reqrec/core.py: data model + shared helpers (stdlib only) =====
@@ -1069,7 +1044,7 @@ def download_filename(content_disposition: Optional[str]) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- platform
-# (formerly in reqrec/winsupport.py; used by the iehost section)
+# (formerly in reqrec/winsupport.py; used by the recorder section)
 
 NOT_WINDOWS_MESSAGE = "Windows 以外では使えません"
 
@@ -1086,8 +1061,7 @@ def is_windows() -> bool:
 #
 # * dispatcher (former ``reqrec/importers/__init__.py``) - ``load_recording`` / ``load_recordings``;
 # * HAR importer (former ``reqrec/importers/har.py``) - ``load_har`` / ``recording_from_har``;
-# * mitmproxy -> Flow conversion (former ``reqrec/importers/mitm.py``) - ``flow_from_mitm`` (used by
-#   the recorder addon).
+# * header helpers shared with the recording proxy - ``infer_resource_type`` / ``decode_header_fields``.
 
 
 # ===== former reqrec/importers/__init__.py: dispatcher (load_recording / load_recordings) =====
@@ -1658,16 +1632,12 @@ def _trim_fraction(s: str) -> str:
     return f"{head}.{digits[:6] or '0'}{rest}"
 
 
-# ===== former reqrec/importers/mitm.py: mitmproxy HTTPFlow -> Flow conversion (recorder addon) =====
-# mitmproxy -> Flow conversion.  Contract: DESIGN.md §2.
-#
-# ``flow_from_mitm`` is used by the live recorder addon (recorder section).  It only touches public
-# attributes of ``mitmproxy.http.HTTPFlow`` so it also works on duck-typed objects and does not
-# itself need mitmproxy importable.
+# ===== header helpers (shared by the importers and the recording proxy) =====
+# ``infer_resource_type`` (HAR-style resource type from the browser's ``Sec-Fetch-Dest`` header; the
+# IE engine never sends it, so its flows are classified by URL extension and MIME type instead),
+# ``decode_header_fields`` and ``_text`` (bytes -> str that never raises).
 
-# ``Sec-Fetch-Dest`` request header -> HAR-style resource type, used when present (Chromium / Firefox
-# HARs).  The IE-engine recording browser never sends it: its flows get no resource type and are
-# classified by URL extension and MIME type instead.
+# ``Sec-Fetch-Dest`` request header -> HAR-style resource type.
 _SEC_FETCH_DEST_TO_RESOURCE_TYPE = {
     "document": "document",
     "iframe": "document",
@@ -1693,100 +1663,6 @@ _SEC_FETCH_DEST_TO_RESOURCE_TYPE = {
 }
 
 
-def _timestamp(mflow: Any) -> Optional[float]:
-    req = getattr(mflow, "request", None)
-    ts = getattr(req, "timestamp_start", None)
-    if ts is None:
-        return None
-    try:
-        return float(ts)
-    except (TypeError, ValueError):
-        return None
-
-
-# --------------------------------------------------------------------------- conversion
-
-def flow_from_mitm(flow: Any, flow_id: str) -> Flow:
-    """Convert a ``mitmproxy.http.HTTPFlow`` into a :class:`Flow` with the given id.
-
-    * URL: ``request.pretty_url`` (host from the Host header / SNI rather than the IP).
-    * Headers: ``headers.fields`` byte pairs decoded tolerantly (UTF-8, falling back to latin-1),
-      kept exactly as captured.
-    * Bodies: ``.content`` (Content-Encoding removed); ``.raw_content`` when decoding fails.
-    * ``started_at``: ``request.timestamp_start``; ``resource_type`` inferred from ``Sec-Fetch-Dest``.
-
-    Raises ``TypeError`` for flows without an HTTP request (TCP / UDP / DNS flows).
-    """
-    request = getattr(flow, "request", None)
-    if request is None or not hasattr(request, "method"):
-        raise TypeError(f"not an HTTP flow: {type(flow).__name__}")
-
-    req_headers = decode_header_fields(_header_fields(request))
-    req_body = _message_body(request)
-    if req_body == b"" and not _has_header(req_headers, "content-type"):
-        # mitmproxy reports b"" for a body-less GET; HAR has no postData -> None.  Normalise so
-        # both importers agree ("no body"); an explicitly typed empty body (POST with
-        # Content-Type) is kept as b"".
-        req_body = None
-    recorded_request = RecordedRequest(
-        method=_text(getattr(request, "method", "GET")).upper() or "GET",
-        url=_request_url(request),
-        headers=req_headers,
-        body=req_body,
-    )
-
-    recorded_response: Optional[RecordedResponse] = None
-    response = getattr(flow, "response", None)
-    if response is not None:
-        try:
-            status = int(getattr(response, "status_code", 0) or 0)
-        except (TypeError, ValueError):
-            status = 0
-        if status > 0:
-            recorded_response = RecordedResponse(
-                status=status,
-                headers=decode_header_fields(_header_fields(response)),
-                body=_message_body(response),
-            )
-
-    return Flow(
-        id=flow_id,
-        request=recorded_request,
-        response=recorded_response,
-        started_at=_timestamp(flow),
-        page_ref=None,
-        resource_type=infer_resource_type(req_headers),
-    )
-
-
-def _request_url(request: Any) -> str:
-    for attr in ("pretty_url", "url"):
-        try:
-            url = getattr(request, attr)
-        except Exception:  # pragma: no cover - mitmproxy raises on malformed authority
-            continue
-        if url:
-            return _text(url)
-    # Last resort: assemble from parts.
-    scheme = _text(getattr(request, "scheme", "http") or "http")
-    host = _text(getattr(request, "pretty_host", "") or getattr(request, "host", "") or "")
-    path = _text(getattr(request, "path", "/") or "/")
-    return f"{scheme}://{host}{path}"
-
-
-def _header_fields(message: Any) -> Iterable[tuple[Any, Any]]:
-    headers = getattr(message, "headers", None)
-    if headers is None:
-        return ()
-    fields = getattr(headers, "fields", None)
-    if fields is not None:
-        return fields
-    try:
-        return list(headers.items(multi=True))  # mitmproxy Headers without .fields (very old versions)
-    except TypeError:
-        return list(headers.items())
-
-
 def decode_header_fields(fields: Iterable[tuple[Any, Any]]) -> Headers:
     """``((b"name", b"value"), ...)`` -> ``[("name", "value"), ...]``; bytes that are not UTF-8 are
     decoded as latin-1 so nothing ever raises.  ``str`` pairs pass through."""
@@ -1798,11 +1674,6 @@ def decode_header_fields(fields: Iterable[tuple[Any, Any]]) -> Headers:
             continue
         out.append((_text(name), _text(value)))
     return out
-
-
-def _has_header(headers: Headers, name: str) -> bool:
-    lname = name.lower()
-    return any(k.lower() == lname for k, _ in headers)
 
 
 def _text(value: Any) -> str:
@@ -1817,31 +1688,6 @@ def _text(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
-
-
-def _message_body(message: Any) -> Optional[bytes]:
-    """Decoded body (``.content``), falling back to ``.raw_content`` when Content-Encoding decoding
-    fails (corrupt gzip, unknown ``br`` without brotli, ...)."""
-    try:
-        content = message.content
-    except Exception:
-        content = None
-        try:
-            content = message.raw_content
-        except Exception:  # pragma: no cover - defensive
-            content = None
-    if content is None:
-        # mitmproxy uses None for "no body" / "body not captured"; a response that was streamed
-        # without buffering also lands here.
-        raw = getattr(message, "raw_content", None)
-        if raw is None:
-            return None
-        content = raw
-    if isinstance(content, (bytearray, memoryview)):
-        content = bytes(content)
-    if not isinstance(content, bytes):
-        content = _text(content).encode("utf-8", "replace")
-    return content
 
 
 def infer_resource_type(headers: Headers) -> Optional[str]:
@@ -4488,7 +4334,8 @@ class _Builder:
         if unquote(sample) == value:
             return Ref.expr(f"unquote({var})")
         if sample == value.replace("/", "\\/"):
-            return Ref.expr(f"{var}.replace({'\\/'!r}, '/')")
+            escaped_slash = repr("\\/")  # outside the f-string: Python < 3.12 forbids backslashes in its expressions
+            return Ref.expr(f"{var}.replace({escaped_slash}, '/')")
         return Ref.var(var)
 
     def _extractor_key(self, ext: Extractor) -> tuple:
@@ -5603,7 +5450,7 @@ class _Generator:
         if not isinstance(src, dict):
             src = {"source": src} if src else {}
         kind = str(src.get("source") or "不明")
-        label = {"har": "HAR ファイル", "mitmproxy": "mitmproxy 録画"}.get(kind.lower(), kind)
+        label = {"har": "HAR ファイル", "recbrowser": "記録用ブラウザ", "mitmproxy": "mitmproxy 録画"}.get(kind.lower(), kind)
         parts = [label]
         if src.get("file"):
             parts.append(f"({src['file']})")
@@ -6719,50 +6566,74 @@ def generate(plan: Plan, opts: Optional[GenOptions] = None) -> str:
     return _Generator(plan, opts or GenOptions()).generate()
 
 
-# ===== former reqrec/recorder.py: proxy recording (mitmproxy addon, mitmdump launcher, GUI manager) =====
-# Live recording through a mitmproxy-based proxy.  Contract: DESIGN.md §3 and §13.6.
+# ===== recorder: recording browser (IE engine in this python.exe) + recording proxy (standard library) =====
+# Recording (Windows).  ``python reqrec.py record --out rec.json`` - the GUI starts exactly this as a
+# child process for every recording - opens the recording browser and records every plain
+# ``http://`` request it makes.  No exe of reqrec's own is involved: the process is python.exe
+# running this file, with the standard library only (``http.server`` / ``http.client`` / ``ctypes``).
 #
-# reqrec.py itself is the addon script mitmdump loads (``mitmdump -s reqrec.py --set
-# reqrec_out=rec.json``, see :data:`ADDON_PATH`); it has no imports of its own to resolve, so script
-# mode needs no special handling beyond ``_register_script_module`` at the top.  Importing reqrec never
-# requires mitmproxy itself (the addon only needs it at run time).
+# * **recording proxy** - threads of the same process, listening on ``127.0.0.1`` on a free port.
+#   Each request goes to the site as it is (one connection to the site per browser connection, so
+#   Windows authentication - NTLM / Negotiate - keeps working), the response goes back unchanged
+#   and both are stored as a :class:`Flow`.  ``https://`` is tunnelled untouched (``CONNECT``) and
+#   is not recorded: no certificate is needed.
+# * **recording browser** - the Internet Explorer engine (``WebBrowser`` control = Trident / MSHTML,
+#   the engine of Edge's IE mode) hosted with ``ctypes`` in a window of this process: toolbar, tabs,
+#   status bar.  Popups (``window.open``, ``target=_blank``, forms posted to a new window) open as tabs
+#   of the same window with opener, window name, session and POST body intact (``NewWindow3`` is
+#   answered with a fresh control); ``window.close()`` reaches the site's ``IOleCommandTarget`` as
+#   ``OLECMDID_CLOSE``; ``showModalDialog`` / ``showModelessDialog`` are the engine's own windows.
+# * **this process only** - the proxy is set with ``InternetSetOptionA(NULL, INTERNET_OPTION_PROXY)``
+#   (ANSI; plus ``UrlMkSetSessionOption``) before the first control exists, with an EMPTY bypass list
+#   (``<local>`` would exclude dotless intranet names such as ``http://kanri/``).  Nothing in Windows
+#   changes: no Internet Options, no registry value, no certificate, no other process.  Cookies the
+#   browser receives are not persisted and the session starts empty, so the login itself is recorded.
+# * **表示モード** without the registry: ``ie8`` / ``ie11`` / ``ie11_force`` add an ``X-UA-Compatible``
+#   header to the HTML the browser receives (the recording keeps the site's own response) and set the
+#   matching User-Agent for this process.  A popup opened by ``window.open(url)`` from a page in IE9 or
+#   later mode would come up in quirks mode (measured on Windows 11 with this engine); navigating the
+#   fresh control to ``about:blank`` before the engine gets it avoids that.
 #
-# Sections (each one a former module, in dependency order):
+# The process's bitness is the installed Python's: legacy pages whose 32-bit ActiveX controls must
+# load (as in Edge's 32-bit IE mode) need a 32-bit Python.
 #
-# * addon (former ``reqrec/recorder/addon.py``) - the mitmproxy addon ``ReqRecAddon`` / ``addons``;
-# * command line (former ``reqrec/recorder/run.py``) - ``build_command``: the ``mitmdump`` argument
-#   vector with this file as its addon;
-# * manager (former ``reqrec/recorder/manager.py``) - ``RecorderManager``: start / stop / watch a
-#   recording from the GUI (the only way reqrec records: the GUI's recording browser).
+# Output: the recording JSON (``--out``) is rewritten atomically about every half second while
+# recording and once more at the end, so even a killed process leaves a valid file.  stdout carries
+# ``READY <port>`` once the proxy listens and the window is open (the GUI waits for it); errors go to
+# stderr in Japanese.  ``--control stdin``: a ``stop`` line (or the end of stdin) closes the browser
+# like its own [記録をおわる] button.  Exit codes: :data:`RECORD_EXIT_OK` ... :data:`RECORD_EXIT_PROXY`.
+#
+# Sections: constants and the store; the proxy; availability and process helpers; the Win32 / COM
+# declarations (built on first use, so importing reqrec stays free of ctypes on every OS); the browser
+# window; ``run_recorder`` (the child process); :class:`RecorderManager` (the GUI's side).
+
+#: Window title of the recording browser (「 — 記録中」 is appended).
+BROWSER_TITLE = "reqrec 記録用ブラウザ"
+#: The recording proxy listens on this PC only.
+RECORD_LISTEN_HOST = "127.0.0.1"
+#: This file: the GUI starts ``python <SCRIPT_PATH> record ...`` for every recording.
+SCRIPT_PATH = os.path.abspath(__file__)
+#: 表示モード -> ``X-UA-Compatible`` value added to the HTML the recording browser receives.  ``None``
+#: (既定) = the engine's own default: IE7 mode for pages with a DOCTYPE, as Edge's IE mode shows
+#: Compatibility-View intranet sites.  ``Emulate...`` follows the page's DOCTYPE; ``IE=edge`` forces IE11.
+EMULATION_MODES: dict[str, Optional[str]] = {
+    "default": None,
+    "ie8": "IE=EmulateIE8",
+    "ie11": "IE=EmulateIE11",
+    "ie11_force": "IE=edge",
+}
+#: Exit codes of ``reqrec record``.
+RECORD_EXIT_OK = 0         # the window was closed (or [記録をおわる] / ``stop``)
+RECORD_EXIT_START = 1      # could not start: not Windows, no IE engine, the window could not be made
+RECORD_EXIT_USAGE = 2      # command line error
+RECORD_EXIT_TIMEOUT = 3    # ``--selftest`` guard timeout
+RECORD_EXIT_PROXY = 4      # the per-process proxy could not be set: nothing would be recorded
+#: Seconds the GUI waits for ``READY`` (a first start imports Flask and loads the IE engine).
+RECORD_READY_TIMEOUT = 30.0
 
 
-# ===== former reqrec/recorder/addon.py: the mitmproxy addon (ReqRecAddon) =====
-# mitmproxy addon that writes a reqrec Recording.  Run by the GUI's recorder as
-# ``mitmdump -s reqrec.py --set reqrec_out=rec.json``.  Contract: DESIGN.md §3.
-#
-# Options (declared in :meth:`ReqRecAddon.load`):
-#
-# ``reqrec_out``
-#     Path of the recording JSON file.  Rewritten **atomically after every response** (temp file in
-#     the same directory + ``os.replace``) so a killed session still leaves a valid file.
-#
-# Every HTTP flow is recorded (the recording browser is the proxy's only client; https:// is tunnelled
-# untouched by ``HTTPS_PASSTHROUGH_ARGS``).  The host filter ``reqrec_hosts`` was removed on 2026-10-25.
-#
-# The addon works both when reqrec is imported normally and when mitmproxy exec's reqrec.py directly
-# (script mode).
-
-try:  # mitmproxy is only needed for type checks / option access; the addon stays importable without it
-    from mitmproxy import ctx as _mitm_ctx
-    from mitmproxy import http as _mitm_http
-except ImportError:  # pragma: no cover - exercised only when mitmproxy is absent
-    _mitm_ctx = None
-    _mitm_http = None
-
-log = logging.getLogger("reqrec.recorder")
-
-OPT_OUT = "reqrec_out"
-DEFAULT_OUT = "reqrec_recording.json"
+class RecorderError(RuntimeError):
+    """Raised with a Japanese, user-facing message when a recording cannot start / stop / load."""
 
 
 def write_recording_atomic(recording: Recording, path: str) -> str:
@@ -6789,273 +6660,2306 @@ def write_recording_atomic(recording: Recording, path: str) -> str:
     return path
 
 
-class ReqRecAddon:
-    """Collect completed HTTP flows and keep ``reqrec_out`` up to date on disk.
+# --------------------------------------------------------------------------- recording store
 
-    The addon can also be used programmatically without mitmproxy's option machinery::
+class RecordingStore:
+    """The flows the proxy recorded, kept on disk at ``out``.
 
-        addon = ReqRecAddon(out="rec.json")
-        addon.response(flow)      # flow: mitmproxy.http.HTTPFlow
-        addon.done()
-
-    The option set through mitmproxy (``--set reqrec_out=...``) takes precedence once ``configure`` runs.
+    ``start()`` writes an empty, valid file at once; every :meth:`add` schedules a rewrite (a writer
+    thread batches the flows of about half a second; the pause grows with the file so a large
+    recording never keeps the process busy); :meth:`close` writes the final file.  Flows are ordered
+    by the time their request started and numbered ``f0001``.. (the GUI counts them in the file).
     """
 
-    def __init__(self, out: Optional[str] = None) -> None:
-        # The constructor argument is the baseline; the mitmproxy option set to a non-default value
-        # overrides it in ``configure`` (and falls back to it when reset to the default).
-        self._init_out: Optional[str] = out
-        self.out: Optional[str] = out
-        self.started_at: str = now_iso()
-        self.errors: int = 0  # flows recorded through the error hook (no response)
-        self.flush_count: int = 0
+    def __init__(self, out: str, meta: Optional[dict[str, Any]] = None, flush_interval: float = 0.5) -> None:
+        self.out = os.path.abspath(out)
+        self.meta = dict(meta or {})
+        self.started_at = now_iso()
+        self.flush_interval = float(flush_interval)
+        self.errors = 0
         self.last_flush_error: Optional[str] = None
         self._flows: list[Flow] = []
-        self._seen: set[Any] = set()  # mitmproxy flow ids already recorded (response/error both fire)
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._dirty = threading.Event()
+        self._closed = False
+        self._pause = self.flush_interval
+        self._thread: Optional[threading.Thread] = None
 
-    # ------------------------------------------------------------------ mitmproxy option hooks
+    def start(self) -> "RecordingStore":
+        self.flush()
+        self._thread = threading.Thread(target=self._writer, name="reqrec-recording-writer", daemon=True)
+        self._thread.start()
+        return self
 
-    def load(self, loader: Any) -> None:
-        """Declare the ``reqrec_out`` option."""
-        loader.add_option(
-            name=OPT_OUT,
-            typespec=str,
-            default=DEFAULT_OUT,
-            help="reqrec: path of the recording JSON file (rewritten atomically after every response)",
-        )
-
-    def configure(self, updated: Iterable[str]) -> None:
-        """Pick up option changes (mitmproxy calls this at start-up with every option name)."""
-        updated = set(updated)
-        if OPT_OUT in updated:
-            value = self._option(OPT_OUT)
-            if isinstance(value, str) and value.strip() and value.strip() != DEFAULT_OUT:
-                self.out = value.strip()
-            else:
-                self.out = self._init_out  # option at its default -> constructor value / DEFAULT_OUT
-            log.info("[reqrec] recording -> %s", self.output_path)
-
-    def _option(self, name: str) -> Any:
-        """Read a mitmproxy option, or ``None`` when no master is running (plain Python use)."""
-        if _mitm_ctx is None:
-            return None
-        try:
-            options = _mitm_ctx.options
-        except AttributeError:
-            return None
-        try:
-            return getattr(options, name)
-        except (AttributeError, KeyError):
-            return None
-
-    @property
-    def output_path(self) -> str:
-        """Absolute output path: explicit ``out`` > mitmproxy option > ``DEFAULT_OUT``."""
-        out = self.out
-        if not out:
-            value = self._option(OPT_OUT)
-            out = value if isinstance(value, str) and value.strip() else DEFAULT_OUT
-        return os.path.abspath(out)
-
-    # ------------------------------------------------------------------ mitmproxy event hooks
-
-    def response(self, flow: Any) -> None:
-        """A full response has arrived: record the flow and flush the file."""
-        self._record(flow, errored=False)
-
-    def error(self, flow: Any) -> None:
-        """The flow failed (connection refused, TLS failure, client abort, ...).
-
-        The request is still worth keeping (``response=None``) so the user sees what the browser
-        attempted; ``filters`` drops such flows from the generated script.
-        """
-        self._record(flow, errored=True)
-
-    def done(self) -> None:
-        """mitmproxy is shutting down: final flush (also when nothing was recorded)."""
-        try:
-            path = self.flush()
-        except Exception as exc:  # never let shutdown blow up
-            log.error("[reqrec] final flush failed: %s", exc)
-            return
-        log.info("[reqrec] %d flow(s) saved to %s", len(self._flows), path)
-
-    # ------------------------------------------------------------------ core
-
-    def wants(self, flow: Any) -> bool:
-        """Should this flow be recorded?  Every HTTP flow."""
-        if _mitm_http is not None and not isinstance(flow, _mitm_http.HTTPFlow):
-            return False
-        request = getattr(flow, "request", None)
-        return request is not None and hasattr(request, "method")
-
-    def _record(self, flow: Any, errored: bool) -> None:
-        if not self.wants(flow):
-            return
-        key = getattr(flow, "id", None) or id(flow)
+    def add(self, flow: Flow, errored: bool = False) -> int:
+        """Keep ``flow`` (any id; renumbered when written); returns the number of flows so far."""
         with self._lock:
-            if key in self._seen:
-                return
-            try:
-                recorded = flow_from_mitm(flow, "f0000")  # real id assigned when sorted at flush time
-            except Exception as exc:
-                log.warning("[reqrec] could not convert flow: %s", exc)
-                return
-            self._seen.add(key)
-            self._flows.append(recorded)
+            self._flows.append(flow)
             if errored:
                 self.errors += 1
-            try:
-                self.flush()
-            except Exception as exc:
-                self.last_flush_error = str(exc)
-                log.error("[reqrec] could not write %s: %s", self.output_path, exc)
-        status: Any = recorded.response.status if recorded.response is not None else "ERR"
-        log.info("[reqrec] #%04d %s %s -> %s", len(self._flows), recorded.request.method, truncate(recorded.request.url, 100), status)
-
-    def recording(self) -> Recording:
-        """Snapshot of everything recorded so far, chronologically ordered with fresh ids."""
-        with self._lock:
-            ordered = self._sorted_flows()
-            for n, flow in enumerate(ordered, start=1):
-                flow.id = f"f{n:04d}"
-            meta: dict[str, Any] = {
-                "source": "mitmproxy",
-                "started_at": self.started_at,
-                "updated_at": now_iso(),
-                "flows_total": len(ordered),
-                "errors": self.errors,
-            }
-            return Recording(flows=list(ordered), meta=meta)
-
-    def _sorted_flows(self) -> list[Flow]:
-        """Stable sort by ``started_at``; flows without a timestamp keep their arrival position."""
-        keyed: list[tuple[float, int, Flow]] = []
-        last = float("-inf")
-        for index, flow in enumerate(self._flows):
-            if flow.started_at is None:
-                key = last
-            else:
-                key = last = float(flow.started_at)
-            keyed.append((key, index, flow))
-        keyed.sort(key=lambda t: (t[0], t[1]))
-        return [f for _, _, f in keyed]
-
-    def flush(self) -> str:
-        """Write the current recording atomically; returns the path written."""
-        with self._lock:
-            path = write_recording_atomic(self.recording(), self.output_path)
-            self.flush_count += 1
-            self.last_flush_error = None
-            return path
+            count = len(self._flows)
+        self._dirty.set()
+        return count
 
     def __len__(self) -> int:
-        return len(self._flows)
+        with self._lock:
+            return len(self._flows)
+
+    def recording(self) -> Recording:
+        """Snapshot: chronological (request start, then arrival), ids ``f0001``.., with meta."""
+        with self._lock:
+            flows = list(self._flows)
+            errors = self.errors
+        keyed = sorted(enumerate(flows), key=lambda t: (t[1].started_at if t[1].started_at is not None else float("inf"), t[0]))
+        ordered = [replace(flow, id=f"f{n:04d}") for n, (_, flow) in enumerate(keyed, start=1)]
+        meta: dict[str, Any] = {"source": "recbrowser"}
+        meta.update(self.meta)
+        meta.update(started_at=self.started_at, updated_at=now_iso(), flows_total=len(ordered), errors=errors)
+        return Recording(flows=ordered, meta=meta)
+
+    def flush(self) -> str:
+        """Write the current recording atomically; returns the path."""
+        with self._write_lock:
+            began = time.monotonic()
+            try:
+                path = write_recording_atomic(self.recording(), self.out)
+            except OSError as exc:
+                self.last_flush_error = str(exc)
+                raise
+            self.last_flush_error = None
+            # a recording that takes long to write is written less often (never more than 1/4 of the time)
+            self._pause = max(self.flush_interval, min(10.0, (time.monotonic() - began) * 4))
+            return path
+
+    def _writer(self) -> None:
+        while True:
+            self._dirty.wait()
+            if self._closed:
+                return
+            time.sleep(self._pause)  # the rest of the page's requests arrive meanwhile
+            self._dirty.clear()
+            if self._closed:
+                return
+            try:
+                self.flush()
+            except OSError:
+                pass  # kept in last_flush_error; the next flow tries again
+
+    def close(self) -> str:
+        """Stop the writer thread and write the final file."""
+        self._closed = True
+        self._dirty.set()
+        if self._thread is not None:
+            self._thread.join(5.0)
+        return self.flush()
 
 
-addons = [ReqRecAddon()]
+# --------------------------------------------------------------------------- recording proxy
+
+#: Never forwarded (they describe the connection to the proxy, not the request).
+_HOP_BY_HOP_HEADERS = frozenset({
+    "connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade",
+})
+#: Printable ASCII is kept as it is when a request line holds raw bytes (``%`` included).
+_URL_SAFE_ASCII = "".join(chr(c) for c in range(0x21, 0x7F))
 
 
-# ===== former reqrec/recorder/run.py: the mitmdump command line =====
-# ``mitmdump -s reqrec.py --set reqrec_out=... -p PORT --listen-host 127.0.0.1``.
-# Contract: DESIGN.md §3.  The proxy only ever listens on this PC (:data:`RECORD_LISTEN_HOST`): its
-# only client is the recording browser started by the GUI.
+def _decode_content(data: bytes, encoding: Optional[str]) -> bytes:
+    """The body without its ``Content-Encoding`` (gzip / deflate); anything else as received."""
+    enc = (encoding or "").strip().lower()
+    if not data or enc in ("", "identity"):
+        return data
+    import gzip
+    import zlib
 
-#: Absolute path of the addon file passed to ``mitmdump -s``: this very file (its addon section defines ``addons``).
-ADDON_PATH = os.path.abspath(__file__)
-
-#: ``mitmproxy.tools.main`` has no ``__main__`` guard, so ``python -m mitmproxy.tools.main`` does
-#: nothing; the documented programmatic entry point is the ``mitmdump()`` function.
-MITMDUMP_PYTHON_STUB = "import sys; from mitmproxy.tools.main import mitmdump; sys.exit(mitmdump())"
-
-#: The recording proxy's listen address: this PC only.
-RECORD_LISTEN_HOST = "127.0.0.1"
-
-
-# --------------------------------------------------------------------------- discovery
-
-def mitmproxy_available() -> bool:
-    """True when either a ``mitmdump`` executable or the ``mitmproxy`` package can be found."""
-    if shutil.which("mitmdump"):
-        return True
     try:
-        return importlib.util.find_spec("mitmproxy") is not None
-    except (ImportError, ValueError):  # pragma: no cover - broken sys.modules entry
+        if enc in ("gzip", "x-gzip"):
+            return gzip.decompress(data)
+        if enc == "deflate":
+            try:
+                return zlib.decompress(data)
+            except zlib.error:
+                return zlib.decompress(data, -zlib.MAX_WBITS)  # raw deflate (old IIS)
+    except (OSError, EOFError, zlib.error):
+        return data
+    return data
+
+
+def _header_text(value: str) -> str:
+    """``http.server`` / ``http.client`` read header bytes as latin-1; UTF-8 bytes become text again."""
+    try:
+        raw = value.encode("latin-1")
+    except UnicodeEncodeError:
+        return value
+    if raw.isascii():
+        return value
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return value
+
+
+def _recorded_url(raw_url: str) -> str:
+    """The request URL as recorded: raw bytes of the request line (a Shift_JIS query string sent
+    unescaped, ...) are percent-encoded, everything else is kept as sent."""
+    try:
+        raw = raw_url.encode("latin-1")
+    except UnicodeEncodeError:
+        return raw_url
+    if raw.isascii() and " " not in raw_url:
+        return raw_url
+    return quote_from_bytes(raw, safe=_URL_SAFE_ASCII)
+
+
+def _is_html_response(headers: Headers) -> bool:
+    ct = header_get(headers, "content-type")
+    return bool(ct) and parse_content_type(ct)[0] in ("text/html", "application/xhtml+xml")
+
+
+class _UpstreamConnection(http.client.HTTPConnection):
+    """Sends the request line with the browser's own bytes (latin-1 round trip) instead of
+    refusing non-ASCII as ``http.client`` does."""
+
+    def _encode_request(self, request: str) -> bytes:  # type: ignore[override]
+        return request.encode("latin-1")
+
+
+def _pipe(a: socket.socket, b: socket.socket, idle: float) -> None:
+    """Copy bytes both ways until one side closes, fails or stays silent for ``idle`` seconds."""
+    import select
+
+    socks = [a, b]
+    while True:
+        try:
+            readable, _, broken = select.select(socks, [], socks, idle)
+        except (OSError, ValueError):
+            return
+        if broken or not readable:
+            return
+        for sock in readable:
+            try:
+                data = sock.recv(65536)
+            except OSError:
+                return
+            if not data:
+                return
+            try:
+                (b if sock is a else a).sendall(data)
+            except OSError:
+                return
+
+
+class _RecordingProxyHandler(http.server.BaseHTTPRequestHandler):
+    """One browser connection (kept alive): every request is forwarded and recorded."""
+
+    protocol_version = "HTTP/1.1"
+    timeout = 300  # an idle browser connection is closed after this many seconds
+
+    def setup(self) -> None:
+        super().setup()
+        self._upstreams: dict[tuple[str, int], _UpstreamConnection] = {}
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        finally:
+            for conn in self._upstreams.values():
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._upstreams.clear()
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - http.server's signature
+        pass
+
+    def handle_one_request(self) -> None:
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline, self.request_version, self.command = "", "", ""
+                self._plain_error(414, "reqrec: request line too long")
+                return
+            if not self.raw_requestline:
+                self.close_connection = True
+                return
+            if not self.parse_request():
+                return
+            if self.command == "CONNECT":
+                self._tunnel()
+            else:
+                self._relay()
+            self.wfile.flush()
+        except OSError:  # the browser went away / timed out
+            self.close_connection = True
+
+    # ------------------------------------------------------------------ helpers
+
+    def _plain_error(self, status: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response_only(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _read_body(self) -> bytes:
+        """The request body (``Content-Length`` or chunked); ``ValueError`` when malformed."""
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            chunks: list[bytes] = []
+            while True:
+                line = self.rfile.readline(65537)
+                if not line:
+                    raise ValueError("truncated chunked body")
+                size = int(line.split(b";", 1)[0].strip() or b"0", 16)
+                if size == 0:
+                    while self.rfile.readline(65537) not in (b"\r\n", b"\n", b""):
+                        pass  # trailers
+                    return b"".join(chunks)
+                chunks.append(self.rfile.read(size))
+                self.rfile.readline(65537)  # CRLF after the chunk
+        length = self.headers.get("Content-Length")
+        if not length:
+            return b""
+        n = int(length)
+        if n < 0:
+            raise ValueError("negative Content-Length")
+        data = self.rfile.read(n)
+        if len(data) != n:
+            raise ValueError("truncated body")
+        return data
+
+    def _drop_upstream(self, key: tuple[str, int]) -> None:
+        conn = self._upstreams.pop(key, None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _exchange(self, host: str, port: int, target: str, headers: Headers, body: bytes) -> tuple[Any, bytes]:
+        """Send the request on this browser connection's connection to ``host:port`` (opened when
+        needed; a kept-alive one the site had closed is retried once on a new one)."""
+        server: RecordingProxy = self.server  # type: ignore[assignment]
+        key = (host.lower(), int(port))
+        for attempt in (0, 1):
+            conn = self._upstreams.get(key)
+            reused = conn is not None
+            if conn is None:
+                conn = _UpstreamConnection(host, port, timeout=server.connect_timeout)
+                self._upstreams[key] = conn
+            try:
+                if conn.sock is None:
+                    conn.connect()
+                    conn.sock.settimeout(server.read_timeout)  # connecting may take 30 s, a slow report longer
+                conn.putrequest(self.command, target, skip_host=True, skip_accept_encoding=True)
+                for name, value in headers:
+                    conn.putheader(name, value)
+                conn.endheaders(body if body else None)
+                resp = conn.getresponse()
+                data = resp.read()  # chunked transfer coding undone; Content-Encoding kept
+            except (http.client.RemoteDisconnected, ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                self._drop_upstream(key)
+                if reused and attempt == 0:
+                    continue
+                raise
+            except BaseException:
+                self._drop_upstream(key)
+                raise
+            if resp.will_close:
+                self._drop_upstream(key)
+            return resp, data
+        raise OSError("unreachable")  # pragma: no cover
+
+    # ------------------------------------------------------------------ http:// (recorded)
+
+    def _relay(self) -> None:
+        server: RecordingProxy = self.server  # type: ignore[assignment]
+        started = time.time()
+        raw_url = self.path
+        parts = urlsplit(raw_url)
+        if parts.scheme.lower() != "http" or not parts.hostname:
+            self._plain_error(400, "reqrec: これは記録用の中継です (http:// のアドレスだけを中継します)")
+            return
+        try:
+            body = self._read_body()
+            port = parts.port or 80
+        except ValueError:
+            self._plain_error(400, "reqrec: リクエストの形式が不正です")
+            return
+        received = [(name, value) for name, value in self.headers.items()]
+        forward = [(n, v) for n, v in received if n.lower() not in _HOP_BY_HOP_HEADERS]
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            forward.append(("Content-Length", str(len(body))))
+        target = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+        rec_headers = [(name, _header_text(value)) for name, value in received]
+        request = RecordedRequest(
+            method=(self.command or "GET").upper(),
+            url=_recorded_url(raw_url),
+            headers=rec_headers,
+            body=body if (body or header_get(rec_headers, "content-type") is not None) else None,
+        )
+        resource_type = infer_resource_type(rec_headers)
+        try:
+            resp, data = self._exchange(parts.hostname, port, target, forward, body)
+        except (OSError, http.client.HTTPException) as exc:
+            server.record(Flow(id="f0000", request=request, response=None, started_at=started, resource_type=resource_type), errored=True)
+            self._plain_error(502, f"reqrec: {parts.hostname}:{port} に接続できません ({exc})")
+            return
+        status = int(resp.status)
+        resp_headers = [(name, value) for name, value in resp.getheaders()]
+        rec_resp_headers = [(name, _header_text(value)) for name, value in resp_headers]
+        server.record(Flow(
+            id="f0000",
+            request=request,
+            response=RecordedResponse(status=status, headers=rec_resp_headers,
+                                      body=_decode_content(data, header_get(resp_headers, "content-encoding"))),
+            started_at=started,
+            resource_type=resource_type,
+        ))
+        out = [(n, v) for n, v in resp_headers if n.lower() not in _HOP_BY_HOP_HEADERS and n.lower() != "content-length"]
+        if server.compat and _is_html_response(resp_headers) and header_get(resp_headers, "x-ua-compatible") is None:
+            out.append(("X-UA-Compatible", server.compat))
+        self.send_response_only(status, resp.reason)
+        for name, value in out:
+            self.send_header(name, value)
+        bodyless = self.command == "HEAD" or status in (204, 304) or status < 200
+        if not bodyless:
+            self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if not bodyless and data:
+            self.wfile.write(data)
+
+    # ------------------------------------------------------------------ https:// (tunnelled, not recorded)
+
+    def _tunnel(self) -> None:
+        server: RecordingProxy = self.server  # type: ignore[assignment]
+        host, sep, port_text = self.path.rpartition(":")
+        if not sep:
+            host, port_text = self.path, "443"
+        try:
+            port = int(port_text)
+        except ValueError:
+            self._plain_error(400, "reqrec: CONNECT の宛先が不正です")
+            return
+        try:
+            upstream = socket.create_connection((host.strip("[]"), port), timeout=server.connect_timeout)
+        except OSError as exc:
+            self._plain_error(502, f"reqrec: {host}:{port} に接続できません ({exc})")
+            return
+        try:
+            self.send_response_only(200, "Connection Established")
+            self.end_headers()
+            self.wfile.flush()
+            self.close_connection = True
+            _pipe(self.connection, upstream, server.read_timeout)
+        finally:
+            try:
+                upstream.close()
+            except OSError:
+                pass
+
+
+class RecordingProxy(http.server.ThreadingHTTPServer):
+    """The recording proxy: ``127.0.0.1`` on a free port; every ``http://`` exchange goes to ``store``.
+
+    ``compat`` is the ``X-UA-Compatible`` value added to HTML responses (表示モード, see
+    :data:`EMULATION_MODES`); ``on_flow(count, flow)`` is called after each recorded flow.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = False  # Windows: SO_REUSEADDR would let another socket share the port
+
+    def __init__(
+        self,
+        store: RecordingStore,
+        host: str = RECORD_LISTEN_HOST,
+        port: int = 0,
+        compat: Optional[str] = None,
+        on_flow: Optional[Callable[[int, Flow], None]] = None,
+        connect_timeout: float = 30.0,
+        read_timeout: float = 300.0,
+    ) -> None:
+        self.store = store
+        self.compat = compat
+        self.on_flow = on_flow
+        self.connect_timeout = float(connect_timeout)
+        self.read_timeout = float(read_timeout)
+        super().__init__((host, int(port)), _RecordingProxyHandler)
+
+    @property
+    def port(self) -> int:
+        return int(self.server_address[1])
+
+    def record(self, flow: Flow, errored: bool = False) -> None:
+        count = self.store.add(flow, errored=errored)
+        if self.on_flow is not None:
+            try:
+                self.on_flow(count, flow)
+            except Exception:
+                pass
+
+    def start(self) -> threading.Thread:
+        thread = threading.Thread(target=self.serve_forever, kwargs={"poll_interval": 0.2}, name="reqrec-proxy", daemon=True)
+        thread.start()
+        return thread
+
+
+# --------------------------------------------------------------------------- availability / process helpers
+
+#: CLSID of the IE engine's WebBrowser control (``Shell.Explorer.2``, ieframe.dll).
+_WEBBROWSER_CLSID = "{8856F961-340A-11D0-A96B-00C04FD705A2}"
+
+
+def _ie_engine_registered() -> bool:
+    """Is the WebBrowser control registered (read-only registry check)?"""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"CLSID\{_WEBBROWSER_CLSID}\InprocServer32"):
+            return True
+    except OSError:
         return False
 
 
-def mitmdump_launcher() -> list[str]:
-    """Command prefix that runs mitmdump: the ``mitmdump`` executable when on PATH, otherwise the
-    current interpreter calling ``mitmproxy.tools.main.mitmdump()``."""
-    exe = shutil.which("mitmdump")
-    if exe:
-        return [exe]
-    return [sys.executable, "-c", MITMDUMP_PYTHON_STUB]
-
-
-# --------------------------------------------------------------------------- command line
-
-def build_command(out: str, port: int = 8080, extra_args: Sequence[str] = ()) -> list[str]:
-    """Full ``mitmdump`` argument vector for a recording session.
-
-    * ``out`` is made absolute (mitmdump's cwd is ours, but absolute paths survive ``--set`` quoting).
-    * mitmdump's own per-flow dump is off (``flow_detail=0``); the addon's one-line-per-recorded-flow
-      log and mitmproxy warnings stay visible.
-    * ``extra_args`` are appended verbatim (the GUI passes :data:`HTTPS_PASSTHROUGH_ARGS`).
-    """
-    cmd = mitmdump_launcher()
-    cmd += ["-s", ADDON_PATH, "--set", f"reqrec_out={os.path.abspath(out)}"]
-    cmd += ["-p", str(int(port)), "--listen-host", RECORD_LISTEN_HOST]
-    cmd += ["--set", "flow_detail=0"]
-    cmd += [str(a) for a in extra_args]
-    return cmd
-
-
-# --------------------------------------------------------------------------- waiting
-
-def _wait(proc: subprocess.Popen, timeout: float) -> Optional[int]:
+def recorder_availability(platform: Optional[str] = None, engine_check: Optional[Callable[[], bool]] = None) -> dict[str, Any]:
+    """``{"available": bool, "reason": str|None}``: can this PC record (Windows with the IE engine)?"""
+    if (platform or sys.platform) != "win32":
+        return {"available": False, "reason": "記録用ブラウザ (IE エンジン) は Windows でのみ使えます。HAR ファイルからは作れます。"}
+    check = engine_check or _ie_engine_registered
     try:
-        return proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        ok = bool(check())
+    except Exception:
+        ok = False
+    if not ok:
+        return {"available": False, "reason": "この PC には IE エンジン (ieframe.dll) が見つかりません。HAR ファイルからは作れます。"}
+    return {"available": True, "reason": None}
+
+
+def emulation_user_agent(default_ua: str, mode: str) -> Optional[str]:
+    """The User-Agent the engine sends in 表示モード ``mode``, made from its default (IE7) one, or
+    ``None`` to keep the default: ``ie11`` / ``ie11_force`` -> ``Mozilla/5.0 (...; rv:11.0) like
+    Gecko``, ``ie8`` -> ``MSIE 8.0``."""
+    ua = (default_ua or "").strip()
+    if mode in ("ie11", "ie11_force"):
+        m = re.match(r"Mozilla/4\.0 \(compatible; MSIE [\d.]+; (.*)\)$", ua)
+        return f"Mozilla/5.0 ({m.group(1)}; rv:11.0) like Gecko" if m else None
+    if mode == "ie8":
+        return re.sub(r"MSIE [\d.]+", "MSIE 8.0", ua, count=1) if "MSIE " in ua else None
+    return None
+
+
+def _kill_on_close_job(proc: Any) -> Optional[int]:
+    """Put ``proc`` in a Windows job object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` and return the
+    job handle (``None`` when unsupported or it failed - never raises).
+
+    The handle stays open in the GUI process; if the GUI dies without cleaning up (console window
+    closed, ended from Task Manager), Windows closes the handle and ends the recording browser too.
+    No setting, file or registry value is involved.
+    """
+    if not is_windows():
+        return None
+    handle = getattr(proc, "_handle", None)
+    if not handle:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class _BasicLimit(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _ExtendedLimit(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimit),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _ExtendedLimit()
+        # KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK: only the recording browser is tied to the GUI; programs
+        # it starts (Excel opened from a download, a mail client ...) stay outside the job and survive.
+        info.BasicLimitInformation.LimitFlags = 0x2000 | 0x1000
+        ok = kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))  # JobObjectExtendedLimitInformation
+        if ok:
+            ok = kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(int(handle)))
+        if not ok:
+            kernel32.CloseHandle(job)
+            return None
+        return int(job)
+    except Exception:
         return None
 
 
-# ===== former reqrec/recorder/manager.py: RecorderManager for the GUI =====
-# Start / stop / watch a mitmdump recording from the GUI.  Contract: DESIGN.md §13.6 (RecorderManager).
-#
-# ``RecorderManager`` owns at most one child process.  The command line comes from an injectable
-# ``command_builder`` (default :func:`build_command`) so tests can substitute a
-# small Python stub for mitmdump.  The child's stdout / stderr are drained by reader threads into
-# bounded ring buffers (``status()["stdout_tail"]`` / ``["stderr_tail"]``) so a child that logs a
-# lot can never block, and the addon's atomically flushed recording file is read to count flows while
-# the session runs.
-#
-# Stopping: SIGINT (``CTRL_BREAK_EVENT`` on Windows, where the child is started in its own process
-# group) -> ``terminate()`` -> ``kill()``.
+def _close_handle(handle: Optional[int]) -> None:
+    if not handle or not is_windows():
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- Win32 / COM declarations (ctypes)
+
+_RB_WIN32: Optional[types.SimpleNamespace] = None
+
+
+def _rb_win32() -> types.SimpleNamespace:
+    """The ctypes declarations of the recording browser (Windows only), built once on first use."""
+    global _RB_WIN32
+    if _RB_WIN32 is None:
+        _RB_WIN32 = _build_rb_win32()
+    return _RB_WIN32
+
+
+def _build_rb_win32() -> types.SimpleNamespace:  # noqa: C901 - a flat list of declarations
+    import ctypes
+    from ctypes import (
+        POINTER, WINFUNCTYPE, Structure, Union, addressof, byref, c_int, c_long, c_short, c_size_t, c_uint,
+        c_ulong, c_ushort, c_void_p, c_wchar_p, cast, pointer, sizeof,
+    )
+    from ctypes import wintypes as wt
+
+    HRESULT = c_long
+    LRESULT = wt.LPARAM
+    IS_64BIT = sizeof(c_void_p) == 8
+
+    def hr32(value: int) -> int:
+        return c_long(value).value
+
+    S_OK, S_FALSE = 0, 1
+    E_NOTIMPL, E_NOINTERFACE, E_POINTER, E_FAIL = hr32(0x80004001), hr32(0x80004002), hr32(0x80004003), hr32(0x80004005)
+    OLECMDERR_E_NOTSUPPORTED, OLECMDERR_E_UNKNOWNGROUP = hr32(0x80040100), hr32(0x80040104)
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    gdi32 = ctypes.WinDLL("gdi32")
+    ole32 = ctypes.WinDLL("ole32")
+    oleaut32 = ctypes.WinDLL("oleaut32")
+    wininet = ctypes.WinDLL("wininet", use_last_error=True)
+    urlmon = ctypes.WinDLL("urlmon")
+
+    # ------------------------------------------------------------------ structures
+    class GUID(Structure):
+        _fields_ = [("Data1", c_ulong), ("Data2", c_ushort), ("Data3", c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+    class _VARIANT_U(Union):
+        _fields_ = [("llVal", ctypes.c_longlong), ("lVal", c_long), ("iVal", c_short), ("boolVal", c_short),
+                    ("fltVal", ctypes.c_float), ("dblVal", ctypes.c_double), ("bstrVal", c_void_p),
+                    ("pdispVal", c_void_p), ("byref", c_void_p), ("_record", c_void_p * 2)]
+
+    class VARIANT(Structure):
+        _fields_ = [("vt", c_ushort), ("wReserved1", c_ushort), ("wReserved2", c_ushort), ("wReserved3", c_ushort),
+                    ("u", _VARIANT_U)]
+
+    class DISPPARAMS(Structure):
+        _fields_ = [("rgvarg", POINTER(VARIANT)), ("rgdispidNamedArgs", POINTER(c_long)),
+                    ("cArgs", c_uint), ("cNamedArgs", c_uint)]
+
+    class EXCEPINFO(Structure):
+        _fields_ = [("wCode", wt.WORD), ("wReserved", wt.WORD), ("bstrSource", c_void_p), ("bstrDescription", c_void_p),
+                    ("bstrHelpFile", c_void_p), ("dwHelpContext", wt.DWORD), ("pvReserved", c_void_p),
+                    ("pfnDeferredFillIn", c_void_p), ("scode", c_long)]
+
+    class OLEINPLACEFRAMEINFO(Structure):
+        _fields_ = [("cb", c_uint), ("fMDIApp", wt.BOOL), ("hwndFrame", wt.HWND), ("haccel", wt.HANDLE),
+                    ("cAccelEntries", c_uint)]
+
+    class INTERNET_PROXY_INFO(Structure):
+        _fields_ = [("dwAccessType", wt.DWORD), ("lpszProxy", ctypes.c_char_p), ("lpszProxyBypass", ctypes.c_char_p)]
+
+    WNDPROC = WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+
+    class WNDCLASSEXW(Structure):
+        _fields_ = [("cbSize", wt.UINT), ("style", wt.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", c_int),
+                    ("cbWndExtra", c_int), ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON), ("hCursor", wt.HANDLE),
+                    ("hbrBackground", wt.HBRUSH), ("lpszMenuName", wt.LPCWSTR), ("lpszClassName", wt.LPCWSTR),
+                    ("hIconSm", wt.HICON)]
+
+    class MINMAXINFO(Structure):
+        _fields_ = [("ptReserved", wt.POINT), ("ptMaxSize", wt.POINT), ("ptMaxPosition", wt.POINT),
+                    ("ptMinTrackSize", wt.POINT), ("ptMaxTrackSize", wt.POINT)]
+
+    class DRAWITEMSTRUCT(Structure):
+        _fields_ = [("CtlType", c_uint), ("CtlID", c_uint), ("itemID", c_uint), ("itemAction", c_uint),
+                    ("itemState", c_uint), ("hwndItem", wt.HWND), ("hDC", wt.HDC), ("rcItem", wt.RECT),
+                    ("itemData", c_size_t)]
+
+    class NMHDR(Structure):
+        _fields_ = [("hwndFrom", wt.HWND), ("idFrom", c_size_t), ("code", c_int)]
+
+    class TCITEMW(Structure):
+        _fields_ = [("mask", c_uint), ("dwState", wt.DWORD), ("dwStateMask", wt.DWORD), ("pszText", c_wchar_p),
+                    ("cchTextMax", c_int), ("iImage", c_int), ("lParam", wt.LPARAM)]
+
+    class LOGFONTW(Structure):
+        _fields_ = [("lfHeight", c_long), ("lfWidth", c_long), ("lfEscapement", c_long), ("lfOrientation", c_long),
+                    ("lfWeight", c_long), ("lfItalic", ctypes.c_ubyte), ("lfUnderline", ctypes.c_ubyte),
+                    ("lfStrikeOut", ctypes.c_ubyte), ("lfCharSet", ctypes.c_ubyte), ("lfOutPrecision", ctypes.c_ubyte),
+                    ("lfClipPrecision", ctypes.c_ubyte), ("lfQuality", ctypes.c_ubyte),
+                    ("lfPitchAndFamily", ctypes.c_ubyte), ("lfFaceName", ctypes.c_wchar * 32)]
+
+    class NONCLIENTMETRICSW(Structure):
+        _fields_ = [("cbSize", c_uint), ("iBorderWidth", c_int), ("iScrollWidth", c_int), ("iScrollHeight", c_int),
+                    ("iCaptionWidth", c_int), ("iCaptionHeight", c_int), ("lfCaptionFont", LOGFONTW),
+                    ("iSmCaptionWidth", c_int), ("iSmCaptionHeight", c_int), ("lfSmCaptionFont", LOGFONTW),
+                    ("iMenuWidth", c_int), ("iMenuHeight", c_int), ("lfMenuFont", LOGFONTW),
+                    ("lfStatusFont", LOGFONTW), ("lfMessageFont", LOGFONTW), ("iPaddedBorderWidth", c_int)]
+
+    class INITCOMMONCONTROLSEX(Structure):
+        _fields_ = [("dwSize", wt.DWORD), ("dwICC", wt.DWORD)]
+
+    class ACTCTXW(Structure):
+        _fields_ = [("cbSize", wt.ULONG), ("dwFlags", wt.DWORD), ("lpSource", wt.LPCWSTR),
+                    ("wProcessorArchitecture", wt.USHORT), ("wLangId", wt.LANGID), ("lpAssemblyDirectory", wt.LPCWSTR),
+                    ("lpResourceName", wt.LPCWSTR), ("lpApplicationName", wt.LPCWSTR), ("hModule", wt.HMODULE)]
+
+    # ------------------------------------------------------------------ functions
+    def proto(dll: Any, name: str, restype: Any, *argtypes: Any) -> Any:
+        fn = getattr(dll, name)
+        fn.restype = restype
+        fn.argtypes = list(argtypes)
+        return fn
+
+    proto(user32, "RegisterClassExW", wt.ATOM, POINTER(WNDCLASSEXW))
+    proto(user32, "CreateWindowExW", wt.HWND, wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, c_int, c_int, c_int, c_int,
+          wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID)
+    proto(user32, "DefWindowProcW", LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+    proto(user32, "CallWindowProcW", LRESULT, c_void_p, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+    proto(user32, "DestroyWindow", wt.BOOL, wt.HWND)
+    proto(user32, "ShowWindow", wt.BOOL, wt.HWND, c_int)
+    proto(user32, "MoveWindow", wt.BOOL, wt.HWND, c_int, c_int, c_int, c_int, wt.BOOL)
+    proto(user32, "SetWindowPos", wt.BOOL, wt.HWND, wt.HWND, c_int, c_int, c_int, c_int, wt.UINT)
+    proto(user32, "GetClientRect", wt.BOOL, wt.HWND, POINTER(wt.RECT))
+    proto(user32, "GetWindowRect", wt.BOOL, wt.HWND, POINTER(wt.RECT))
+    proto(user32, "MapWindowPoints", c_int, wt.HWND, wt.HWND, c_void_p, wt.UINT)
+    proto(user32, "SetWindowTextW", wt.BOOL, wt.HWND, wt.LPCWSTR)
+    proto(user32, "GetWindowTextW", c_int, wt.HWND, wt.LPWSTR, c_int)
+    proto(user32, "GetWindowTextLengthW", c_int, wt.HWND)
+    proto(user32, "GetMessageW", wt.BOOL, POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT)
+    proto(user32, "TranslateMessage", wt.BOOL, POINTER(wt.MSG))
+    proto(user32, "DispatchMessageW", LRESULT, POINTER(wt.MSG))
+    proto(user32, "PostMessageW", wt.BOOL, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+    proto(user32, "SendMessageW", LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+    proto(user32, "PostQuitMessage", None, c_int)
+    proto(user32, "SetTimer", c_size_t, wt.HWND, c_size_t, wt.UINT, c_void_p)
+    proto(user32, "KillTimer", wt.BOOL, wt.HWND, c_size_t)
+    proto(user32, "IsChild", wt.BOOL, wt.HWND, wt.HWND)
+    proto(user32, "IsWindow", wt.BOOL, wt.HWND)
+    proto(user32, "IsWindowEnabled", wt.BOOL, wt.HWND)
+    proto(user32, "IsWindowVisible", wt.BOOL, wt.HWND)
+    proto(user32, "EnableWindow", wt.BOOL, wt.HWND, wt.BOOL)
+    proto(user32, "LoadCursorW", wt.HANDLE, wt.HINSTANCE, c_void_p)
+    proto(user32, "LoadIconW", wt.HICON, wt.HINSTANCE, c_void_p)
+    proto(user32, "SetFocus", wt.HWND, wt.HWND)
+    proto(user32, "SetForegroundWindow", wt.BOOL, wt.HWND)
+    proto(user32, "GetFocus", wt.HWND)
+    proto(user32, "SystemParametersInfoW", wt.BOOL, wt.UINT, wt.UINT, c_void_p, wt.UINT)
+    proto(user32, "GetDC", wt.HDC, wt.HWND)
+    proto(user32, "ReleaseDC", c_int, wt.HWND, wt.HDC)
+    proto(user32, "FillRect", c_int, wt.HDC, POINTER(wt.RECT), wt.HBRUSH)
+    proto(user32, "DrawTextW", c_int, wt.HDC, wt.LPCWSTR, c_int, POINTER(wt.RECT), wt.UINT)
+    proto(user32, "DrawFocusRect", wt.BOOL, wt.HDC, POINTER(wt.RECT))
+    proto(user32, "InvalidateRect", wt.BOOL, wt.HWND, c_void_p, wt.BOOL)
+    proto(user32, "GetClassNameW", c_int, wt.HWND, wt.LPWSTR, c_int)
+    ENUMWINDOWSPROC = WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    proto(user32, "EnumThreadWindows", wt.BOOL, wt.DWORD, ENUMWINDOWSPROC, wt.LPARAM)
+    set_window_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW  # 32-bit: no ...Ptr export
+    set_window_long.restype = c_void_p
+    set_window_long.argtypes = [wt.HWND, c_int, c_void_p]
+    proto(kernel32, "GetModuleHandleW", wt.HMODULE, wt.LPCWSTR)
+    proto(kernel32, "GetCurrentThreadId", wt.DWORD)
+    proto(kernel32, "CreateActCtxW", wt.HANDLE, POINTER(ACTCTXW))
+    proto(kernel32, "ActivateActCtx", wt.BOOL, wt.HANDLE, POINTER(c_size_t))
+    proto(gdi32, "CreateFontIndirectW", wt.HFONT, POINTER(LOGFONTW))
+    proto(gdi32, "CreateSolidBrush", wt.HBRUSH, wt.COLORREF)
+    proto(gdi32, "DeleteObject", wt.BOOL, wt.HGDIOBJ)
+    proto(gdi32, "SelectObject", wt.HGDIOBJ, wt.HDC, wt.HGDIOBJ)
+    proto(gdi32, "SetTextColor", wt.COLORREF, wt.HDC, wt.COLORREF)
+    proto(gdi32, "SetBkMode", c_int, wt.HDC, c_int)
+    proto(gdi32, "GetTextExtentPoint32W", wt.BOOL, wt.HDC, wt.LPCWSTR, c_int, POINTER(wt.SIZE))
+    proto(ole32, "CLSIDFromString", HRESULT, c_wchar_p, POINTER(GUID))
+    proto(ole32, "OleInitialize", HRESULT, c_void_p)
+    proto(ole32, "CoCreateInstance", HRESULT, POINTER(GUID), c_void_p, wt.DWORD, POINTER(GUID), POINTER(c_void_p))
+    proto(ole32, "OleSetContainedObject", HRESULT, c_void_p, wt.BOOL)
+    proto(oleaut32, "SysAllocString", c_void_p, c_wchar_p)
+    proto(oleaut32, "SysFreeString", None, c_void_p)
+    proto(oleaut32, "SysStringLen", c_uint, c_void_p)
+    proto(oleaut32, "VariantClear", HRESULT, POINTER(VARIANT))
+    proto(wininet, "InternetSetOptionA", wt.BOOL, c_void_p, wt.DWORD, c_void_p, wt.DWORD)
+    proto(urlmon, "UrlMkSetSessionOption", HRESULT, wt.DWORD, c_void_p, wt.DWORD, wt.DWORD)
+    proto(urlmon, "ObtainUserAgentString", HRESULT, wt.DWORD, ctypes.c_char_p, POINTER(wt.DWORD))
+
+    # ------------------------------------------------------------------ constants
+    WM_DESTROY, WM_SIZE, WM_SETFOCUS, WM_CLOSE = 0x0002, 0x0005, 0x0007, 0x0010
+    WM_GETMINMAXINFO, WM_NOTIFY, WM_SETFONT, WM_KEYDOWN, WM_CHAR = 0x0024, 0x004E, 0x0030, 0x0100, 0x0102
+    WM_COMMAND, WM_TIMER, WM_DRAWITEM, WM_KEYFIRST, WM_KEYLAST = 0x0111, 0x0113, 0x002B, 0x0100, 0x0109
+    WM_APP = 0x8000
+    WM_APP_CLOSE_TAB = WM_APP + 1   # wParam = the tab's container window
+    WM_APP_STOP = WM_APP + 2        # ``stop`` on stdin / end of stdin
+    WS_OVERLAPPEDWINDOW, WS_CHILD, WS_VISIBLE = 0x00CF0000, 0x40000000, 0x10000000
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_TABSTOP, WS_EX_CLIENTEDGE = 0x02000000, 0x04000000, 0x00010000, 0x00000200
+    ES_AUTOHSCROLL, BS_PUSHBUTTON, BS_OWNERDRAW = 0x0080, 0x0000, 0x000B
+    SW_HIDE, SW_SHOW = 0, 5
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE = 0x0002, 0x0001, 0x0010
+    HWND_TOP = 0
+    GWLP_WNDPROC = -4
+    VK_RETURN = 0x0D
+    TCM_FIRST = 0x1300
+    TCM_GETCURSEL, TCM_SETCURSEL, TCM_INSERTITEMW, TCM_SETITEMW = TCM_FIRST + 11, TCM_FIRST + 12, TCM_FIRST + 62, TCM_FIRST + 61
+    TCM_DELETEITEM, TCM_ADJUSTRECT, TCM_SETPADDING = TCM_FIRST + 8, TCM_FIRST + 40, TCM_FIRST + 43
+    TCIF_TEXT, TCIF_PARAM = 0x0001, 0x0008
+    TCN_SELCHANGE = -551
+    SB_SETTEXTW, SB_SETPARTS, SBT_OWNERDRAW = 0x0400 + 11, 0x0400 + 4, 0x1000
+    ODT_BUTTON, ODS_SELECTED, ODS_FOCUS = 4, 0x0001, 0x0010
+    DT_CENTER, DT_VCENTER, DT_SINGLELINE, DT_LEFT, DT_RIGHT, DT_END_ELLIPSIS = 0x1, 0x4, 0x20, 0x0, 0x2, 0x8000
+    TRANSPARENT = 1
+    SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA = 0x0029, 0x0030
+    ICC_BAR_CLASSES, ICC_TAB_CLASSES, ICC_STANDARD_CLASSES = 0x0004, 0x0008, 0x4000
+    CW_USEDEFAULT = c_int(0x80000000).value
+    CLSCTX_INPROC_SERVER = 1
+    OLEIVERB_INPLACEACTIVATE, OLEIVERB_UIACTIVATE = -5, -4
+    OLECLOSE_NOSAVE = 1
+    OLECMDID_SHOWSCRIPTERROR, OLECMDID_CLOSE = 40, 45
+    DISPID_COMMANDSTATECHANGE, DISPID_TITLECHANGE, DISPID_NEWWINDOW2, DISPID_NAVIGATECOMPLETE2 = 105, 113, 251, 252
+    DISPID_DOCUMENTCOMPLETE, DISPID_WINDOWCLOSING, DISPID_FILEDOWNLOAD, DISPID_NEWWINDOW3 = 259, 263, 270, 273
+    CSC_NAVIGATEFORWARD, CSC_NAVIGATEBACK = 1, 2
+    INTERNET_OPTION_PROXY, INTERNET_OPTION_END_BROWSER_SESSION, INTERNET_OPTION_SUPPRESS_BEHAVIOR = 38, 42, 81
+    INTERNET_SUPPRESS_COOKIE_PERSIST, INTERNET_OPEN_TYPE_PROXY = 3, 3
+    URLMON_OPTION_USERAGENT = 0x10000001
+    VT_EMPTY, VT_NULL, VT_I2, VT_I4, VT_R4, VT_R8, VT_BSTR, VT_DISPATCH = 0, 1, 2, 3, 4, 5, 8, 9
+    VT_ERROR, VT_BOOL, VT_VARIANT, VT_UNKNOWN, VT_UI4, VT_I8, VT_INT, VT_UINT = 10, 11, 12, 13, 19, 20, 22, 23
+    VT_BYREF = 0x4000
+    DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPATCH_PROPERTYPUT = 1, 2, 4
+    DISPID_PROPERTYPUT = -3
+    LOCALE_USER_DEFAULT = 0x0400
+    # SIZE passed by value to IOleInPlaceSite::Scroll: one 8-byte register on x64, two DWORDs on x86
+    SCROLL_ARGS = [ctypes.c_int64] if IS_64BIT else [c_long, c_long]
+
+    def guid(text: str) -> GUID:
+        g = GUID()
+        if ole32.CLSIDFromString(text, byref(g)) != 0:
+            raise ValueError("bad GUID " + text)
+        return g
+
+    IID_NULL = GUID()
+    IID_IUnknown = guid("{00000000-0000-0000-C000-000000000046}")
+    IID_IDispatch = guid("{00020400-0000-0000-C000-000000000046}")
+    IID_IOleObject = guid("{00000112-0000-0000-C000-000000000046}")
+    IID_IOleInPlaceObject = guid("{00000113-0000-0000-C000-000000000046}")
+    IID_IOleWindow = guid("{00000114-0000-0000-C000-000000000046}")
+    IID_IOleInPlaceUIWindow = guid("{00000115-0000-0000-C000-000000000046}")
+    IID_IOleInPlaceFrame = guid("{00000116-0000-0000-C000-000000000046}")
+    IID_IOleClientSite = guid("{00000118-0000-0000-C000-000000000046}")
+    IID_IOleInPlaceSite = guid("{00000119-0000-0000-C000-000000000046}")
+    IID_IOleCommandTarget = guid("{B722BCCB-4E68-101B-A2BC-00AA00404770}")
+    IID_IConnectionPointContainer = guid("{B196B284-BAB4-101A-B69C-00AA00341D07}")
+    IID_IWebBrowser2 = guid("{D30C1661-CDAF-11D0-8A3E-00C04FC9E26E}")
+    CLSID_WebBrowser = guid(_WEBBROWSER_CLSID)
+    DIID_DWebBrowserEvents2 = guid("{34A715A0-6587-11D0-924A-0020AFC7AC4D}")
+    CGID_DocHostCommandHandler = guid("{F38BC242-B950-11D1-8918-00C04FC2C836}")
+
+    # ------------------------------------------------------------------ COM calls (vtable / IDispatch)
+    protos: dict[Any, Any] = {}
+
+    def vcall(obj: int, index: int, restype: Any, argtypes: Sequence[Any], *args: Any) -> Any:
+        """Call method ``index`` of the interface pointer ``obj``."""
+        if not obj:
+            raise OSError("null COM pointer")
+        vtbl = cast(c_void_p(obj), POINTER(c_void_p))[0]
+        fnp = cast(c_void_p(vtbl), POINTER(c_void_p))[index]
+        key = (restype, tuple(argtypes))
+        fn_type = protos.get(key)
+        if fn_type is None:
+            fn_type = protos[key] = WINFUNCTYPE(restype, c_void_p, *argtypes)
+        return fn_type(fnp)(obj, *args)
+
+    def qi(obj: int, iid: GUID) -> int:
+        out = c_void_p()
+        hr = vcall(obj, 0, HRESULT, [POINTER(GUID), POINTER(c_void_p)], byref(iid), byref(out))
+        return int(out.value or 0) if hr == 0 else 0
+
+    def addref(obj: int) -> int:
+        return vcall(obj, 1, c_ulong, [])
+
+    def release(obj: int) -> int:
+        return vcall(obj, 2, c_ulong, []) if obj else 0
+
+    def same_object(a: Any, b: Any) -> bool:
+        if not a or not b:
+            return False
+        ua, ub = qi(a, IID_IUnknown), qi(b, IID_IUnknown)
+        try:
+            return bool(ua) and ua == ub
+        finally:
+            release(ua)
+            release(ub)
+
+    def bstr_text(p: Any) -> str:
+        return ctypes.wstring_at(p, oleaut32.SysStringLen(p)) if p else ""
+
+    def from_variant(v: Any) -> Any:
+        vt = v.vt
+        if vt & VT_BYREF:
+            base, ref = vt & ~VT_BYREF, v.u.byref
+            if not ref:
+                return None
+            if base == VT_VARIANT:
+                return from_variant(cast(c_void_p(ref), POINTER(VARIANT))[0])
+            if base == VT_BSTR:
+                return bstr_text(cast(c_void_p(ref), POINTER(c_void_p))[0])
+            if base == VT_BOOL:
+                return cast(c_void_p(ref), POINTER(c_short))[0] != 0
+            if base in (VT_I4, VT_UI4, VT_INT, VT_UINT):
+                return cast(c_void_p(ref), POINTER(c_long))[0]
+            if base in (VT_DISPATCH, VT_UNKNOWN):
+                return cast(c_void_p(ref), POINTER(c_void_p))[0]
+            return None
+        if vt in (VT_EMPTY, VT_NULL):
+            return None
+        if vt == VT_BSTR:
+            return bstr_text(v.u.bstrVal)
+        if vt == VT_BOOL:
+            return v.u.boolVal != 0
+        if vt in (VT_I4, VT_INT, VT_ERROR):
+            return v.u.lVal
+        if vt in (VT_UI4, VT_UINT):
+            return v.u.lVal & 0xFFFFFFFF
+        if vt == VT_I2:
+            return v.u.iVal
+        if vt == VT_I8:
+            return v.u.llVal
+        if vt == VT_R4:
+            return v.u.fltVal
+        if vt == VT_R8:
+            return v.u.dblVal
+        if vt in (VT_DISPATCH, VT_UNKNOWN):
+            return v.u.pdispVal  # borrowed
+        return None
+
+    def to_variant(v: Any, value: Any, allocated: list) -> None:
+        if value is None:
+            v.vt = VT_EMPTY
+        elif isinstance(value, bool):
+            v.vt, v.u.boolVal = VT_BOOL, (-1 if value else 0)
+        elif isinstance(value, int):
+            v.vt, v.u.lVal = VT_I4, value
+        elif isinstance(value, str):
+            b = oleaut32.SysAllocString(value)
+            allocated.append(b)
+            v.vt, v.u.bstrVal = VT_BSTR, b
+        else:
+            raise TypeError(f"unsupported argument {value!r}")
+
+    def disp_invoke(pdisp: int, name: str, flags: int, args: Sequence[Any] = ()) -> Any:
+        """IDispatch call by name; an object result is returned AddRef'd (the caller releases it)."""
+        names = (c_wchar_p * 1)(name)
+        dispid = c_long()
+        hr = vcall(pdisp, 5, HRESULT, [POINTER(GUID), POINTER(c_wchar_p), c_uint, c_ulong, POINTER(c_long)],
+                   byref(IID_NULL), names, 1, LOCALE_USER_DEFAULT, byref(dispid))
+        if hr != 0:
+            raise OSError(f"GetIDsOfNames({name}) failed: 0x{hr & 0xFFFFFFFF:08x}")
+        argv = (VARIANT * max(len(args), 1))()
+        allocated: list = []
+        for i, a in enumerate(reversed(list(args))):
+            to_variant(argv[i], a, allocated)
+        params = DISPPARAMS()
+        if args:
+            params.rgvarg = cast(argv, POINTER(VARIANT))
+            params.cArgs = len(args)
+        named = c_long(DISPID_PROPERTYPUT)
+        if flags == DISPATCH_PROPERTYPUT:
+            params.rgdispidNamedArgs = pointer(named)
+            params.cNamedArgs = 1
+        result, excep, argerr = VARIANT(), EXCEPINFO(), c_uint()
+        try:
+            hr = vcall(pdisp, 6, HRESULT,
+                       [c_long, POINTER(GUID), c_ulong, c_ushort, POINTER(DISPPARAMS), POINTER(VARIANT),
+                        POINTER(EXCEPINFO), POINTER(c_uint)],
+                       dispid.value, byref(IID_NULL), LOCALE_USER_DEFAULT, flags, byref(params), byref(result),
+                       byref(excep), byref(argerr))
+            if hr != 0:
+                raise OSError(f"Invoke({name}) failed: 0x{hr & 0xFFFFFFFF:08x} {bstr_text(excep.bstrDescription)}")
+            if result.vt in (VT_DISPATCH, VT_UNKNOWN):
+                p = result.u.pdispVal
+                if p:
+                    addref(p)
+                return p or 0
+            return from_variant(result)
+        finally:
+            oleaut32.VariantClear(byref(result))
+            for b in allocated + [excep.bstrSource, excep.bstrDescription, excep.bstrHelpFile]:
+                if b:
+                    oleaut32.SysFreeString(b)
+
+    def disp_get(pdisp: int, name: str) -> Any:
+        return disp_invoke(pdisp, name, DISPATCH_PROPERTYGET)
+
+    def disp_call(pdisp: int, name: str, *args: Any) -> Any:
+        return disp_invoke(pdisp, name, DISPATCH_METHOD, args)
+
+    # ------------------------------------------------------------------ COM objects implemented in Python
+    QI_PROTO = WINFUNCTYPE(HRESULT, c_void_p, POINTER(GUID), POINTER(c_void_p))
+    REF_PROTO = WINFUNCTYPE(c_ulong, c_void_p)
+
+    def P(*argtypes: Any) -> Any:
+        """Prototype of an HRESULT method (after ``this``)."""
+        return WINFUNCTYPE(HRESULT, c_void_p, *argtypes)
+
+    class _Iface(Structure):
+        _fields_ = [("lpVtbl", c_void_p)]
+
+    def null_out(pp: Any, hr: int) -> int:
+        if pp:
+            pp[0] = None
+        return hr
+
+    class ComObject:
+        """A COM object made in Python: one vtable per interface, one shared reference count.  Kept
+        alive by its owner for the lifetime of the process (the engine may call it late)."""
+
+        def __init__(self, label: str, log: Callable[[str], None]) -> None:
+            self.label = label
+            self.log = log
+            self.refs = 0
+            self._keep: list = []
+            self._by_iid: dict[bytes, int] = {}
+
+        def _guard(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+            def call(*args: Any) -> Any:
+                try:
+                    r = fn(*args)
+                    return S_OK if r is None else r
+                except Exception:
+                    self.log(f"callback error in {self.label}: " + traceback.format_exc().strip().replace("\n", " | "))
+                    return E_FAIL
+            return call
+
+        def implement(self, iids: Sequence[GUID], methods: Sequence[tuple[Any, Callable[..., Any]]]) -> None:
+            funcs = [QI_PROTO(self._qi), REF_PROTO(self._addref), REF_PROTO(self._release)]
+            funcs += [fn_type(self._guard(fn)) for fn_type, fn in methods]
+            vtbl = (c_void_p * len(funcs))(*[cast(f, c_void_p).value for f in funcs])
+            iface = _Iface(addressof(vtbl))
+            self._keep += [funcs, vtbl, iface]
+            if not self._by_iid:
+                self._by_iid[bytes(IID_IUnknown)] = addressof(iface)  # COM identity: the first interface
+            for iid in iids:
+                self._by_iid[bytes(iid)] = addressof(iface)
+
+        def ptr(self, iid: GUID) -> int:
+            return self._by_iid[bytes(iid)]
+
+        def _qi(self, this: Any, riid: Any, ppv: Any) -> int:
+            if not ppv:
+                return E_POINTER
+            p = self._by_iid.get(bytes(riid[0]))
+            if p is None:
+                ppv[0] = None
+                return E_NOINTERFACE
+            ppv[0] = p
+            self.refs += 1
+            return S_OK
+
+        def _addref(self, this: Any) -> int:
+            self.refs += 1
+            return self.refs
+
+        def _release(self, this: Any) -> int:
+            self.refs = max(self.refs - 1, 0)
+            return self.refs
+
+    return types.SimpleNamespace(**{k: v for k, v in locals().items() if not k.startswith("__")})
+
+
+# --------------------------------------------------------------------------- the recording browser window
+
+class _RecLog:
+    """``--log`` file of the recording browser: ``HH:MM:SS.mmm text`` lines (UTF-8).  Never raises."""
+
+    def __init__(self, path: Optional[str]) -> None:
+        self._lock = threading.Lock()
+        self._fh: Any = None
+        if path:
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+                self._fh = open(path, "a", encoding="utf-8")
+            except OSError:
+                self._fh = None
+
+    def write(self, text: str) -> None:
+        t = time.time()
+        line = time.strftime("%H:%M:%S", time.localtime(t)) + f".{int((t % 1) * 1000):03d} {text}\n"
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.write(line)
+                    self._fh.flush()
+                except (OSError, ValueError):
+                    pass
+
+    def close(self) -> None:
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
+
+
+class _RecBrowserTab:
+    """One tab: a container window with one WebBrowser control, its client site and its event sink."""
+
+    def __init__(self, app: "RecBrowserApp", popup: bool) -> None:
+        W = app.W
+        app.counter += 1
+        self.app, self.W, self.popup, self.name = app, W, popup, f"tab{app.counter}"
+        self.closed = False
+        self.ole = self.wb = self.inplace = self.cp = 0
+        self.cookie = 0
+        self.title = ""
+        self.can_back = self.can_forward = False
+        self.title_announced = not popup
+        rc = app.page_rect()
+        self.hwnd = W.user32.CreateWindowExW(
+            0, app.PAGE_CLASS, "", W.WS_CHILD | W.WS_CLIPCHILDREN | W.WS_CLIPSIBLINGS,
+            rc.left, rc.top, max(rc.right - rc.left, 1), max(rc.bottom - rc.top, 1), app.hwnd, None, app.hinst, None)
+        if not self.hwnd:
+            raise RecorderError(f"記録用ブラウザのタブを作れません (エラー {ctypes_last_error()})")
+        app.pages[self.hwnd] = self
+        self.site = self._make_site()
+        self.sink = self._make_sink()
+        ole = W.c_void_p()
+        hr = W.ole32.CoCreateInstance(W.byref(W.CLSID_WebBrowser), None, W.CLSCTX_INPROC_SERVER, W.byref(W.IID_IOleObject), W.byref(ole))
+        if hr != 0:
+            raise RecorderError(f"IE エンジンを開けません (0x{hr & 0xFFFFFFFF:08x})")
+        self.ole = int(ole.value)
+        site = self.site.ptr(W.IID_IOleClientSite)
+        W.vcall(self.ole, 3, W.HRESULT, [W.c_void_p], site)  # IOleObject::SetClientSite
+        W.ole32.OleSetContainedObject(self.ole, True)
+        crc = self.client_rect()
+        hr = W.vcall(self.ole, 11, W.HRESULT, [W.c_long, W.c_void_p, W.c_void_p, W.c_long, W.wt.HWND, W.POINTER(W.wt.RECT)],
+                     W.OLEIVERB_INPLACEACTIVATE, None, site, 0, self.hwnd, W.byref(crc))  # IOleObject::DoVerb
+        if hr < 0:
+            raise RecorderError(f"IE エンジンを表示できません (0x{hr & 0xFFFFFFFF:08x})")
+        self.wb = W.qi(self.ole, W.IID_IWebBrowser2)
+        self.inplace = W.qi(self.ole, W.IID_IOleInPlaceObject)
+        cpc = W.qi(self.ole, W.IID_IConnectionPointContainer)
+        cp = W.c_void_p()
+        hr = W.vcall(cpc, 4, W.HRESULT, [W.POINTER(W.GUID), W.POINTER(W.c_void_p)], W.byref(W.DIID_DWebBrowserEvents2), W.byref(cp))
+        W.release(cpc)
+        if hr != 0 or not cp.value:
+            raise RecorderError(f"IE エンジンのイベントを受け取れません (0x{hr & 0xFFFFFFFF:08x})")
+        self.cp = int(cp.value)
+        cookie = W.wt.DWORD()
+        hr = W.vcall(self.cp, 5, W.HRESULT, [W.c_void_p, W.POINTER(W.wt.DWORD)], self.sink.ptr(W.IID_IDispatch), W.byref(cookie))
+        if hr != 0:
+            raise RecorderError(f"IE エンジンのイベントを受け取れません (0x{hr & 0xFFFFFFFF:08x})")
+        self.cookie = int(cookie.value)
+
+    # ------------------------------------------------------------------ helpers
+    def client_rect(self) -> Any:
+        rc = self.W.wt.RECT()
+        self.W.user32.GetClientRect(self.hwnd, self.W.byref(rc))
+        return rc
+
+    def resize(self) -> None:
+        if self.inplace and not self.closed:
+            rc = self.client_rect()
+            self.W.vcall(self.inplace, 7, self.W.HRESULT, [self.W.POINTER(self.W.wt.RECT)] * 2, self.W.byref(rc), self.W.byref(rc))
+
+    def ui_activate(self) -> None:
+        if self.ole and not self.closed:
+            W = self.W
+            crc = self.client_rect()
+            try:
+                W.vcall(self.ole, 11, W.HRESULT, [W.c_long, W.c_void_p, W.c_void_p, W.c_long, W.wt.HWND, W.POINTER(W.wt.RECT)],
+                        W.OLEIVERB_UIACTIVATE, None, self.site.ptr(W.IID_IOleClientSite), 0, self.hwnd, W.byref(crc))
+            except OSError:
+                pass
+
+    def navigate(self, url: str) -> None:
+        self.W.disp_call(self.wb, "Navigate", url)
+
+    def location(self) -> str:
+        try:
+            return str(self.W.disp_get(self.wb, "LocationURL") or "")
+        except OSError:
+            return ""
+
+    def command(self, name: str, *args: Any) -> None:
+        try:
+            self.W.disp_call(self.wb, name, *args)
+        except OSError as exc:
+            self.app.log(f"{name} failed in {self.name}: {exc}")
+
+    def eval(self, expression: str) -> str:
+        """``eval`` in the page (the --selftest report); never raises."""
+        W = self.W
+        doc = script = 0
+        try:
+            doc = W.disp_get(self.wb, "Document")
+            if not doc:
+                return "(no document)"
+            script = W.disp_get(doc, "Script")
+            r = W.disp_call(script, "eval", expression)
+            if isinstance(r, float) and r.is_integer():
+                r = int(r)
+            return "" if r is None else str(r)
+        except Exception as exc:
+            return f"(error {exc})"
+        finally:
+            W.release(script)
+            W.release(doc)
+
+    def call_page(self, function: str) -> Any:
+        W = self.W
+        doc = script = 0
+        try:
+            doc = W.disp_get(self.wb, "Document")
+            script = W.disp_get(doc, "Script")
+            return W.disp_call(script, function)
+        finally:
+            W.release(script)
+            W.release(doc)
+
+    def destroy(self) -> None:
+        """Deactivate and release the control, then destroy the container window."""
+        if self.closed:
+            return
+        self.closed = True
+        W = self.W
+        steps = (
+            lambda: W.vcall(self.cp, 6, W.HRESULT, [W.wt.DWORD], self.cookie),       # Unadvise
+            lambda: W.vcall(self.inplace, 5, W.HRESULT, []),                         # InPlaceDeactivate
+            lambda: W.vcall(self.ole, 6, W.HRESULT, [W.wt.DWORD], W.OLECLOSE_NOSAVE),  # IOleObject::Close
+            lambda: W.vcall(self.ole, 3, W.HRESULT, [W.c_void_p], None),             # SetClientSite(NULL)
+        )
+        for step in steps:
+            try:
+                step()
+            except Exception as exc:
+                self.app.log(f"destroy {self.name}: {exc}")
+        for p in (self.cp, self.inplace, self.wb, self.ole):
+            try:
+                W.release(p)
+            except Exception:
+                pass
+        self.cp = self.inplace = self.wb = self.ole = 0
+        self.app.pages.pop(self.hwnd, None)
+        W.user32.DestroyWindow(self.hwnd)
+
+    # ------------------------------------------------------------------ the client site
+    def _make_site(self) -> Any:
+        W, app = self.W, self.app
+
+        def get_window(this: Any, phwnd: Any) -> int:
+            phwnd[0] = self.hwnd
+            return W.S_OK
+
+        def get_window_context(this: Any, pp_frame: Any, pp_doc: Any, prc_pos: Any, prc_clip: Any, frame_info: Any) -> int:
+            pp_frame[0] = app.frame.ptr(W.IID_IOleInPlaceFrame)
+            app.frame.refs += 1
+            pp_doc[0] = None
+            rc = self.client_rect()
+            prc_pos[0] = rc
+            prc_clip[0] = rc
+            fi = frame_info.contents
+            fi.fMDIApp, fi.hwndFrame, fi.haccel, fi.cAccelEntries = False, app.hwnd, None, 0
+            return W.S_OK
+
+        def on_ui_activate(this: Any) -> int:
+            app.on_ui_activate(self)
+            return W.S_OK
+
+        def query_status(this: Any, pguid: Any, count: Any, cmds: Any, text: Any) -> int:
+            return W.OLECMDERR_E_UNKNOWNGROUP if pguid else W.OLECMDERR_E_NOTSUPPORTED
+
+        def exec_(this: Any, pguid: Any, cmd: int, opt: int, pva_in: Any, pva_out: Any) -> int:
+            if pguid:
+                group = bytes(W.cast(W.c_void_p(pguid), W.POINTER(W.GUID))[0])
+                if group == bytes(W.CGID_DocHostCommandHandler) and cmd == W.OLECMDID_SHOWSCRIPTERROR:
+                    # a script error on a legacy page: no dialog, the page's scripts keep running
+                    if pva_out:
+                        v = W.cast(W.c_void_p(pva_out), W.POINTER(W.VARIANT))[0]
+                        v.vt, v.u.boolVal = W.VT_BOOL, -1
+                    app.log("script error suppressed in " + self.name)
+                    return W.S_OK
+                return W.OLECMDERR_E_NOTSUPPORTED if group == bytes(W.CGID_DocHostCommandHandler) else W.OLECMDERR_E_UNKNOWNGROUP
+            if cmd == W.OLECMDID_CLOSE:
+                # window.close(): deferred, the engine is still inside the call
+                app.log(f"OLECMDID_CLOSE {self.name} (window.close)")
+                W.user32.PostMessageW(app.hwnd, W.WM_APP_CLOSE_TAB, self.hwnd, 0)
+                return W.S_OK
+            return W.OLECMDERR_E_NOTSUPPORTED
+
+        P = W.P
+        site = W.ComObject(self.name + ".site", app.log)
+        site.implement([W.IID_IOleClientSite], [
+            (P(), lambda this: W.E_NOTIMPL),                                                       # SaveObject
+            (P(W.wt.DWORD, W.wt.DWORD, W.POINTER(W.c_void_p)), lambda this, a, w, pp: W.null_out(pp, W.E_NOTIMPL)),  # GetMoniker
+            (P(W.POINTER(W.c_void_p)), lambda this, pp: W.null_out(pp, W.E_NOINTERFACE)),          # GetContainer
+            (P(), lambda this: W.S_OK),                                                            # ShowObject
+            (P(W.wt.BOOL), lambda this, show: W.S_OK),                                             # OnShowWindow
+            (P(), lambda this: W.E_NOTIMPL),                                                       # RequestNewObjectLayout
+        ])
+        site.implement([W.IID_IOleInPlaceSite, W.IID_IOleWindow], [
+            (P(W.POINTER(W.wt.HWND)), get_window),                                                 # GetWindow
+            (P(W.wt.BOOL), lambda this, mode: W.E_NOTIMPL),                                        # ContextSensitiveHelp
+            (P(), lambda this: W.S_OK),                                                            # CanInPlaceActivate
+            (P(), lambda this: W.S_OK),                                                            # OnInPlaceActivate
+            (P(), on_ui_activate),                                                                 # OnUIActivate
+            (P(W.POINTER(W.c_void_p), W.POINTER(W.c_void_p), W.POINTER(W.wt.RECT), W.POINTER(W.wt.RECT),
+               W.POINTER(W.OLEINPLACEFRAMEINFO)), get_window_context),                             # GetWindowContext
+            (P(*W.SCROLL_ARGS), lambda this, *size: W.E_NOTIMPL),                                  # Scroll
+            (P(W.wt.BOOL), lambda this, undoable: W.S_OK),                                         # OnUIDeactivate
+            (P(), lambda this: W.S_OK),                                                            # OnInPlaceDeactivate
+            (P(), lambda this: W.E_NOTIMPL),                                                       # DiscardUndoState
+            (P(), lambda this: W.E_NOTIMPL),                                                       # DeactivateAndUndo
+            (P(W.POINTER(W.wt.RECT)), lambda this, rc: W.S_OK),                                    # OnPosRectChange
+        ])
+        site.implement([W.IID_IOleCommandTarget], [
+            (P(W.c_void_p, W.c_ulong, W.c_void_p, W.c_void_p), query_status),                      # QueryStatus
+            (P(W.c_void_p, W.wt.DWORD, W.wt.DWORD, W.c_void_p, W.c_void_p), exec_),                # Exec
+        ])
+        return site
+
+    # ------------------------------------------------------------------ DWebBrowserEvents2 (IDispatch)
+    def _make_sink(self) -> Any:
+        W = self.W
+
+        def get_type_info_count(this: Any, pct: Any) -> int:
+            pct[0] = 0
+            return W.S_OK
+
+        P = W.P
+        sink = W.ComObject(self.name + ".events", self.app.log)
+        sink.implement([W.IID_IDispatch, W.DIID_DWebBrowserEvents2], [
+            (P(W.POINTER(W.c_uint)), get_type_info_count),                                         # GetTypeInfoCount
+            (P(W.c_uint, W.c_ulong, W.POINTER(W.c_void_p)), lambda this, i, lcid, pp: W.null_out(pp, W.E_NOTIMPL)),
+            (P(W.POINTER(W.GUID), W.c_void_p, W.c_uint, W.c_ulong, W.POINTER(W.c_long)), lambda *a: W.E_NOTIMPL),
+            (P(W.c_long, W.POINTER(W.GUID), W.c_ulong, W.c_ushort, W.POINTER(W.DISPPARAMS), W.c_void_p, W.c_void_p,
+               W.c_void_p), self._invoke),                                                         # Invoke
+        ])
+        return sink
+
+    def _invoke(self, this: Any, dispid: int, riid: Any, lcid: Any, flags: Any, pparams: Any, *rest: Any) -> int:
+        W, app = self.W, self.app
+        if self.closed:
+            return W.S_OK
+        params = pparams[0] if pparams else None
+        n = params.cArgs if params else 0
+        args = [params.rgvarg[n - 1 - i] for i in range(n)]  # declaration order
+        top = lambda: same_object_safe(W, W.from_variant(args[0]), self.ole)  # noqa: E731
+        if dispid == W.DISPID_NEWWINDOW3 and n >= 5:
+            url = W.from_variant(args[4]) or ""
+            app.log(f"NewWindow3 from {self.name} flags=0x{(W.from_variant(args[2]) or 0) & 0xFFFFFFFF:x} url={url}")
+            app.host_popup(args[0], args[1], url)
+        elif dispid == W.DISPID_NEWWINDOW2 and n >= 2:
+            app.log("NewWindow2 from " + self.name)
+            app.host_popup(args[0], args[1], "")
+        elif dispid == W.DISPID_WINDOWCLOSING:
+            app.log("WindowClosing " + self.name)
+            W.user32.PostMessageW(app.hwnd, W.WM_APP_CLOSE_TAB, self.hwnd, 0)
+        elif dispid == W.DISPID_FILEDOWNLOAD and n >= 1 and not W.from_variant(args[0]):
+            app.log(f"FileDownload {self.name} (file download)")
+            app.status("このダウンロード (https://) は記録されません" if self.location().lower().startswith("https:") else "ダウンロードを記録しました")
+        elif dispid == W.DISPID_TITLECHANGE and n >= 1:
+            title = str(W.from_variant(args[0]) or "")
+            self.title = title
+            app.set_tab_text(self)
+            if not self.title_announced and title.strip() and not title.lower().startswith(("http://", "https://", "about:")):
+                self.title_announced = True
+                app.status("新しいタブ: " + _shorten(title.strip(), app.MAX_TAB_TEXT))
+        elif dispid == W.DISPID_COMMANDSTATECHANGE and n >= 2:
+            command, enabled = W.from_variant(args[0]), bool(W.from_variant(args[1]))
+            if command == W.CSC_NAVIGATEBACK:
+                self.can_back = enabled
+            elif command == W.CSC_NAVIGATEFORWARD:
+                self.can_forward = enabled
+            if app.active is self:
+                app.update_toolbar()
+        elif dispid == W.DISPID_NAVIGATECOMPLETE2 and n >= 2 and top():
+            url = str(W.from_variant(args[1]) or "")
+            app.log(f"Navigated {self.name} -> {url}")
+            if url.lower().startswith("https:"):
+                app.status("このページ (https://) は記録されません。http:// のページで操作してください")
+            if app.active is self:
+                app.update_toolbar()
+        elif dispid == W.DISPID_DOCUMENTCOMPLETE and n >= 2 and top():
+            url = str(W.from_variant(args[1]) or "")
+            app.log(f"DocumentComplete {self.name} {url}")
+            app.set_tab_text(self)
+            if app.active is self:
+                app.update_toolbar()
+            app.document_complete(self, url)
+        return W.S_OK
+
+
+def same_object_safe(W: Any, a: Any, b: Any) -> bool:
+    try:
+        return W.same_object(a, b)
+    except Exception:
+        return False
+
+
+def ctypes_last_error() -> int:
+    import ctypes
+
+    return int(ctypes.get_last_error())
+
+
+def _shorten(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+class RecBrowserApp:
+    """The recording browser window: toolbar, tabs (one WebBrowser control each), status bar.
+
+    ``run()`` sets the per-process proxy (and the 表示モード User-Agent), opens the window at ``url``,
+    calls ``ready()`` and runs the message loop until the window closes; it returns the exit code.
+    ``stop()`` may be called from any thread (stdin control): the window closes like [記録をおわる].
+    """
+
+    MAIN_CLASS = "ReqrecRecBrowser"
+    PAGE_CLASS = "ReqrecRecBrowserPage"
+    RECORDING_TEXT = "● 記録中 — このウィンドウで開いた http:// のページの通信を記録しています（https:// は記録されません）"
+    MAX_TAB_TEXT = 40
+    #: Page functions ``--selftest`` calls on the first page, in this order (tests/ie_support.py's site).
+    SELFTEST_FUNCTIONS = ("doOpen", "doBlankPost", "doBlankLink", "doModeless", "doModal", "doClosePopup")
+    ID_BACK, ID_FORWARD, ID_RELOAD, ID_CLOSE_TAB, ID_STOP, ID_ADDRESS, ID_TABS, ID_STATUS = range(101, 109)
+    TIMER_SELFTEST, TIMER_GUARD, TIMER_CLOSE_RETRY = 1, 2, 3
+
+    def __init__(
+        self,
+        proxy_address: str,
+        url: Optional[str] = None,
+        title: str = BROWSER_TITLE,
+        emulation: str = "default",
+        bypass: str = "",
+        log: Optional[_RecLog] = None,
+        ready: Optional[Callable[[], None]] = None,
+        selftest: bool = False,
+        seconds: int = 30,
+        functions: Optional[Sequence[str]] = None,
+        force_exit: Optional[Callable[[int], None]] = None,
+    ) -> None:
+        self.W = _rb_win32()
+        #: Last resort when a modal dialog will not let the window close: end the process (the
+        #: recording is on disk; ``run_recorder`` passes a function that writes it once more first).
+        self._force_exit: Callable[[int], None] = force_exit or os._exit
+        self.proxy_address = proxy_address
+        self.start_url = (url or "").strip() or "about:blank"
+        self.title = title or BROWSER_TITLE
+        self.emulation = emulation if emulation in EMULATION_MODES else "default"
+        self.bypass = bypass or ""
+        self._log = log or _RecLog(None)
+        self._ready = ready
+        self.selftest = bool(selftest)
+        self.seconds = max(1, int(seconds))
+        self.functions = tuple(functions) if functions else self.SELFTEST_FUNCTIONS
+        self.hwnd = 0
+        self.hinst = self.W.kernel32.GetModuleHandleW(None)
+        self.tabs: list[_RecBrowserTab] = []
+        self.pages: dict[int, _RecBrowserTab] = {}
+        self.retired: list[_RecBrowserTab] = []  # closed tabs: their COM objects stay alive (late calls)
+        self.active: Optional[_RecBrowserTab] = None
+        self.ui_active: Optional[_RecBrowserTab] = None
+        self.active_object = 0
+        self.counter = 0
+        self.exit_code = RECORD_EXIT_OK
+        self.quitting = False
+        self.selftest_started = False
+        self.busy = False
+        self.steps: list[Callable[[], None]] = []
+        self.close_retries = 0
+        self.stop_requested = False
+        self._keep: list = []
+        self.controls: dict[str, int] = {}
+        self.font = self.bold_font = 0
+        self.status_text = ""
+
+    # ------------------------------------------------------------------ logging / status
+    def log(self, text: str) -> None:
+        self._log.write(text)
+
+    def status(self, text: str) -> None:
+        self.status_text = text
+        self.log("status: " + text)
+        bar = self.controls.get("status")
+        if bar:
+            self.W.user32.SendMessageW(bar, self.W.SB_SETTEXTW, 1, self._wide(text))
+
+    def _wide(self, text: str) -> int:
+        buf = self.W.ctypes.create_unicode_buffer(text)
+        self._keep.append(buf)
+        if len(self._keep) > 200:
+            del self._keep[:100]
+        return self.W.addressof(buf)
+
+    # ------------------------------------------------------------------ process-wide options (this process only)
+    def _set_process_options(self) -> bool:
+        W = self.W
+
+        def option(opt: int, buf: Any = None, size: int = 0) -> tuple[bool, int]:
+            ok = W.wininet.InternetSetOptionA(None, opt, buf, size)
+            return bool(ok), (0 if ok else ctypes_last_error())
+
+        ok, err = option(W.INTERNET_OPTION_END_BROWSER_SESSION)
+        self.log("end browser session -> " + ("ok" if ok else f"FAILED (error {err})"))
+        suppress = W.wt.DWORD(W.INTERNET_SUPPRESS_COOKIE_PERSIST)
+        ok, err = option(W.INTERNET_OPTION_SUPPRESS_BEHAVIOR, W.byref(suppress), W.sizeof(suppress))
+        self.log("suppress cookie persist -> " + ("ok" if ok else f"FAILED (error {err})"))
+        info = W.INTERNET_PROXY_INFO(W.INTERNET_OPEN_TYPE_PROXY, self.proxy_address.encode("ascii"), self.bypass.encode("ascii"))
+        self._keep_forever = [info]  # WinINet may keep pointing at these strings
+        ok, err = option(W.INTERNET_OPTION_PROXY, W.byref(info), W.sizeof(info))
+        self.log(f"proxy {self.proxy_address} -> " + ("ok" if ok else f"FAILED (error {err})"))
+        if not ok:
+            self.proxy_error = err
+            return False
+        self.log(f'proxy bypass="{self.bypass}"')
+        info2 = W.INTERNET_PROXY_INFO(W.INTERNET_OPEN_TYPE_PROXY, self.proxy_address.encode("ascii"), self.bypass.encode("ascii"))
+        self._keep_forever.append(info2)
+        hr = W.urlmon.UrlMkSetSessionOption(W.INTERNET_OPTION_PROXY, W.byref(info2), W.sizeof(info2), 0)
+        self.log(f"urlmon proxy -> hr=0x{hr & 0xFFFFFFFF:x}")
+        if self.emulation != "default":
+            buf = W.ctypes.create_string_buffer(512)
+            size = W.wt.DWORD(512)
+            default_ua = buf.value.decode("latin-1") if W.urlmon.ObtainUserAgentString(0, buf, W.byref(size)) == 0 else ""
+            ua = emulation_user_agent(default_ua, self.emulation)
+            if ua:
+                ua_buf = W.ctypes.create_string_buffer(ua.encode("latin-1"))
+                self._keep_forever.append(ua_buf)
+                hr = W.urlmon.UrlMkSetSessionOption(W.URLMON_OPTION_USERAGENT, ua_buf, len(ua), 0)
+                self.log(f"user agent ({self.emulation}) {ua} -> hr=0x{hr & 0xFFFFFFFF:x}")
+            self.log(f"表示モード {self.emulation}: X-UA-Compatible {EMULATION_MODES[self.emulation]}")
+        return True
+
+    # ------------------------------------------------------------------ window, controls, fonts
+    def _visual_styles(self) -> None:
+        """Common controls 6 (themed buttons / tabs) for this thread: an activation context made from a
+        temporary manifest (the same thing ``Application.EnableVisualStyles`` does).  Optional."""
+        W = self.W
+        manifest = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"><dependency><dependentAssembly>'
+                    '<assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" '
+                    'processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>'
+                    '</dependentAssembly></dependency></assembly>')
+        path = ""
+        try:
+            fd, path = tempfile.mkstemp(prefix="reqrec-", suffix=".manifest")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(manifest)
+            ctx = W.ACTCTXW()
+            ctx.cbSize = W.sizeof(W.ACTCTXW)
+            ctx.lpSource = path
+            handle = W.kernel32.CreateActCtxW(W.byref(ctx))
+            if handle and handle != W.c_void_p(-1).value:
+                cookie = W.c_size_t()
+                ok = W.kernel32.ActivateActCtx(handle, W.byref(cookie))
+                self.log("visual styles -> " + ("ok" if ok else "FAILED"))
+        except Exception as exc:
+            self.log(f"visual styles -> FAILED ({exc})")
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        try:
+            comctl32 = W.ctypes.WinDLL("comctl32")
+            icc = W.INITCOMMONCONTROLSEX(W.sizeof(W.INITCOMMONCONTROLSEX), W.ICC_BAR_CLASSES | W.ICC_TAB_CLASSES | W.ICC_STANDARD_CLASSES)
+            comctl32.InitCommonControlsEx.argtypes = [W.POINTER(W.INITCOMMONCONTROLSEX)]
+            comctl32.InitCommonControlsEx(W.byref(icc))
+        except Exception as exc:
+            self.log(f"common controls -> FAILED ({exc})")
+
+    def _fonts(self) -> None:
+        W = self.W
+        ncm = W.NONCLIENTMETRICSW()
+        ncm.cbSize = W.sizeof(W.NONCLIENTMETRICSW)
+        lf = W.LOGFONTW()
+        if W.user32.SystemParametersInfoW(W.SPI_GETNONCLIENTMETRICS, ncm.cbSize, W.byref(ncm), 0):
+            lf = ncm.lfMessageFont
+        else:
+            lf.lfFaceName = "Meiryo UI"
+        lf.lfHeight = min(int(lf.lfHeight) if lf.lfHeight else -13, -13)  # at least 10 pt
+        self.font = W.gdi32.CreateFontIndirectW(W.byref(lf))
+        bold = W.LOGFONTW.from_buffer_copy(lf)
+        bold.lfWeight = 700
+        bold.lfHeight = lf.lfHeight - 3
+        self.bold_font = W.gdi32.CreateFontIndirectW(W.byref(bold))
+        self.font_height = abs(int(lf.lfHeight))
+
+    def _text_width(self, text: str, font: int) -> int:
+        W = self.W
+        dc = W.user32.GetDC(self.hwnd)
+        try:
+            old = W.gdi32.SelectObject(dc, font)
+            size = W.wt.SIZE()
+            W.gdi32.GetTextExtentPoint32W(dc, text, len(text), W.byref(size))
+            W.gdi32.SelectObject(dc, old)
+            return int(size.cx)
+        finally:
+            W.user32.ReleaseDC(self.hwnd, dc)
+
+    def _register_classes(self) -> None:
+        W = self.W
+        self.main_proc = W.WNDPROC(self._main_proc)
+        self.page_proc = W.WNDPROC(self._page_proc)
+        icon = W.user32.LoadIconW(None, W.c_void_p(32512))  # IDI_APPLICATION
+        cursor = W.user32.LoadCursorW(None, W.c_void_p(32512))  # IDC_ARROW
+        for name, proc, brush in ((self.MAIN_CLASS, self.main_proc, 16), (self.PAGE_CLASS, self.page_proc, 6)):
+            wc = W.WNDCLASSEXW()
+            wc.cbSize = W.sizeof(W.WNDCLASSEXW)
+            wc.lpfnWndProc = proc
+            wc.hInstance = self.hinst
+            wc.hIcon = icon
+            wc.hCursor = cursor
+            wc.hbrBackground = brush  # COLOR_BTNFACE + 1 / COLOR_WINDOW + 1
+            wc.lpszClassName = name
+            if not W.user32.RegisterClassExW(W.byref(wc)) and ctypes_last_error() != 1410:  # 1410 = already registered
+                raise RecorderError(f"記録用ブラウザの窓を登録できません (エラー {ctypes_last_error()})")
+            self._keep.append(wc)
+
+    def _create_window(self) -> None:
+        W = self.W
+        work = W.wt.RECT()
+        if not W.user32.SystemParametersInfoW(W.SPI_GETWORKAREA, 0, W.byref(work), 0):
+            work = W.wt.RECT(0, 0, 1280, 800)
+        width = min(1100, work.right - work.left - 20)
+        height = min(800, work.bottom - work.top - 20)
+        x = work.left + (work.right - work.left - width) // 2
+        y = work.top + (work.bottom - work.top - height) // 2
+        self.hwnd = W.user32.CreateWindowExW(0, self.MAIN_CLASS, f"{self.title} — 記録中", W.WS_OVERLAPPEDWINDOW | W.WS_CLIPCHILDREN,
+                                             x, y, width, height, None, None, self.hinst, None)
+        if not self.hwnd:
+            raise RecorderError(f"記録用ブラウザの窓を作れません (エラー {ctypes_last_error()})")
+        self._fonts()
+
+        def child(key: str, cls: str, text: str, style: int, ident: int, ex: int = 0) -> int:
+            h = W.user32.CreateWindowExW(ex, cls, text, W.WS_CHILD | W.WS_VISIBLE | style, 0, 0, 10, 10, self.hwnd, ident, self.hinst, None)
+            if not h:
+                raise RecorderError(f"記録用ブラウザの部品を作れません: {cls} (エラー {ctypes_last_error()})")
+            W.user32.SendMessageW(h, W.WM_SETFONT, self.bold_font if key == "stop" else self.font, 1)
+            self.controls[key] = h
+            return h
+
+        child("back", "BUTTON", "← 戻る", W.BS_PUSHBUTTON | W.WS_TABSTOP, self.ID_BACK)
+        child("forward", "BUTTON", "→ 進む", W.BS_PUSHBUTTON | W.WS_TABSTOP, self.ID_FORWARD)
+        child("reload", "BUTTON", "更新", W.BS_PUSHBUTTON | W.WS_TABSTOP, self.ID_RELOAD)
+        child("address", "EDIT", "", W.ES_AUTOHSCROLL | W.WS_TABSTOP, self.ID_ADDRESS, W.WS_EX_CLIENTEDGE)
+        child("close_tab", "BUTTON", "タブを閉じる", W.BS_PUSHBUTTON | W.WS_TABSTOP, self.ID_CLOSE_TAB)
+        child("stop", "BUTTON", "■ 記録をおわる", W.BS_OWNERDRAW | W.WS_TABSTOP, self.ID_STOP)
+        child("tabs", "SysTabControl32", "", W.WS_CLIPSIBLINGS, self.ID_TABS)
+        child("status", "msctls_statusbar32", "", 0, self.ID_STATUS)
+        # Enter in the address box opens the address: the EDIT's own window procedure is wrapped
+        self.edit_proc = W.WNDPROC(self._address_proc)
+        self.edit_old = W.set_window_long(self.controls["address"], W.GWLP_WNDPROC, W.cast(self.edit_proc, W.c_void_p))
+        W.user32.SendMessageW(self.controls["status"], W.SB_SETTEXTW, W.SBT_OWNERDRAW, 0)  # part 0: drawn in red
+        self.layout()
+        W.user32.ShowWindow(self.hwnd, W.SW_SHOW)
+        W.user32.SetForegroundWindow(self.hwnd)  # may be refused by Windows' foreground rules: harmless
+
+    def layout(self) -> None:
+        W = self.W
+        if not self.hwnd or not self.controls:
+            return
+        rc = W.wt.RECT()
+        W.user32.GetClientRect(self.hwnd, W.byref(rc))
+        width = rc.right - rc.left
+        pad = 6
+        row = max(self.font_height + 16, 30)
+        x = pad
+        for key, text in (("back", "← 戻る"), ("forward", "→ 進む"), ("reload", "更新")):
+            w = self._text_width(text, self.font) + 26
+            W.user32.MoveWindow(self.controls[key], x, pad, w, row, True)
+            x += w + 4
+        stop_w = self._text_width("■ 記録をおわる", self.bold_font) + 40
+        close_w = self._text_width("タブを閉じる", self.font) + 26
+        stop_x = width - pad - stop_w
+        close_x = stop_x - 8 - close_w
+        W.user32.MoveWindow(self.controls["stop"], stop_x, pad, stop_w, row, True)
+        W.user32.MoveWindow(self.controls["close_tab"], close_x, pad, close_w, row, True)
+        edit_h = self.font_height + 10
+        W.user32.MoveWindow(self.controls["address"], x + 4, pad + (row - edit_h) // 2, max(close_x - 8 - (x + 4), 40), edit_h, True)
+        top = pad * 2 + row
+        status = self.controls["status"]
+        W.user32.SendMessageW(status, W.WM_SIZE, 0, 0)
+        src = W.wt.RECT()
+        W.user32.GetWindowRect(status, W.byref(src))
+        status_h = src.bottom - src.top
+        parts = (W.c_int * 2)(max(width - 340, 100), -1)
+        W.user32.SendMessageW(status, W.SB_SETPARTS, 2, W.addressof(parts))
+        W.user32.SendMessageW(status, W.SB_SETTEXTW, W.SBT_OWNERDRAW, 0)
+        W.user32.SendMessageW(status, W.SB_SETTEXTW, 1, self._wide(self.status_text))
+        W.user32.MoveWindow(self.controls["tabs"], 0, top, width, max(rc.bottom - top - status_h, 50), True)
+        page = self.page_rect()
+        for tab in self.tabs:
+            W.user32.MoveWindow(tab.hwnd, page.left, page.top, max(page.right - page.left, 1), max(page.bottom - page.top, 1), True)
+
+    def page_rect(self) -> Any:
+        """Client coordinates (of the main window) of the area a tab's page fills."""
+        W = self.W
+        tabs = self.controls.get("tabs")
+        rc = W.wt.RECT()
+        if not tabs:
+            W.user32.GetClientRect(self.hwnd, W.byref(rc))
+            return rc
+        W.user32.GetWindowRect(tabs, W.byref(rc))
+        W.user32.MapWindowPoints(None, self.hwnd, W.byref(rc), 2)
+        W.user32.SendMessageW(tabs, W.TCM_ADJUSTRECT, 0, W.addressof(rc))
+        return rc
+
+    # ------------------------------------------------------------------ tabs
+    def new_tab(self, popup: bool) -> _RecBrowserTab:
+        W = self.W
+        tab = _RecBrowserTab(self, popup)
+        self.tabs.append(tab)
+        item = W.TCITEMW()
+        item.mask = W.TCIF_TEXT | W.TCIF_PARAM
+        item.pszText = "新しいタブ"
+        item.lParam = tab.hwnd
+        W.user32.SendMessageW(self.controls["tabs"], W.TCM_INSERTITEMW, len(self.tabs) - 1, W.addressof(item))
+        self.layout()  # the first item gives the tab control its strip: the pages move below it
+        self.select(tab)
+        tab.resize()
+        if popup:
+            self.status("新しいタブを開きました")
+        self.log(f"new tab {tab.name}{' (popup)' if popup else ''} handle=0x{tab.hwnd:x}")
+        return tab
+
+    def select(self, tab: _RecBrowserTab) -> None:
+        W = self.W
+        if tab not in self.tabs:
+            return
+        self.active = tab
+        W.user32.SendMessageW(self.controls["tabs"], W.TCM_SETCURSEL, self.tabs.index(tab), 0)
+        for other in self.tabs:
+            if other is not tab:
+                W.user32.ShowWindow(other.hwnd, W.SW_HIDE)
+        W.user32.SetWindowPos(tab.hwnd, W.HWND_TOP, 0, 0, 0, 0, W.SWP_NOMOVE | W.SWP_NOSIZE)
+        W.user32.ShowWindow(tab.hwnd, W.SW_SHOW)
+        self.update_toolbar()
+
+    def set_tab_text(self, tab: _RecBrowserTab) -> None:
+        W = self.W
+        if tab not in self.tabs:
+            return
+        text = (tab.title or "").strip()
+        if not text or text.lower().startswith(("http://", "https://")):
+            host = urlsplit(tab.location()).hostname or ""
+            text = text or host
+        text = _shorten(text or "新しいタブ", self.MAX_TAB_TEXT)
+        item = W.TCITEMW()
+        item.mask = W.TCIF_TEXT
+        item.pszText = text
+        W.user32.SendMessageW(self.controls["tabs"], W.TCM_SETITEMW, self.tabs.index(tab), W.addressof(item))
+
+    def close_tab(self, tab: _RecBrowserTab) -> None:
+        W = self.W
+        if tab not in self.tabs:
+            return
+        self.log("close tab " + tab.name)
+        index = self.tabs.index(tab)
+        W.user32.SendMessageW(self.controls["tabs"], W.TCM_DELETEITEM, index, 0)
+        self.tabs.remove(tab)
+        if self.ui_active is tab:
+            self.ui_active = None
+        tab.destroy()
+        self.retired.append(tab)
+        if self.quitting:
+            return
+        if not self.tabs:  # never leave the window without a tab
+            fresh = self.new_tab(popup=False)
+            fresh.navigate("about:blank")
+        else:
+            self.select(self.tabs[min(index, len(self.tabs) - 1)])
+
+    def host_popup(self, ppdisp_var: Any, cancel_var: Any, url: str) -> None:
+        """Answer NewWindow2/3 with a fresh control in a new tab: the engine navigates it itself, so
+        opener, window name, session and POST body survive."""
+        W = self.W
+        slot = W.cast(W.c_void_p(ppdisp_var.u.byref), W.POINTER(W.c_void_p))
+        if slot[0]:
+            self.log("  -> already hosted")
+            return
+        try:
+            target = self.new_tab(popup=True)
+            if url.lower().startswith(("http://", "https://")):
+                # Without this a window.open(url) popup of a page in IE9+ mode comes up in quirks
+                # mode (see the section comment); the engine's own navigation replaces about:blank.
+                target.navigate("about:blank")
+            disp = W.qi(target.ole, W.IID_IDispatch)  # this reference passes to the engine
+            if not disp:
+                raise RecorderError("no IDispatch")
+        except Exception as exc:
+            self.log(f"  -> new tab FAILED: {exc}")
+            W.cast(W.c_void_p(cancel_var.u.byref), W.POINTER(W.c_short))[0] = -1
+            return
+        slot[0] = disp
+        self.log("  -> hosted in " + target.name)
+
+    def on_ui_activate(self, tab: _RecBrowserTab) -> None:
+        W = self.W
+        previous = self.ui_active
+        self.ui_active = tab
+        if previous is not None and previous is not tab and previous.inplace and not previous.closed:
+            try:
+                W.vcall(previous.inplace, 6, W.HRESULT, [])  # IOleInPlaceObject::UIDeactivate
+            except OSError:
+                pass
+
+    # ------------------------------------------------------------------ toolbar
+    def update_toolbar(self) -> None:
+        W = self.W
+        tab = self.active
+        url = tab.location() if tab is not None else ""
+        if url == "about:blank":
+            url = ""
+        address = self.controls.get("address")
+        if address and (W.user32.GetFocus() != address or W.user32.GetWindowTextLengthW(address) == 0):
+            W.user32.SetWindowTextW(address, url)
+        W.user32.EnableWindow(self.controls["back"], bool(tab and tab.can_back))
+        W.user32.EnableWindow(self.controls["forward"], bool(tab and tab.can_forward))
+
+    def address_text(self) -> str:
+        W = self.W
+        address = self.controls["address"]
+        n = W.user32.GetWindowTextLengthW(address)
+        buf = W.ctypes.create_unicode_buffer(n + 1)
+        W.user32.GetWindowTextW(address, buf, n + 1)
+        return buf.value
+
+    def open_address(self, text: str) -> None:
+        target = (text or "").strip()
+        if not target or self.active is None:
+            return
+        if "://" not in target and not target.lower().startswith("about:"):
+            target = "http://" + target
+        try:
+            self.active.navigate(target)
+        except OSError as exc:
+            self.log(f"navigate failed: {exc}")
+            self.status("このアドレスは開けません")
+
+    # ------------------------------------------------------------------ window procedures
+    def _address_proc(self, hwnd: Any, msg: int, wparam: int, lparam: int) -> int:
+        W = self.W
+        try:
+            if msg == W.WM_KEYDOWN and wparam == W.VK_RETURN:
+                self.open_address(self.address_text())
+                return 0
+            if msg == W.WM_CHAR and wparam in (13, 10):
+                return 0  # no beep
+        except Exception:
+            self.log("address box error: " + traceback.format_exc().strip().replace("\n", " | "))
+        return W.user32.CallWindowProcW(self.edit_old, hwnd, msg, wparam, lparam)
+
+    def _page_proc(self, hwnd: Any, msg: int, wparam: int, lparam: int) -> int:
+        W = self.W
+        try:
+            tab = self.pages.get(hwnd)
+            if tab is not None:
+                if msg == W.WM_SIZE:
+                    tab.resize()
+                    return 0
+                if msg == W.WM_SETFOCUS:
+                    tab.ui_activate()
+                    return 0
+        except Exception:
+            self.log("page error: " + traceback.format_exc().strip().replace("\n", " | "))
+        return W.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _main_proc(self, hwnd: Any, msg: int, wparam: int, lparam: int) -> int:  # noqa: C901 - a message switch
+        W = self.W
+        try:
+            if msg == W.WM_SIZE:
+                self.layout()
+                return 0
+            if msg == W.WM_GETMINMAXINFO:
+                info = W.cast(W.c_void_p(lparam), W.POINTER(W.MINMAXINFO))[0]
+                info.ptMinTrackSize.x, info.ptMinTrackSize.y = 640, 400
+                return 0
+            if msg == W.WM_COMMAND:
+                self._command(wparam & 0xFFFF, (wparam >> 16) & 0xFFFF)
+                return 0
+            if msg == W.WM_NOTIFY:
+                hdr = W.cast(W.c_void_p(lparam), W.POINTER(W.NMHDR))[0]
+                if hdr.hwndFrom == self.controls.get("tabs") and hdr.code == W.TCN_SELCHANGE:
+                    index = W.user32.SendMessageW(self.controls["tabs"], W.TCM_GETCURSEL, 0, 0)
+                    if 0 <= index < len(self.tabs):
+                        self.select(self.tabs[index])
+                        self.tabs[index].ui_activate()
+                return 0
+            if msg == W.WM_DRAWITEM:
+                self._draw(W.cast(W.c_void_p(lparam), W.POINTER(W.DRAWITEMSTRUCT))[0])
+                return 1
+            if msg == W.WM_SETFOCUS:
+                if self.active is not None:
+                    self.active.ui_activate()
+                return 0
+            if msg == W.WM_TIMER:
+                self._timer(int(wparam))
+                return 0
+            if msg == W.WM_APP_CLOSE_TAB:
+                tab = self.pages.get(int(wparam))
+                if tab is not None:
+                    self.close_tab(tab)
+                return 0
+            if msg in (W.WM_CLOSE, W.WM_APP_STOP):
+                self.request_quit(self.exit_code)
+                return 0
+            if msg == W.WM_DESTROY:
+                W.user32.PostQuitMessage(self.exit_code)
+                return 0
+        except Exception:
+            self.log("window error: " + traceback.format_exc().strip().replace("\n", " | "))
+        return W.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _command(self, ident: int, code: int) -> None:
+        tab = self.active
+        if ident == self.ID_BACK and tab is not None and tab.can_back:
+            tab.command("GoBack")
+        elif ident == self.ID_FORWARD and tab is not None and tab.can_forward:
+            tab.command("GoForward")
+        elif ident == self.ID_RELOAD and tab is not None:
+            tab.command("Refresh")
+        elif ident == self.ID_CLOSE_TAB and tab is not None:
+            self.close_tab(tab)
+        elif ident == self.ID_STOP:
+            self.log("stop button")
+            self.request_quit(RECORD_EXIT_OK)
+
+    def _draw(self, item: Any) -> None:
+        W = self.W
+        if item.hwndItem == self.controls.get("stop"):
+            pressed = bool(item.itemState & W.ODS_SELECTED)
+            brush = W.gdi32.CreateSolidBrush(0x001E1EA0 if pressed else 0x001E1EC4)  # COLORREF = 0x00BBGGRR
+            rc = W.wt.RECT(item.rcItem.left, item.rcItem.top, item.rcItem.right, item.rcItem.bottom)
+            W.user32.FillRect(item.hDC, W.byref(rc), brush)
+            W.gdi32.DeleteObject(brush)
+            old = W.gdi32.SelectObject(item.hDC, self.bold_font)
+            W.gdi32.SetBkMode(item.hDC, W.TRANSPARENT)
+            W.gdi32.SetTextColor(item.hDC, 0x00FFFFFF)
+            W.user32.DrawTextW(item.hDC, "■ 記録をおわる", -1, W.byref(rc), W.DT_CENTER | W.DT_VCENTER | W.DT_SINGLELINE)
+            W.gdi32.SelectObject(item.hDC, old)
+            if item.itemState & W.ODS_FOCUS:
+                inner = W.wt.RECT(rc.left + 3, rc.top + 3, rc.right - 3, rc.bottom - 3)
+                W.user32.DrawFocusRect(item.hDC, W.byref(inner))
+        elif item.hwndItem == self.controls.get("status"):
+            rc = W.wt.RECT(item.rcItem.left + 4, item.rcItem.top, item.rcItem.right - 2, item.rcItem.bottom)
+            old = W.gdi32.SelectObject(item.hDC, self.font)
+            W.gdi32.SetBkMode(item.hDC, W.TRANSPARENT)
+            W.gdi32.SetTextColor(item.hDC, 0x000000AA)  # dark red
+            W.user32.DrawTextW(item.hDC, self.RECORDING_TEXT, -1, W.byref(rc), W.DT_LEFT | W.DT_VCENTER | W.DT_SINGLELINE | W.DT_END_ELLIPSIS)
+            W.gdi32.SelectObject(item.hDC, old)
+
+    # ------------------------------------------------------------------ closing
+    def stop(self) -> None:
+        """Close the browser like its [記録をおわる] button (any thread; before the window exists, it
+        closes as soon as it is open)."""
+        self.stop_requested = True
+        if self.hwnd:
+            self.W.user32.PostMessageW(self.hwnd, self.W.WM_APP_STOP, 0, 0)
+
+    def request_quit(self, code: int) -> None:
+        """Close every tab and the window.  While a modal dialog (alert, showModalDialog, the download
+        dialog) is open the window is disabled: the dialogs are asked to close first and closing is
+        retried; after about 5 seconds the process ends anyway (the recording is on disk)."""
+        W = self.W
+        self.exit_code = code
+        if self.quitting:
+            return
+        if not W.user32.IsWindowEnabled(self.hwnd) and self.close_retries < 20:
+            self.close_retries += 1
+            self._close_dialogs()
+            W.user32.SetTimer(self.hwnd, self.TIMER_CLOSE_RETRY, 250, None)
+            return
+        if not W.user32.IsWindowEnabled(self.hwnd):
+            self.log("modal dialog did not close -> exit anyway")
+            self._force_exit(code)
+            return
+        self.quitting = True
+        for tab in list(self.tabs):
+            self.close_tab(tab)
+        W.user32.DestroyWindow(self.hwnd)
+
+    def _close_dialogs(self) -> None:
+        W = self.W
+
+        def each(hwnd: Any, lparam: Any) -> bool:
+            buf = W.ctypes.create_unicode_buffer(64)
+            W.user32.GetClassNameW(hwnd, buf, 64)
+            if buf.value in ("#32770", "Internet Explorer_TridentDlgFrame") and W.user32.IsWindowVisible(hwnd):
+                W.user32.PostMessageW(hwnd, W.WM_CLOSE, 0, 0)
+            return True
+
+        callback = W.ENUMWINDOWSPROC(each)
+        W.user32.EnumThreadWindows(W.kernel32.GetCurrentThreadId(), callback, 0)
+
+    # ------------------------------------------------------------------ timers / --selftest
+    def _timer(self, ident: int) -> None:
+        W = self.W
+        if ident == self.TIMER_CLOSE_RETRY:
+            W.user32.KillTimer(self.hwnd, self.TIMER_CLOSE_RETRY)
+            self.request_quit(self.exit_code)
+        elif ident == self.TIMER_GUARD:
+            W.user32.KillTimer(self.hwnd, self.TIMER_GUARD)
+            self.log(f"selftest: guard timeout after {self.seconds} s -> exit {RECORD_EXIT_TIMEOUT}")
+            self.request_quit(RECORD_EXIT_TIMEOUT)
+        elif ident == self.TIMER_SELFTEST and not self.busy:  # busy: a modal dialog's loop re-entered
+            if not self.steps:
+                W.user32.KillTimer(self.hwnd, self.TIMER_SELFTEST)
+                return
+            self.busy = True
+            try:
+                self.steps.pop(0)()
+            except Exception as exc:
+                self.log(f"selftest: step error: {exc}")
+            finally:
+                self.busy = False
+
+    def document_complete(self, tab: _RecBrowserTab, url: str) -> None:
+        if not self.selftest or self.selftest_started or tab is not (self.tabs[0] if self.tabs else None):
+            return
+        if not url or url == "about:blank":
+            return
+        self.selftest_started = True
+        self.log("selftest: first page completed " + url)
+        for fn in self.functions:
+            self.steps.append(lambda fn=fn: self._selftest_call(tab, fn))
+        self.steps.append(self._selftest_tabs)
+        self.steps.append(self._selftest_done)
+        self.W.user32.SetTimer(self.hwnd, self.TIMER_SELFTEST, 1500, None)
+
+    def _selftest_call(self, tab: _RecBrowserTab, fn: str) -> None:
+        if tab.eval("typeof " + fn) != "function":
+            self.log(f"selftest: {fn} not present, skipped")
+            return
+        try:
+            r = tab.call_page(fn)
+            self.log(f"selftest: {fn} -> {'(null)' if r is None else r}")
+        except Exception as exc:
+            self.log(f"selftest: {fn} error: {exc}")
+
+    def _selftest_tabs(self) -> None:
+        self.log(f"selftest: tabs={len(self.tabs)}")
+        for tab in self.tabs:
+            url = tab.location() or "(none)"
+            mode = tab.eval("document.documentMode")
+            opener = tab.eval("window.opener ? 'yes' : 'no'")
+            name = tab.eval("window.name")
+            self.log(f"tab: {url} mode={mode} opener={opener} name={name}")
+
+    def _selftest_done(self) -> None:
+        self.log(f"selftest: done -> exit {RECORD_EXIT_OK}")
+        self.request_quit(RECORD_EXIT_OK)
+
+    # ------------------------------------------------------------------ run
+    def run(self) -> int:
+        W = self.W
+        if not self._set_process_options():
+            _record_error(f"記録用の中継設定に失敗したため、記録できません (エラー {getattr(self, 'proxy_error', '?')})。"
+                          "もう一度 [記録をはじめる] を押してください。")
+            return RECORD_EXIT_PROXY
+        hr = W.ole32.OleInitialize(None)
+        self.log(f"OleInitialize -> hr=0x{hr & 0xFFFFFFFF:x}")
+        self._visual_styles()
+        self._register_classes()
+        self.frame = self._make_frame()
+        self._create_window()
+        self.log(f"title {self.title} — 記録中")
+        first = self.new_tab(popup=False)
+        if self.selftest:
+            W.user32.SetTimer(self.hwnd, self.TIMER_GUARD, self.seconds * 1000, None)
+        target = self.start_url
+        if "://" not in target and not target.lower().startswith("about:"):
+            target = "http://" + target
+        first.navigate(target)
+        first.ui_activate()
+        if self._ready is not None:
+            self._ready()
+        if self.stop_requested:  # ``stop`` arrived while the window was being made
+            W.user32.PostMessageW(self.hwnd, W.WM_APP_STOP, 0, 0)
+        msg = W.wt.MSG()
+        while True:
+            r = W.user32.GetMessageW(W.byref(msg), None, 0, 0)
+            if r == 0 or r == -1:
+                break
+            if W.WM_KEYFIRST <= msg.message <= W.WM_KEYLAST and self._pretranslate(msg):
+                continue
+            W.user32.TranslateMessage(W.byref(msg))
+            W.user32.DispatchMessageW(W.byref(msg))
+        self.log(f"window closed -> exit {self.exit_code}")
+        return self.exit_code
+
+    def _pretranslate(self, msg: Any) -> bool:
+        """Keyboard messages for the page go to its active object first (Tab, Enter, Delete, Ctrl+C ...)."""
+        W = self.W
+        tab = self.ui_active or self.active
+        if not self.active_object or tab is None or tab.closed:
+            return False
+        if msg.hWnd != tab.hwnd and not W.user32.IsChild(tab.hwnd, msg.hWnd):
+            return False
+        try:
+            return W.vcall(self.active_object, 5, W.HRESULT, [W.POINTER(W.wt.MSG)], W.byref(msg)) == W.S_OK
+        except OSError:
+            return False
+
+    def _make_frame(self) -> Any:
+        W = self.W
+
+        def get_window(this: Any, phwnd: Any) -> int:
+            phwnd[0] = self.hwnd
+            return W.S_OK
+
+        def set_active_object(this: Any, active: Any, name: Any) -> int:
+            old = self.active_object
+            if active:
+                W.addref(active)
+            self.active_object = int(active or 0)
+            if old:
+                W.release(old)
+            return W.S_OK
+
+        P = W.P
+        frame = W.ComObject("frame", self.log)
+        frame.implement([W.IID_IOleInPlaceFrame, W.IID_IOleInPlaceUIWindow, W.IID_IOleWindow], [
+            (P(W.POINTER(W.wt.HWND)), get_window),                                    # GetWindow
+            (P(W.wt.BOOL), lambda this, mode: W.E_NOTIMPL),                           # ContextSensitiveHelp
+            (P(W.POINTER(W.wt.RECT)), lambda this, rc: W.E_NOTIMPL),                  # GetBorder
+            (P(W.c_void_p), lambda this, widths: W.E_NOTIMPL),                        # RequestBorderSpace
+            (P(W.c_void_p), lambda this, widths: W.E_NOTIMPL),                        # SetBorderSpace
+            (P(W.c_void_p, W.c_wchar_p), set_active_object),                          # SetActiveObject
+            (P(W.c_void_p, W.c_void_p), lambda this, menu, widths: W.E_NOTIMPL),      # InsertMenus
+            (P(W.c_void_p, W.c_void_p, W.wt.HWND), lambda this, m, o, h: W.S_OK),     # SetMenu
+            (P(W.c_void_p), lambda this, menu: W.E_NOTIMPL),                          # RemoveMenus
+            (P(W.c_wchar_p), lambda this, text: W.S_OK),                              # SetStatusText
+            (P(W.wt.BOOL), lambda this, enable: W.S_OK),                              # EnableModeless
+            (P(W.c_void_p, W.wt.WORD), lambda this, msg, ident: W.S_FALSE),           # TranslateAccelerator
+        ])
+        return frame
+
+
+def _record_error(message: str) -> None:
+    """A Japanese error line on stderr (the GUI shows the last one)."""
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- reqrec record (the child process)
+
+def run_recorder(
+    out: str,
+    url: Optional[str] = None,
+    title: str = BROWSER_TITLE,
+    emulation: str = "default",
+    log_path: Optional[str] = None,
+    bypass: str = "",
+    control: str = "none",
+    selftest: bool = False,
+    seconds: int = 30,
+    headless: bool = False,
+    functions: Optional[Sequence[str]] = None,
+    ready: Optional[Callable[[int], None]] = None,
+) -> int:
+    """Record until the recording browser is closed; returns an exit code (``RECORD_EXIT_*``).
+
+    ``headless`` runs only the proxy (no window; tests and non-Windows checks): it stops on ``stop`` /
+    the end of stdin (``control="stdin"``) or Ctrl+C.  ``ready(port)`` defaults to printing
+    ``READY <port>`` on stdout.
+    """
+    if emulation not in EMULATION_MODES:
+        _record_error(f"表示モードは {' / '.join(EMULATION_MODES)} のいずれかで指定してください: {emulation}")
+        return RECORD_EXIT_USAGE
+    if not headless:
+        availability = recorder_availability()
+        if not availability["available"]:
+            _record_error(str(availability["reason"]))
+            return RECORD_EXIT_START
+    log = _RecLog(log_path)
+    log.write(f"reqrec record start (python {sys.version.split()[0]}, {struct.calcsize('P') * 8}-bit, pid {os.getpid()})")
+    try:
+        store = RecordingStore(out, meta={"emulation": emulation}).start()
+    except OSError as exc:
+        _record_error(f"記録ファイルを作成できません: {exc}")
+        log.close()
+        return RECORD_EXIT_START
+
+    def on_flow(count: int, flow: Flow) -> None:
+        status: Any = flow.response.status if flow.response is not None else "ERR"
+        log.write(f"flow #{count} {flow.request.method} {truncate(flow.request.url, 160)} -> {status}")
+
+    try:
+        proxy = RecordingProxy(store, compat=EMULATION_MODES[emulation], on_flow=on_flow)
+    except OSError as exc:
+        _record_error(f"記録用の中継を開始できません: {exc}")
+        store.close()
+        log.close()
+        return RECORD_EXIT_PROXY
+    proxy.start()
+    address = f"{RECORD_LISTEN_HOST}:{proxy.port}"
+    log.write(f"recording proxy listening on {address}")
+
+    def announce() -> None:
+        if ready is not None:
+            ready(proxy.port)
+            return
+        try:
+            # the pid too: a venv's python.exe is a launcher that runs the real interpreter as its child
+            print(f"READY {proxy.port} {os.getpid()}", flush=True)
+        except (OSError, ValueError, AttributeError):  # no stdout (pythonw without a pipe)
+            pass
+
+    finished: list[int] = []
+
+    def finish(code: int) -> int:
+        """Stop the proxy, write the recording one last time, close the log (once)."""
+        if finished:
+            return finished[0]
+        finished.append(code)
+        try:
+            proxy.shutdown()
+            proxy.server_close()
+        except Exception:
+            pass
+        try:
+            path = store.close()
+            log.write(f"recording: {len(store)} flows -> {path}")
+        except OSError as exc:
+            _record_error(f"記録ファイルを書き込めません: {exc}")
+        log.write(f"exit {code}")
+        log.close()
+        return code
+
+    def force_exit(code: int) -> None:  # a modal dialog would not let the window close
+        finish(code)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(code)
+
+    code = RECORD_EXIT_OK
+    try:
+        if headless:
+            announce()
+            _wait_for_stop(control)
+        else:
+            app = RecBrowserApp(address, url=url, title=title, emulation=emulation, bypass=bypass, log=log,
+                                ready=announce, selftest=selftest, seconds=seconds, functions=functions,
+                                force_exit=force_exit)
+            if control == "stdin":
+                threading.Thread(target=_stdin_control, args=(app,), name="reqrec-stdin", daemon=True).start()
+            try:
+                code = app.run()
+            except Exception as exc:  # RecorderError (Japanese) or anything the engine raised
+                _record_error(f"記録用ブラウザを開けませんでした: {exc}")
+                log.write("fatal: " + traceback.format_exc().strip().replace("\n", " | "))
+                code = RECORD_EXIT_START
+    except KeyboardInterrupt:
+        code = RECORD_EXIT_OK
+    finally:
+        code = finish(code)
+    return code
+
+
+def _wait_for_stop(control: str) -> None:
+    """Headless mode: block until ``stop`` / the end of stdin (``control="stdin"``) or Ctrl+C."""
+    if control == "stdin":
+        for line in sys.stdin:
+            if line.strip().lower() == "stop":
+                return
+        return
+    while True:
+        time.sleep(3600)
+
+
+def _stdin_control(app: RecBrowserApp) -> None:
+    """``--control stdin``: ``stop`` (or the end of stdin: the GUI went away) closes the browser."""
+    try:
+        for line in sys.stdin:
+            if line.strip().lower() == "stop":
+                break
+    except (OSError, ValueError):
+        pass
+    app.stop()
+
+
+# --------------------------------------------------------------------------- RecorderManager (the GUI's side)
 
 #: Reading a very large recording with ``json.loads`` every second would hurt; above this size a
 #: regular expression counts the flow ids instead.
 _JSON_COUNT_MAX_BYTES = 24 * 1024 * 1024
 _RECORDER_FLOW_ID_RE = re.compile(rb'"id":\s*"f\d{4,}"')
-
-_MANAGER_GRACE_AFTER_TERMINATE = 5.0
 _READER_JOIN_TIMEOUT = 2.0
 
 CommandBuilder = Callable[..., Sequence[str]]
 
 
-class RecorderError(RuntimeError):
-    """Raised by :class:`RecorderManager` with a Japanese, user-facing message."""
+def recorder_command(
+    out: str,
+    url: Optional[str] = None,
+    emulation: str = "default",
+    title: str = BROWSER_TITLE,
+    log_path: Optional[str] = None,
+    python: Optional[str] = None,
+) -> list[str]:
+    """``python reqrec.py record ...`` for one recording, stopped through stdin."""
+    cmd = [python or sys.executable or "python", SCRIPT_PATH, "record", "--out", os.path.abspath(out),
+           "--control", "stdin", "--title", title, "--emulation", emulation]
+    if url:
+        cmd += ["--url", str(url)]
+    if log_path:
+        cmd += ["--log", log_path]
+    return cmd
 
 
 def count_flows_in_file(path: str, default: int = 0) -> int:
-    """Number of flows in a recording JSON file.
-
-    Tolerates a missing or not yet written file (before the addon's first flush): returns
-    ``default`` whenever the file cannot be parsed.  Large files are counted with a regular
-    expression on the raw bytes.
-    """
+    """Number of flows in a recording JSON file (``default`` when it cannot be read yet)."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
@@ -7073,44 +8977,60 @@ def count_flows_in_file(path: str, default: int = 0) -> int:
     if not isinstance(data, dict):
         return default
     flows = data.get("flows")
-    if isinstance(flows, list):
-        return len(flows)
-    return default
+    return len(flows) if isinstance(flows, list) else default
+
+
+def _wait(proc: Any, timeout: float) -> Optional[int]:
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
 
 
 class RecorderManager:
-    """Lifecycle of one recording child process (see module docstring).
+    """The GUI's recording: one ``reqrec record`` child process (recording browser + proxy).
 
-    ``command_builder(out, port=...)`` (plus ``extra_args=[...]`` when there are any) must return the
-    argument vector to run; it is called with the absolute output path.  ``popen`` is injectable too.
+    ``start`` spawns it (``command_builder`` / ``popen`` are injectable), ``wait_until_ready`` waits for
+    its ``READY <port>`` line, ``status`` reports the live flow count read from the recording file,
+    ``stop`` ends it gracefully (``stop`` on stdin = the browser's own [記録をおわる]; then WM_CLOSE
+    via ``taskkill /PID``; then terminate / kill) and ``load_recording`` parses the result.  stdout /
+    stderr are drained by reader threads into bounded buffers so the child never blocks.
     """
 
     def __init__(
         self,
         command_builder: Optional[CommandBuilder] = None,
-        popen: Optional[Callable[..., subprocess.Popen]] = None,
+        popen: Optional[Callable[..., Any]] = None,
         max_lines: int = 500,
-        stop_timeout: float = 10.0,
+        stop_timeout: float = 8.0,
+        run: Optional[Callable[..., Any]] = None,
+        job: Optional[Callable[[Any], Optional[int]]] = None,
     ) -> None:
-        self.command_builder: CommandBuilder = command_builder or build_command
+        self.command_builder: CommandBuilder = command_builder or recorder_command
         self._popen = popen or subprocess.Popen
+        self._run = run or subprocess.run
+        self._job = job if job is not None else (_kill_on_close_job if popen is None else None)
         self.max_lines = int(max_lines)
         self.stop_timeout = float(stop_timeout)
         self._lock = threading.RLock()
-        self._proc: Optional[subprocess.Popen] = None
+        self._proc: Any = None
         self._threads: list[threading.Thread] = []
         self._stdout: deque[str] = deque(maxlen=self.max_lines)
         self._stderr: deque[str] = deque(maxlen=self.max_lines)
+        self._ready = threading.Event()
         self._last_count = 0
         self._stop_requested = False
+        self.job_handle: Optional[int] = None
         self.command: list[str] = []
         self.out: Optional[str] = None
+        self.log_path: Optional[str] = None
         self.port: Optional[int] = None
+        #: pid of the process that shows the window (``READY``); differs from ``pid`` when python.exe
+        #: is a venv's launcher
+        self.browser_pid: Optional[int] = None
         self.started_at: Optional[float] = None
         self.stopped_at: Optional[float] = None
         self.exit_code: Optional[int] = None
-
-    # ------------------------------------------------------------------ properties
 
     @property
     def running(self) -> bool:
@@ -7118,111 +9038,72 @@ class RecorderManager:
             return self._proc is not None and self._proc.poll() is None
 
     # ------------------------------------------------------------------ start
-
-    def start(self, out: str, port: int = 8080, extra_args: Sequence[str] = ()) -> dict[str, Any]:
-        """Spawn the recording process; returns :meth:`status`.
-
-        Raises :class:`RecorderError` when a session is already running, the output directory
-        cannot be created or the process fails to start.
-        """
+    def start(self, out: str, url: Optional[str] = None, emulation: str = "default", title: str = BROWSER_TITLE,
+              log_path: Optional[str] = None) -> dict[str, Any]:
+        """Spawn the recording process; returns :meth:`status`.  :class:`RecorderError` when a session
+        is already running, the output folder cannot be made or the process cannot be started."""
         with self._lock:
             if self.running:
                 raise RecorderError("すでに記録中です。先に記録を停止してください。")
-            try:
-                port_int = int(port)
-            except (TypeError, ValueError):
-                raise RecorderError(f"ポート番号が不正です: {port!r}") from None
-            if not 1 <= port_int <= 65535:
-                raise RecorderError(f"ポート番号は 1〜65535 で指定してください: {port_int}")
             out_abs = os.path.abspath(out)
             try:
                 os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
             except OSError as exc:
                 raise RecorderError(f"出力先フォルダを作成できません: {exc}") from exc
-            kwargs: dict[str, Any] = {}
-            if extra_args:
-                kwargs["extra_args"] = list(extra_args)
-            cmd = [str(c) for c in self.command_builder(out_abs, port=port_int, **kwargs)]
+            cmd = [str(c) for c in self.command_builder(out_abs, url=url, emulation=emulation, title=title, log_path=log_path)]
+            env = dict(os.environ)
+            env["PYTHONIOENCODING"] = "utf-8"
             popen_kwargs: dict[str, Any] = dict(
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
             )
-            if os.name == "nt":  # own process group so CTRL_BREAK_EVENT reaches only the child
-                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             try:
                 proc = self._popen(cmd, **popen_kwargs)
             except OSError as exc:
-                raise RecorderError(f"記録プロセスを起動できません: {exc}") from exc
+                raise RecorderError(f"記録用ブラウザを起動できません: {exc}") from exc
+            if self.job_handle:
+                _close_handle(self.job_handle)
+            self.job_handle = self._job(proc) if self._job is not None else None
             self._proc = proc
             self.command = cmd
             self.out = out_abs
-            self.port = port_int
+            self.log_path = log_path
+            self.port = None
+            self.browser_pid = None
             self.started_at = time.time()
             self.stopped_at = None
             self.exit_code = None
             self._stop_requested = False
             self._last_count = 0
+            self._ready = threading.Event()
             self._stdout = deque(maxlen=self.max_lines)
             self._stderr = deque(maxlen=self.max_lines)
             self._threads = []
             for stream, buf, label in ((proc.stdout, self._stdout, "stdout"), (proc.stderr, self._stderr, "stderr")):
                 if stream is None:
                     continue
-                t = threading.Thread(target=self._drain, args=(stream, buf), name=f"reqrec-recorder-{label}", daemon=True)
+                t = threading.Thread(target=self._drain, args=(stream, buf, label == "stdout"), name=f"reqrec-recorder-{label}", daemon=True)
                 t.start()
                 self._threads.append(t)
             return self.status()
 
-    def wait_until_listening(
-        self,
-        timeout: float = 20.0,
-        connect: Optional[Callable[..., Any]] = None,
-        interval: float = 0.2,
-    ) -> bool:
-        """Block until the proxy accepts TCP connections on ``127.0.0.1:port``.
-
-        mitmdump needs a second or two to import before it binds; a client that is pointed at the
-        proxy earlier (the in-app recording browser, DESIGN.md §13.12) gets 「ページを表示できません」.
-        Returns ``False`` when the child exits first or ``timeout`` passes.  Does not hold the lock
-        while waiting.  ``connect`` is injectable (default :func:`socket.create_connection`).
-        """
-        dial = connect or socket.create_connection
-        with self._lock:
-            port = self.port
-            out = self.out
-        if not port:
-            return False
-        host = RECORD_LISTEN_HOST
-        deadline = time.time() + max(0.0, float(timeout))
-        while True:
-            if not self.running or self.out != out:
-                return False
-            try:
-                conn = dial((host, int(port)), timeout=0.5)
-            except OSError:
-                conn = None
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                return True
-            if time.time() >= deadline:
-                return False
-            time.sleep(interval)
-
-    @staticmethod
-    def _drain(stream: Any, buf: deque) -> None:
+    def _drain(self, stream: Any, buf: deque, parse_ready: bool) -> None:
         try:
             for line in iter(stream.readline, ""):
                 if not line:
                     break
-                buf.append(line.rstrip("\r\n"))
+                text = line.rstrip("\r\n")
+                buf.append(text)
+                if parse_ready and text.startswith("READY "):
+                    fields = text.split()
+                    try:
+                        self.port = int(fields[1])
+                        self.browser_pid = int(fields[2]) if len(fields) > 2 else None
+                    except (IndexError, ValueError):
+                        pass
+                    self._ready.set()
         except (ValueError, OSError):  # stream closed while reading
             pass
         finally:
@@ -7231,14 +9112,26 @@ class RecorderManager:
             except Exception:
                 pass
 
+    def wait_until_ready(self, timeout: float = RECORD_READY_TIMEOUT, interval: float = 0.1) -> bool:
+        """Block until the child printed ``READY`` (proxy listening, window open).  ``False`` when it
+        exited first or ``timeout`` passed.  Does not hold the lock while waiting."""
+        deadline = time.time() + max(0.0, float(timeout))
+        ready = self._ready
+        while True:
+            if ready.wait(interval):
+                return True
+            if not self.running:
+                return ready.is_set()
+            if time.time() >= deadline:
+                return False
+
+    @property
+    def ready(self) -> bool:
+        return self._ready.is_set()
+
     # ------------------------------------------------------------------ stop
-
     def stop(self, timeout: Optional[float] = None) -> Optional[int]:
-        """Stop the child gracefully and return its exit code (``None`` when nothing was running).
-
-        Order: SIGINT / CTRL_BREAK_EVENT (lets the addon flush) -> wait ``timeout`` ->
-        ``terminate()`` -> wait -> ``kill()``.
-        """
+        """End the child gracefully and return its exit code (``None`` when nothing ran)."""
         grace = self.stop_timeout if timeout is None else float(timeout)
         with self._lock:
             proc = self._proc
@@ -7248,35 +9141,45 @@ class RecorderManager:
             rc = proc.poll()
             if rc is None:
                 rc = self._shutdown(proc, grace)
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except (OSError, ValueError):
+                pass
             for t in self._threads:
                 t.join(_READER_JOIN_TIMEOUT)
             self._threads = []
+            if self.job_handle:
+                _close_handle(self.job_handle)
+                self.job_handle = None
             self.exit_code = rc
             self.stopped_at = time.time()
             self._proc = None
             return rc
 
-    @staticmethod
-    def _shutdown(proc: subprocess.Popen, grace: float) -> int:
-        try:
-            if os.name == "nt":
-                sig = getattr(signal, "CTRL_BREAK_EVENT", None)
-                if sig is not None:
-                    proc.send_signal(sig)
-                else:  # pragma: no cover - very old Python on Windows
-                    proc.terminate()
-            else:
-                proc.send_signal(signal.SIGINT)
-        except (ProcessLookupError, OSError, ValueError):
+    def _shutdown(self, proc: Any, grace: float) -> int:
+        try:  # 1. like the browser's own [記録をおわる]: the window closes, the file is written
+            if proc.stdin is not None:
+                proc.stdin.write("stop\n")
+                proc.stdin.flush()
+        except (OSError, ValueError):
             pass
         rc = _wait(proc, grace)
         if rc is not None:
             return rc
-        try:
+        if os.name == "nt" and getattr(proc, "pid", None):  # 2. WM_CLOSE to its windows (and a venv launcher's child)
+            try:
+                self._run(["taskkill", "/PID", str(proc.pid), "/T"], capture_output=True, text=True, errors="replace", timeout=10.0)
+            except Exception:
+                pass
+            rc = _wait(proc, 3.0)
+            if rc is not None:
+                return rc
+        try:  # 3. the file written so far stays (it is rewritten every half second)
             proc.terminate()
         except (ProcessLookupError, OSError):
             pass
-        rc = _wait(proc, _MANAGER_GRACE_AFTER_TERMINATE)
+        rc = _wait(proc, 3.0)
         if rc is not None:
             return rc
         try:
@@ -7286,14 +9189,8 @@ class RecorderManager:
         return proc.wait()
 
     def forget(self) -> bool:
-        """Drop the output file of a **stopped** session so :meth:`status` no longer reports it.
-
-        Used when the recording was thrown away ([やめる] in the GUI, which deletes the file) or never
-        really started (the recording browser could not be opened): afterwards ``out`` is ``None``, so
-        the GUI does not claim 「記録は保存されました」 and :meth:`load_recording` refuses.  The exit
-        code and the output tails stay for diagnostics.  Returns ``False`` (and changes nothing)
-        while the child is still running.
-        """
+        """Drop the output file of a **stopped** session ([やめる], or a start that failed): afterwards
+        ``out`` is ``None``.  ``False`` (and nothing changes) while the child still runs."""
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 return False
@@ -7302,17 +9199,14 @@ class RecorderManager:
             return True
 
     def close(self) -> None:
-        """``stop()`` that never raises (for ``atexit`` / app shutdown)."""
+        """``stop()`` that never raises (app shutdown)."""
         try:
             self.stop()
         except Exception:
             pass
 
     # ------------------------------------------------------------------ inspection
-
     def flow_count(self) -> int:
-        """Flows written so far (``0`` before the first flush).  While the file is being replaced
-        the previous good count is returned."""
         out = self.out
         if not out:
             return 0
@@ -7323,8 +9217,8 @@ class RecorderManager:
         return count
 
     def status(self) -> dict[str, Any]:
-        """Snapshot for the GUI: ``{running, flows, out, pid, exit_code, started_at, stopped_at,
-        port, hosts, stdout_tail, stderr_tail, error, command}``."""
+        """``{running, ready, flows, out, out_name, pid, exit_code, started_at, stopped_at, port, log,
+        stdout_tail, stderr_tail, error, command}`` for the GUI."""
         with self._lock:
             proc = self._proc
             running = proc is not None and proc.poll() is None
@@ -7337,20 +9231,21 @@ class RecorderManager:
             error: Optional[str] = None
             if (not running and not self._stop_requested and self.out is not None
                     and exit_code not in (None, 0) and self.started_at is not None):
-                # The child died on its own (port in use, missing dependency, ...): surface why.
-                detail = stderr_tail.strip().splitlines()
-                last = detail[-1] if detail else ""
-                error = f"記録プロセスが終了コード {exit_code} で終了しました" + (f": {last}" if last else "")
+                detail = [line for line in stderr_tail.strip().splitlines() if line.strip()]
+                error = detail[-1] if detail else f"記録用ブラウザが終了コード {exit_code} で終了しました"
             return {
                 "running": running,
+                "ready": self._ready.is_set(),
                 "flows": self.flow_count(),
                 "out": self.out,
                 "out_name": os.path.basename(self.out) if self.out else None,
-                "pid": proc.pid if proc is not None else None,
+                "pid": getattr(proc, "pid", None) if proc is not None else None,
+                "browser_pid": self.browser_pid,
                 "exit_code": exit_code,
                 "started_at": self.started_at,
                 "stopped_at": self.stopped_at,
                 "port": self.port,
+                "log": self.log_path,
                 "stdout_tail": stdout_tail,
                 "stderr_tail": stderr_tail,
                 "error": error,
@@ -7358,1523 +9253,15 @@ class RecorderManager:
             }
 
     def load_recording(self) -> Recording:
-        """Parse the recording written by the last / current session (``Recording.load``)."""
+        """Parse the recording written by the last / current session."""
         if not self.out:
             raise RecorderError("記録ファイルがありません。先に記録を開始してください。")
         if not os.path.exists(self.out):
-            raise RecorderError(
-                "記録ファイルが作成されませんでした。記録用ブラウザで http:// のページを"
-                " 1 つ以上開いてください。"
-            )
+            raise RecorderError("記録ファイルが作成されませんでした。記録用ブラウザで http:// のページを 1 つ以上開いてください。")
         try:
             return Recording.load(self.out)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise RecorderError(f"記録ファイルを読み込めません: {exc}") from exc
-
-
-# ===== former reqrec/iehost.py: recording browser (build / launch / document mode) =====
-# Recording browser for legacy intranet sites: a hosted IE engine routed through the local proxy.
-# Contract: DESIGN.md §13.12.  Importable on every OS; everything Windows-specific is guarded and
-# takes injectable dependencies (``exists`` / ``run`` / ``popen`` / ``winreg``) so the logic is unit
-# tested anywhere without compiling, starting processes or touching the registry.
-#
-# Why a separate process
-# ----------------------
-# Edge's IE mode can only be pointed at a proxy by changing the Windows (system) proxy, which many
-# factory PCs forbid.  ``RecBrowser.exe`` (C# source:
-# :data:`RECBROWSER_CS` right after this section, compiled on first use with the ``csc.exe`` that
-# ships with the inbox .NET Framework 4.x) hosts the very same Trident / MSHTML engine (``WebBrowser``
-# control) and sets the proxy **for its own process only**::
-#
-#     InternetSetOptionA(NULL, INTERNET_OPTION_PROXY, {dwAccessType=3, "127.0.0.1:PORT", bypass=""})
-#
-# Nothing is written to the registry or Internet Options, no certificate is needed (the recorder is
-# started with a catch-all ``--ignore-hosts`` pattern so HTTPS on every port passes through untouched
-# and only plain ``http://``, the normal case for a LAN intranet site, is recorded).  The exe is always
-# built 32-bit (``-platform:x86``) so the 32-bit ActiveX controls of legacy pages load, as in IE mode.  The bypass list is deliberately **empty**:
-# ``<local>`` would exclude dotless host names such as ``http://kanri/`` from the recording.  Popups
-# (``window.open``, ``target=_blank``, ``showModalDialog`` ...) open as tabs inside the same process,
-# so their traffic is recorded too.
-#
-# Build cache
-# -----------
-# ``iehost.ensure_built(workdir)`` writes :data:`RECBROWSER_CS` to ``<workdir>/bin/RecBrowser.cs``,
-# compiles it to ``<workdir>/bin/RecBrowser.exe`` and stores the SHA-256 of the source (and of the
-# build settings) in ``<workdir>/bin/RecBrowser.cs.sha256``; it recompiles only when the exe is
-# missing, the hash differs (reqrec was updated) or ``force=True``.  Without ``csc.exe`` a prebuilt
-# ``RecBrowser.exe`` next to reqrec.py (``reqrec browser build``) is copied instead.
-#
-# Document mode
-# -------------
-# Without a ``FEATURE_BROWSER_EMULATION`` entry the hosted control runs in IE7 mode (what IE mode
-# does for Compatibility-View intranet sites).  ``iehost.set_emulation`` writes the per-user value
-# ``HKCU\Software\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_BROWSER_EMULATION\RecBrowser.exe``
-# (``11000`` = IE11 mode); this is the only registry value this section ever touches and it affects
-# nothing but ``RecBrowser.exe``.
-#
-# Command line (former ``reqrec/iehost/__main__.py``, now the CLI's ``browser`` sub-command)::
-#
-#     reqrec browser build    # prebuild RecBrowser.exe next to reqrec.py (distribution folder)
-#     reqrec browser status   # is there a prebuilt exe?
-#
-# Namespace
-# ---------
-# The functions and constants live in the class ``iehost`` and are called as before
-# (``iehost.launch(...)``, ``iehost.availability(...)``, ``iehost.EXE_NAME``): several of their names
-# (``build_command``, ``_wait``, ``_write_text``) exist in
-# other sections too.  Inside, they refer to each other through ``iehost.``, so replacing one attribute
-# (tests ``monkeypatch`` ``iehost.csc_path`` / ``iehost.launch``) affects every caller, exactly as
-# replacing an attribute of the former module did.  ``IEHostError`` and ``BrowserProcess`` are
-# top-level classes (``BrowserProcess`` is also reachable as ``iehost.BrowserProcess``).
-
-
-class IEHostError(RuntimeError):
-    """Raised with a Japanese, user-facing message when the recording browser cannot be built or started."""
-
-
-class BrowserProcess:
-    """A running ``RecBrowser.exe``: ``pid`` / ``exe`` / ``log_path`` / ``started_at`` plus ``poll`` / ``close``.
-
-    ``close()`` is graceful first: on Windows ``taskkill /PID <pid>`` (no ``/F``) posts ``WM_CLOSE``
-    so the browser window closes like a user clicking the X; then ``terminate()``, then ``kill()``.
-    ``run`` / ``windows`` are injectable for tests.
-    """
-
-    def __init__(
-        self,
-        proc: Any,
-        exe: str,
-        log_path: str,
-        run: Callable[..., Any] = subprocess.run,
-        started_at: Optional[float] = None,
-        windows: Optional[bool] = None,
-    ) -> None:
-        self._proc = proc
-        self._run = run
-        self._windows = iehost.is_windows() if windows is None else bool(windows)
-        self.pid: int = int(getattr(proc, "pid", 0) or 0)
-        self.exe = exe
-        self.log_path = log_path
-        #: Windows job handle that ends the browser if this process dies (see ``iehost.kill_on_close_job``).
-        self.job_handle: Optional[int] = None
-        self.started_at: float = time.time() if started_at is None else float(started_at)
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        state = "running" if self.running else f"exited({self.poll()})"
-        return f"<BrowserProcess pid={self.pid} {state} exe={self.exe!r}>"
-
-    @property
-    def running(self) -> bool:
-        """True while the browser process is alive."""
-        return self.poll() is None
-
-    @property
-    def returncode(self) -> Optional[int]:
-        return self.poll()
-
-    def poll(self) -> Optional[int]:
-        """Exit code, or ``None`` while running."""
-        return self._proc.poll()
-
-    def wait(self, timeout: Optional[float] = None) -> Optional[int]:
-        """Wait for the browser to exit; ``None`` on timeout."""
-        try:
-            return self._proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return None
-
-    def close(self, timeout: float = 5.0) -> Optional[int]:
-        """Close the browser window and return its exit code (``None`` if it would not die).
-
-        Order: ``taskkill /PID`` (WM_CLOSE, Windows only) -> wait ``timeout`` -> ``terminate()`` ->
-        wait -> ``kill()`` -> wait.  The job handle is released once the process is gone.
-        """
-        rc = self._close(timeout)
-        if rc is not None and self.job_handle:
-            iehost._close_handle(self.job_handle)
-            self.job_handle = None
-        return rc
-
-    def _close(self, timeout: float) -> Optional[int]:
-        rc = self.poll()
-        if rc is not None:
-            return rc
-        if self._windows and self.pid:
-            try:
-                self._run(
-                    ["taskkill", "/PID", str(self.pid)],
-                    capture_output=True, text=True, errors="replace", timeout=iehost._TASKKILL_TIMEOUT,
-                )
-            except Exception:  # taskkill missing / refused: fall through to terminate()
-                pass
-            rc = iehost._wait(self._proc, timeout)
-            if rc is not None:
-                return rc
-        try:
-            self._proc.terminate()
-        except (ProcessLookupError, OSError):
-            pass
-        rc = iehost._wait(self._proc, iehost._GRACE_AFTER_TERMINATE)
-        if rc is not None:
-            return rc
-        try:
-            self._proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
-        return iehost._wait(self._proc, timeout)
-
-
-class iehost:  # noqa: N801 - a namespace, named like the former module its callers use
-    """The recording browser host (former ``reqrec/iehost.py``): build, launch, document mode.
-
-    Used as a namespace only (never instantiated): ``iehost.launch(...)``, ``iehost.EXE_NAME`` ...
-    """
-
-    BrowserProcess = BrowserProcess
-    #: The platform check this section uses (replaceable on its own, as in the former module).
-    is_windows = staticmethod(is_windows)
-
-    #: Name of the compiled host; also the value name FEATURE_BROWSER_EMULATION looks up.
-    EXE_NAME = "RecBrowser.exe"
-
-    #: File next to the exe holding the SHA-256 of the source it was built from.
-    HASH_NAME = "RecBrowser.cs.sha256"
-
-    #: Name of the C# source file csc compiles: :data:`RECBROWSER_CS` written to ``<workdir>/bin/``.
-    SOURCE_NAME = "RecBrowser.cs"
-
-    #: Distribution folder of a prebuilt exe (``reqrec browser build``): the folder of reqrec.py.
-    SHIPPED_DIR = os.path.dirname(os.path.abspath(__file__))
-
-    #: Registry path (under HKEY_CURRENT_USER) of the per-executable document-mode override.
-    FEATURE_BROWSER_EMULATION_KEY = r"Software\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_BROWSER_EMULATION"
-
-    #: Document-mode presets for ``set_emulation`` (``None`` = no override = IE7 mode in the hosted control).
-    EMULATION_LEVELS: dict[str, Optional[int]] = {
-        "default": None,
-        "ie8": 8000,
-        "ie11": 11000,
-        "ie11_force": 11001,
-    }
-
-    #: ``%WINDIR%``-relative locations of the inbox C# compiler, preferred first (either one builds the
-    #: 32-bit exe, see :data:`BUILD_PLATFORM`).
-    _CSC_RELATIVE = (
-        os.path.join("Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe"),
-        os.path.join("Microsoft.NET", "Framework", "v4.0.30319", "csc.exe"),
-    )
-
-    _CSC_TIMEOUT = 120.0
-    _TASKKILL_TIMEOUT = 10.0
-    _GRACE_AFTER_TERMINATE = 3.0
-
-    _NO_CSC_MESSAGE = (
-        "記録用ブラウザを作成するためのコンパイラ (csc.exe) が見つかりません。"
-        "Windows 標準の .NET Framework 4.x が入っているパソコンで実行してください。"
-    )
-
-    # ----------------------------------------------------------------------- discovery
-
-    @staticmethod
-    def csc_path(exists: Callable[[str], bool] = os.path.isfile, env: Optional[dict] = None) -> Optional[str]:
-        """Path of the inbox C# compiler: ``%WINDIR%\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe``
-        (then the 32-bit ``Framework`` directory), or ``None`` when neither exists."""
-        environ = os.environ if env is None else env
-        windir = environ.get("WINDIR") or environ.get("SystemRoot") or environ.get("windir") or r"C:\Windows"
-        for rel in iehost._CSC_RELATIVE:
-            candidate = os.path.join(windir, rel)
-            if exists(candidate):
-                return candidate
-        return None
-
-    @staticmethod
-    def _prebuilt_exe(folder: Optional[str] = None) -> str:
-        """A ready-made ``RecBrowser.exe`` in the distribution folder (default: next to reqrec.py;
-        ``reqrec browser build``)."""
-        return os.path.join(folder or iehost.SHIPPED_DIR, iehost.EXE_NAME)
-
-    @staticmethod
-    def shipped_exe(
-        folder: Optional[str] = None,
-        exists: Callable[[str], bool] = os.path.isfile,
-        source: Optional[str] = None,
-    ) -> Optional[str]:
-        """The prebuilt exe in the distribution folder when it was built from **this** source, else ``None``.
-
-        Run in place (not copied into the work folder): locked-down PCs often allow executables only in
-        the folder IT approved (where reqrec / the portable Python lives), not under the user profile.
-        A shipped exe without a hash file, or one built from another version, is not used directly.
-        ``source`` is the C# source text (default :data:`RECBROWSER_CS`).
-        """
-        exe = iehost._prebuilt_exe(folder)
-        if not exists(exe):
-            return None
-        recorded = iehost._read_text(exe + ".sha256")
-        if recorded and recorded == iehost._build_digest(source):
-            return exe
-        return None
-
-    @staticmethod
-    def build_shipped(
-        run: Callable[..., Any] = subprocess.run,
-        csc: Optional[str] = None,
-        folder: Optional[str] = None,
-        source: Optional[str] = None,
-    ) -> str:
-        """Compile ``RecBrowser.exe`` into the distribution folder (default: next to reqrec.py) and
-        record its source hash.
-
-        ``reqrec browser build`` calls this; afterwards every PC that uses this folder runs the exe
-        from there and nothing is compiled or written under the user's profile.  The C# source
-        (default :data:`RECBROWSER_CS`) goes to a temporary file for ``csc``.
-        """
-        text = RECBROWSER_CS if source is None else source
-        compiler = csc or iehost.csc_path()
-        if compiler is None:
-            raise IEHostError(iehost._NO_CSC_MESSAGE)
-        exe = iehost._prebuilt_exe(folder)
-        kwargs: dict[str, Any] = {"capture_output": True, "text": True, "errors": "replace", "timeout": iehost._CSC_TIMEOUT}
-        if os.name == "nt":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        with tempfile.TemporaryDirectory(prefix="reqrec_recbrowser_") as tmp:
-            src = os.path.join(tmp, iehost.SOURCE_NAME)
-            iehost._write_source(src, text)
-            try:
-                result = run(iehost.build_command(compiler, src, exe), **kwargs)
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise IEHostError(f"記録用ブラウザの作成 (コンパイル) に失敗しました。\n{exc}") from exc
-        if getattr(result, "returncode", 1) != 0 or not os.path.isfile(exe):
-            output = iehost._run_output(result)
-            raise IEHostError("記録用ブラウザの作成 (コンパイル) に失敗しました。" + ("\n" + output if output else ""))
-        iehost._write_text(exe + ".sha256", iehost._build_digest(text))
-        return exe
-
-    @staticmethod
-    def exe_path(workdir: str) -> str:
-        """``<workdir>/bin/RecBrowser.exe`` (the compiled host lives in the work directory)."""
-        return os.path.join(workdir, "bin", iehost.EXE_NAME)
-
-    @staticmethod
-    def source_path(workdir: str) -> str:
-        """``<workdir>/bin/RecBrowser.cs``: where :data:`RECBROWSER_CS` is written for ``csc``."""
-        return os.path.join(workdir, "bin", iehost.SOURCE_NAME)
-
-    @staticmethod
-    def _hash_path(workdir: str) -> str:
-        return os.path.join(workdir, "bin", iehost.HASH_NAME)
-
-    @staticmethod
-    def availability(
-        workdir: str,
-        platform: Optional[str] = None,
-        exists: Callable[[str], bool] = os.path.isfile,
-        env: Optional[dict] = None,
-        folder: Optional[str] = None,
-        source: Optional[str] = None,
-    ) -> dict:
-        """``{"available": bool, "reason": str|None, "exe": str|None, "built": bool, ...}`` for the GUI.
-
-        ``reason`` is a Japanese sentence explaining why the recording browser cannot be used (``None``
-        when it can); ``exe`` is the path ``iehost.launch`` will run (``None`` when unavailable); ``built``
-        tells whether that exe already exists (otherwise the first launch compiles it, a few seconds).
-        Also reports ``source`` (where the C# source is written for compiling), ``csc`` and
-        ``prebuilt`` for diagnostics.  Never raises.
-        """
-        exe = iehost.exe_path(workdir)
-        info: dict[str, Any] = {
-            "available": False,
-            "reason": None,
-            "exe": None,
-            "built": False,
-            "source": iehost.source_path(workdir),
-            "csc": None,
-            "prebuilt": None,
-        }
-        if (platform or sys.platform) != "win32":
-            info["reason"] = "記録用ブラウザ (IE エンジン) は Windows でのみ使えます。"
-            return info
-        csc = iehost.csc_path(exists=exists, env=env)
-        prebuilt = iehost._prebuilt_exe(folder)
-        info["csc"] = csc
-        info["prebuilt"] = prebuilt if exists(prebuilt) else None
-        shipped = iehost.shipped_exe(folder, exists=exists, source=source) if info["prebuilt"] else None
-        if shipped:
-            info.update(available=True, exe=shipped, built=True, shipped=True)
-            return info
-        info["built"] = bool(exists(exe))
-        if info["built"] or info["prebuilt"] or csc:  # the C# source is part of reqrec.py: always there
-            info["available"] = True
-            info["exe"] = exe
-            return info
-        info["reason"] = iehost._NO_CSC_MESSAGE
-        return info
-
-    # ----------------------------------------------------------------------- build
-
-    #: Target platform of ``RecBrowser.exe``: always 32-bit, whichever compiler builds it.  Legacy intranet
-    #: pages load in-process ActiveX controls (report viewers, barcode / printing controls, ...) that
-    #: mostly exist only as 32-bit DLLs; Edge's IE mode hosts them in a 32-bit content process, and a
-    #: 64-bit host could not load them at all.  An x86 exe runs on 32- and 64-bit Windows alike (WOW64).
-    BUILD_PLATFORM = "x86"
-
-    @staticmethod
-    def build_command(csc: str, source: str, exe: str) -> list[str]:
-        """Exact ``csc`` argv (``source`` is the path of the ``.cs`` file): a 32-bit (``-platform:x86``,
-        see :data:`BUILD_PLATFORM`) GUI executable (``winexe``: no console window) with WinForms references.
-
-        The platform does not depend on the compiler ``iehost.csc_path`` picked: the ``Framework64`` and
-        the 32-bit ``Framework`` csc.exe both emit x86 executables.  The P/Invoke structs use ``IntPtr``
-        fields with sequential layout, which is correct for either bitness.
-        """
-        return [
-            csc,
-            "-nologo",
-            "-target:winexe",
-            f"-platform:{iehost.BUILD_PLATFORM}",
-            "-optimize+",
-            f"-out:{exe}",
-            "-r:System.dll",
-            "-r:System.Windows.Forms.dll",
-            "-r:System.Drawing.dll",
-            source,
-        ]
-
-    @staticmethod
-    def _build_digest(source: Optional[str] = None) -> str:
-        """What a built exe is checked against: the C# source (default :data:`RECBROWSER_CS`, as UTF-8)
-        **and** the build settings (platform), so a new source or a change of build options alone
-        (x64 -> x86) rebuilds an exe that is already there, once.  For the same source text this is the
-        hash the former ``RecBrowser.cs`` file gave, so existing work folders are not rebuilt."""
-        text = RECBROWSER_CS if source is None else source
-        return hashlib.sha256(text.encode("utf-8") + f"\0platform={iehost.BUILD_PLATFORM}".encode("ascii")).hexdigest()
-
-    @staticmethod
-    def _write_source(path: str, text: str) -> None:
-        """Write the C# source for ``csc``: its UTF-8 bytes as they are (no BOM, no newline translation)."""
-        try:
-            with open(path, "wb") as fh:
-                fh.write(text.encode("utf-8"))
-        except OSError as exc:
-            raise IEHostError(f"記録用ブラウザのソースファイルを書き込めません: {path}\n{exc}") from exc
-
-    @staticmethod
-    def _read_text(path: str) -> Optional[str]:
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                return fh.read().strip()
-        except OSError:
-            return None
-
-    @staticmethod
-    def _write_text(path: str, text: str) -> None:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(text + "\n")
-
-    @staticmethod
-    def _run_output(result: Any) -> str:
-        return f"{getattr(result, 'stdout', '') or ''}\n{getattr(result, 'stderr', '') or ''}".strip()
-
-    @staticmethod
-    def ensure_built(
-        workdir: str,
-        run: Callable[..., Any] = subprocess.run,
-        csc: Optional[str] = None,
-        force: bool = False,
-        folder: Optional[str] = None,
-        source: Optional[str] = None,
-    ) -> str:
-        """Compile the C# source into ``<workdir>/bin/RecBrowser.exe`` when needed and return the exe path.
-
-        A prebuilt exe for this source in the distribution folder (``folder``, default next to reqrec.py)
-        is returned as it is (unless ``force``).  Otherwise compiles when the exe is missing, when
-        ``<workdir>/bin/RecBrowser.cs.sha256`` differs from the current source hash, or when ``force`` is
-        set: the source (``source``, default :data:`RECBROWSER_CS`) is written to
-        ``<workdir>/bin/RecBrowser.cs`` and the hash is written after a successful build.  ``csc``
-        defaults to ``iehost.csc_path``; without a compiler a prebuilt exe in the distribution folder is
-        copied instead.  ``run`` is called like ``subprocess.run`` (``capture_output`` / ``text`` /
-        ``timeout`` keywords).  Raises :class:`IEHostError` (Japanese prefix + the compiler's output) on
-        failure.  Never prints.
-        """
-        if not force:
-            shipped = iehost.shipped_exe(folder, source=source)
-            if shipped is not None:
-                return shipped  # prebuilt for this version in the distribution folder: run it in place
-        exe = iehost.exe_path(workdir)
-        hash_file = iehost._hash_path(workdir)
-        bin_dir = os.path.dirname(exe)
-        current_hash = iehost._build_digest(source)
-        exe_exists = os.path.isfile(exe)
-
-        if not force and exe_exists and iehost._read_text(hash_file) == current_hash:
-            return exe  # up to date
-
-        compiler = csc or iehost.csc_path()
-        if compiler is None:
-            prebuilt = iehost._prebuilt_exe(folder)
-            if os.path.isfile(prebuilt):
-                return iehost._copy_prebuilt(prebuilt, exe, hash_file, current_hash)
-            raise IEHostError(iehost._NO_CSC_MESSAGE)
-
-        os.makedirs(bin_dir, exist_ok=True)
-        src = iehost.source_path(workdir)
-        iehost._write_source(src, RECBROWSER_CS if source is None else source)
-        cmd = iehost.build_command(compiler, src, exe)
-        kwargs: dict[str, Any] = {"capture_output": True, "text": True, "errors": "replace", "timeout": iehost._CSC_TIMEOUT}
-        if os.name == "nt":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        try:
-            result = run(cmd, **kwargs)
-        except FileNotFoundError:
-            raise IEHostError(f"コンパイラが見つかりません: {compiler}") from None
-        except subprocess.TimeoutExpired:
-            raise IEHostError("記録用ブラウザの作成 (コンパイル) がタイムアウトしました。") from None
-        except OSError as exc:
-            raise IEHostError(f"コンパイラを実行できません: {exc}") from exc
-
-        output = iehost._run_output(result)
-        if getattr(result, "returncode", 1) != 0 or not os.path.isfile(exe):
-            hint = ""
-            if exe_exists:
-                hint = "\n記録用ブラウザが開いたままの場合は、閉じてからもう一度お試しください。"
-            raise IEHostError("記録用ブラウザの作成 (コンパイル) に失敗しました。" + hint + ("\n" + output if output else ""))
-        iehost._write_text(hash_file, current_hash)
-        return exe
-
-    @staticmethod
-    def _copy_prebuilt(prebuilt: str, exe: str, hash_file: str, digest: str) -> str:
-        os.makedirs(os.path.dirname(exe), exist_ok=True)
-        try:
-            shutil.copyfile(prebuilt, exe)
-        except OSError as exc:
-            raise IEHostError(f"記録用ブラウザをコピーできません: {exc}") from exc
-        iehost._write_text(hash_file, digest)
-        return exe
-
-    # ----------------------------------------------------------------------- process
-
-    @staticmethod
-    def _wait(proc: Any, timeout: float) -> Optional[int]:
-        try:
-            return proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return None
-
-    @staticmethod
-    def kill_on_close_job(proc: Any) -> Optional[int]:
-        """Put ``proc`` in a Windows job object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` and return the
-        job handle (``None`` when unsupported or it failed — never raises).
-
-        The handle stays open in this (GUI) process; if the GUI dies without cleaning up (console
-        window closed, ended from Task Manager), Windows closes the handle and ends the recording browser
-        too, so no orphaned window keeps sending traffic to a proxy port the next session may reuse.
-        No setting, file or registry value is involved.
-        """
-        if not iehost.is_windows():
-            return None
-        handle = getattr(proc, "_handle", None)
-        if not handle:
-            return None
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-            class _IoCounters(ctypes.Structure):
-                _fields_ = [(name, ctypes.c_ulonglong) for name in (
-                    "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
-                    "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
-
-            class _BasicLimit(ctypes.Structure):
-                _fields_ = [
-                    ("PerProcessUserTimeLimit", ctypes.c_longlong),
-                    ("PerJobUserTimeLimit", ctypes.c_longlong),
-                    ("LimitFlags", wintypes.DWORD),
-                    ("MinimumWorkingSetSize", ctypes.c_size_t),
-                    ("MaximumWorkingSetSize", ctypes.c_size_t),
-                    ("ActiveProcessLimit", wintypes.DWORD),
-                    ("Affinity", ctypes.c_size_t),
-                    ("PriorityClass", wintypes.DWORD),
-                    ("SchedulingClass", wintypes.DWORD),
-                ]
-
-            class _ExtendedLimit(ctypes.Structure):
-                _fields_ = [
-                    ("BasicLimitInformation", _BasicLimit),
-                    ("IoInfo", _IoCounters),
-                    ("ProcessMemoryLimit", ctypes.c_size_t),
-                    ("JobMemoryLimit", ctypes.c_size_t),
-                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                    ("PeakJobMemoryUsed", ctypes.c_size_t),
-                ]
-
-            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-            kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-            kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
-            kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-
-            job = kernel32.CreateJobObjectW(None, None)
-            if not job:
-                return None
-            info = _ExtendedLimit()
-            # KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK: only RecBrowser.exe is tied to the GUI; programs it
-            # starts (Excel opened from a download, a mail client ...) stay outside the job and survive.
-            info.BasicLimitInformation.LimitFlags = 0x2000 | 0x1000
-            ok = kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))  # JobObjectExtendedLimitInformation
-            if ok:
-                ok = kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(int(handle)))
-            if not ok:
-                kernel32.CloseHandle(job)
-                return None
-            return int(job)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _close_handle(handle: Optional[int]) -> None:
-        if not handle or not iehost.is_windows():
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-            kernel32.CloseHandle(wintypes.HANDLE(handle))
-        except Exception:
-            pass
-
-    @staticmethod
-    def _log_file(log_dir: str, now: float) -> str:
-        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
-        path = os.path.join(log_dir, f"recbrowser_{stamp}.log")
-        n = 2
-        while os.path.exists(path):  # two launches within one second
-            path = os.path.join(log_dir, f"recbrowser_{stamp}_{n}.log")
-            n += 1
-        return path
-
-    @staticmethod
-    def launch(
-        workdir: str,
-        proxy_address: str,
-        url: Optional[str] = None,
-        title: Optional[str] = None,
-        popen: Callable[..., Any] = subprocess.Popen,
-        run: Callable[..., Any] = subprocess.run,
-        log_dir: Optional[str] = None,
-        job: Optional[Callable[[Any], Optional[int]]] = None,
-    ) -> BrowserProcess:
-        """Build if needed, then start the recording browser routed through ``proxy_address`` (``host:port``).
-
-        argv: ``RecBrowser.exe --proxy <addr> --bypass "" --log <workdir>/logs/recbrowser_<timestamp>.log
-        [--url <url>] [--title <title>]``.  The bypass list is empty on purpose (see the section comment).
-        ``run`` is used for the compiler and later for ``taskkill`` in :meth:`BrowserProcess.close`.
-        Raises :class:`IEHostError` when the exe cannot be built or started.
-        """
-        proxy_address = (proxy_address or "").strip()
-        if not proxy_address:
-            raise ValueError("プロキシのアドレス (host:port) を指定してください")
-        exe = iehost.ensure_built(workdir, run=run)
-        logs = log_dir or os.path.join(workdir, "logs")
-        try:
-            os.makedirs(logs, exist_ok=True)
-        except OSError as exc:
-            raise IEHostError(f"ログ用フォルダを作成できません: {exc}") from exc
-        started_at = time.time()
-        log_path = iehost._log_file(logs, started_at)
-        argv = [exe, "--proxy", proxy_address, "--bypass", "", "--log", log_path]
-        if url:
-            argv += ["--url", str(url)]
-        if title:
-            argv += ["--title", str(title)]
-        try:
-            proc = popen(
-                argv,
-                cwd=os.path.dirname(exe),
-                close_fds=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError as exc:
-            raise IEHostError(f"記録用ブラウザを起動できません: {exc}") from exc
-        binder = job if job is not None else (iehost.kill_on_close_job if popen is subprocess.Popen else None)
-        job_handle = binder(proc) if binder is not None else None
-        browser = iehost.BrowserProcess(proc, exe, log_path, run=run, started_at=started_at)
-        browser.job_handle = job_handle
-        return browser
-
-    # ----------------------------------------------------------------------- document mode (registry)
-
-    @staticmethod
-    def _winreg(injected: Any) -> Any:
-        """The injected fake or the real ``winreg`` module; :class:`IEHostError` on other OSes."""
-        if injected is not None:
-            return injected
-        if not iehost.is_windows():
-            raise IEHostError(NOT_WINDOWS_MESSAGE)
-        import winreg  # noqa: WPS433 - Windows only
-
-        return winreg
-
-    @staticmethod
-    def resolve_emulation(level: Any) -> Optional[int]:
-        """Accept a preset name (``"ie11"``), an int (``11000``) or ``None`` and return the DWORD (or ``None``)."""
-        if level is None:
-            return None
-        if isinstance(level, str):
-            key = level.strip().lower()
-            if key in iehost.EMULATION_LEVELS:
-                return iehost.EMULATION_LEVELS[key]
-            if not key or not key.isdigit():
-                raise ValueError(f"表示モードの指定が不正です: {level!r}")
-            level = int(key)
-        if isinstance(level, bool) or not isinstance(level, int) or level < 0:
-            raise ValueError(f"表示モードの指定が不正です: {level!r}")
-        return level
-
-    @staticmethod
-    def set_emulation(level: Optional[int], exe_name: str = EXE_NAME, winreg: Any = None) -> None:
-        """Write (or, for ``None``, delete) the ``FEATURE_BROWSER_EMULATION`` DWORD for ``exe_name`` under HKCU.
-
-        Only this one per-user value is touched; it affects nothing but the named executable.
-        """
-        value = iehost.resolve_emulation(level)
-        reg = iehost._winreg(winreg)
-        access = reg.KEY_READ | reg.KEY_SET_VALUE
-        if value is None:
-            # read-only first: on the default path nothing is opened for writing unless a value exists
-            # (some security products guard this key and refuse write access)
-            if iehost.get_emulation(exe_name, winreg=reg) is None:
-                return
-            try:
-                key = reg.OpenKey(reg.HKEY_CURRENT_USER, iehost.FEATURE_BROWSER_EMULATION_KEY, 0, access)
-            except FileNotFoundError:
-                return  # key absent: nothing to delete
-            with key:
-                try:
-                    reg.DeleteValue(key, exe_name)
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:  # pragma: no cover - other registry errors
-                    if getattr(exc, "winerror", None) != 2:
-                        raise
-            return
-        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, iehost.FEATURE_BROWSER_EMULATION_KEY, 0, access) as key:
-            reg.SetValueEx(key, exe_name, 0, reg.REG_DWORD, int(value))
-
-    @staticmethod
-    def get_emulation(exe_name: str = EXE_NAME, winreg: Any = None) -> Optional[int]:
-        """Current ``FEATURE_BROWSER_EMULATION`` DWORD for ``exe_name`` (``None`` when not set)."""
-        reg = iehost._winreg(winreg)
-        try:
-            key = reg.OpenKey(reg.HKEY_CURRENT_USER, iehost.FEATURE_BROWSER_EMULATION_KEY, 0, reg.KEY_READ)
-        except FileNotFoundError:
-            return None
-        with key:
-            try:
-                value, _type = reg.QueryValueEx(key, exe_name)
-            except FileNotFoundError:
-                return None
-            except OSError as exc:  # pragma: no cover - other registry errors
-                if getattr(exc, "winerror", None) == 2:
-                    return None
-                raise
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-
-# ===== former reqrec/RecBrowser.cs: C# source of the recording browser (RECBROWSER_CS) =====
-# Compiled by ``iehost.ensure_built`` (written to ``<workdir>/bin/RecBrowser.cs`` first) and by
-# ``reqrec browser build`` (written to a temporary file).  Started as the former file and was cut
-# down on 2026-10-12 for the http-only scope (no ``--https`` option, no ``Options.HttpsRecorded``).
-# UTF-8 without BOM (csc reads it as UTF-8), LF line ends; the build hash is taken over these bytes.
-
-#: C# source of ``RecBrowser.exe``, the recording browser (see the iehost section).
-RECBROWSER_CS = r'''// RecBrowser.cs -- reqrec "recording browser" for legacy intranet sites (DESIGN.md: IE host mode).
-//
-// Hosts the Internet Explorer engine (WebBrowser control = Shell.Explorer.2 / MSHTML, the same Trident
-// engine Edge's IE mode uses) in this small process and routes ONLY THIS PROCESS's HTTP through the
-// local reqrec recorder (mitmproxy).  Nothing in Windows is changed: no Internet Options proxy, no
-// registry value, no CA certificate (the recorder is started with a catch-all --ignore-hosts pattern,
-// so HTTPS on every port is tunnelled untouched and only plain http:// is recorded).
-//
-// Proven facts this file relies on (do not "modernise" them away):
-//   * The per-process proxy must be set with InternetSetOptionA(NULL, INTERNET_OPTION_PROXY) and an
-//     INTERNET_PROXY_INFO holding ANSI strings, BEFORE the first WebBrowser control is created.  The
-//     Unicode (W) variant does not work.  INTERNET_OPTION_PER_CONNECTION_OPTION with a NULL handle
-//     writes the registry and is never used here.
-//   * The proxy bypass list must stay EMPTY: "<local>" would exclude dotless intranet names such as
-//     http://kanri/ from the recording.
-//   * Popups (window.open, target=_blank, form target=_blank, showModelessDialog, showModalDialog)
-//     are hosted as new tabs by answering DWebBrowserEvents2.NewWindow3 / NewWindow2 with the
-//     ActiveXInstance of a fresh control, so window.opener, the window name, the session and POST
-//     bodies survive and all of their HTTP goes through the proxy.
-//   * window.close() never raises DWebBrowserEvents2.WindowClosing on this engine build (verified with a
-//     catch-all event sink, with and without RegisterAsBrowser).  MSHTML instead sends OLECMDID_CLOSE to
-//     the control's site (IOleCommandTarget), so the site implements that interface and closes the tab.
-//
-// Build (inbox .NET Framework 4.8, C# 5 compiler, no installation needed):
-//   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe -nologo -target:winexe -platform:x86
-//       -out:RecBrowser.exe -r:System.Windows.Forms.dll -r:System.Drawing.dll RecBrowser.cs
-// Always 32-bit (-platform:x86), also on 64-bit Windows: legacy intranet pages use in-process ActiveX
-// controls that mostly exist only as 32-bit DLLs, which Edge's IE mode loads in a 32-bit process; a
-// 64-bit host cannot load them.
-// Run:
-//   RecBrowser.exe --proxy 127.0.0.1:PORT [--bypass ""] [--url http://...] [--title "..."]
-//                  [--log path] [--selftest] [--seconds N]
-// Exit codes: 0 = window closed normally, 2 = usage error, 3 = --selftest guard timeout.
-//
-// The language level is C# 5 (no string interpolation, nameof, expression-bodied members or ?.).
-using System;
-using System.Collections.Generic;
-using System.Drawing;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Text;
-using System.Windows.Forms;
-
-namespace Reqrec.IeHost
-{
-    /// <summary>Subset of DWebBrowserEvents2 (dispatch ids from exdisp.idl) that the host needs.</summary>
-    [ComImport, Guid("34A715A0-6587-11D0-924A-0020AFC7AC4D"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch), TypeLibType(TypeLibTypeFlags.FHidden)]
-    public interface DWebBrowserEvents2
-    {
-        [DispId(251)] void NewWindow2([In, Out, MarshalAs(UnmanagedType.IDispatch)] ref object ppDisp, [In, Out] ref bool Cancel);
-        [DispId(263)] void WindowClosing([In] bool IsChildWindow, [In, Out] ref bool Cancel);
-        [DispId(270)] void FileDownload([In] bool ActiveDocument, [In, Out] ref bool Cancel);
-        [DispId(273)] void NewWindow3([In, Out, MarshalAs(UnmanagedType.IDispatch)] ref object ppDisp, [In, Out] ref bool Cancel, [In] uint dwFlags, [In, MarshalAs(UnmanagedType.BStr)] string bstrUrlContext, [In, MarshalAs(UnmanagedType.BStr)] string bstrUrl);
-    }
-
-    /// <summary>IOleCommandTarget (docobj.h), implemented by the control's site so MSHTML can ask the
-    /// host to close a window.  Group ids are passed as raw pointers because the standard group is NULL.</summary>
-    [ComImport, Guid("B722BCCB-4E68-101B-A2BC-00AA00404770"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    public interface IOleCommandTarget
-    {
-        [PreserveSig] int QueryStatus(IntPtr pguidCmdGroup, uint cCmds, IntPtr prgCmds, IntPtr pCmdText);
-        [PreserveSig] int Exec(IntPtr pguidCmdGroup, uint nCmdID, uint nCmdexecopt, IntPtr pvaIn, IntPtr pvaOut);
-    }
-
-    /// <summary>Append-only diagnostics log ("HH:mm:ss.fff text", UTF-8 without BOM).  The process has
-    /// no console (winexe), so this file is the only place diagnostics go.  Never throws.</summary>
-    internal static class Log
-    {
-        static StreamWriter writer;
-        static readonly object gate = new object();
-
-        public static void Open(string path)
-        {
-            if (string.IsNullOrEmpty(path)) return;
-            try
-            {
-                string dir = Path.GetDirectoryName(Path.GetFullPath(path));
-                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
-                writer = new StreamWriter(path, true, new UTF8Encoding(false));
-                writer.AutoFlush = true;
-            }
-            catch (Exception) { writer = null; }
-        }
-
-        public static void Write(string text)
-        {
-            lock (gate)
-            {
-                if (writer == null) return;
-                try { writer.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff") + " " + text); }
-                catch (Exception) { }
-            }
-        }
-
-        public static void Close()
-        {
-            lock (gate)
-            {
-                if (writer == null) return;
-                try { writer.Flush(); writer.Dispose(); } catch (Exception) { }
-                writer = null;
-            }
-        }
-    }
-
-    /// <summary>WinINet / urlmon per-process options.  Every call here affects this process only.</summary>
-    internal static class WinInet
-    {
-        const int INTERNET_OPTION_PROXY = 38;
-        const int INTERNET_OPTION_END_BROWSER_SESSION = 42;
-        const int INTERNET_OPTION_SUPPRESS_BEHAVIOR = 81;
-        const int INTERNET_SUPPRESS_COOKIE_PERSIST = 3;
-        const int INTERNET_OPEN_TYPE_PROXY = 3;
-
-        // DWORD + two pointers; Sequential + IntPtr gives the right layout for -platform:x86 (the
-        // production build, see the header) and would for x64 as well.
-        [StructLayout(LayoutKind.Sequential)]
-        struct INTERNET_PROXY_INFO
-        {
-            public int dwAccessType;
-            public IntPtr lpszProxy;
-            public IntPtr lpszProxyBypass;
-        }
-
-        [DllImport("wininet.dll", SetLastError = true, EntryPoint = "InternetSetOptionA")]
-        static extern bool InternetSetOptionA(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
-
-        [DllImport("urlmon.dll")]
-        static extern int UrlMkSetSessionOption(int dwOption, IntPtr pBuffer, int dwBufferLength, int dwReserved);
-
-        // Kept alive for the lifetime of the process: WinINet may keep pointing at these strings.
-        static IntPtr proxyInfoBuffer = IntPtr.Zero;
-
-        static IntPtr BuildProxyInfo(string server, string bypass, out int size)
-        {
-            INTERNET_PROXY_INFO info = new INTERNET_PROXY_INFO();
-            info.dwAccessType = INTERNET_OPEN_TYPE_PROXY;
-            info.lpszProxy = Marshal.StringToHGlobalAnsi(server);            // ANSI: the W variant breaks WinINet
-            info.lpszProxyBypass = Marshal.StringToHGlobalAnsi(bypass ?? "");
-            size = Marshal.SizeOf(typeof(INTERNET_PROXY_INFO));
-            IntPtr buf = Marshal.AllocHGlobal(size);
-            Marshal.StructureToPtr(info, buf, false);
-            return buf;
-        }
-
-        /// <summary>InternetSetOptionA(NULL, INTERNET_OPTION_PROXY): proxy for every WinINet handle of this
-        /// process that uses the pre-configured settings (which is what MSHTML / urlmon do).</summary>
-        public static bool SetProcessProxy(string server, string bypass, out int lastError)
-        {
-            int size;
-            proxyInfoBuffer = BuildProxyInfo(server, bypass, out size);
-            bool ok = InternetSetOptionA(IntPtr.Zero, INTERNET_OPTION_PROXY, proxyInfoBuffer, size);
-            lastError = ok ? 0 : Marshal.GetLastWin32Error();
-            return ok;
-        }
-
-        /// <summary>Belt and braces: the same proxy on urlmon's own session (UrlMkSetSessionOption).</summary>
-        public static int SetUrlmonProxy(string server, string bypass)
-        {
-            int size;
-            IntPtr buf = BuildProxyInfo(server, bypass, out size);
-            try { return UrlMkSetSessionOption(INTERNET_OPTION_PROXY, buf, size, 0); }
-            catch (Exception) { return -1; }
-        }
-
-        /// <summary>Do not persist cookies received by this process (the recording starts from a clean
-        /// session every time, so the login itself gets recorded).</summary>
-        public static bool SuppressCookiePersist(out int lastError)
-        {
-            IntPtr buf = Marshal.AllocHGlobal(4);
-            Marshal.WriteInt32(buf, INTERNET_SUPPRESS_COOKIE_PERSIST);
-            bool ok = InternetSetOptionA(IntPtr.Zero, INTERNET_OPTION_SUPPRESS_BEHAVIOR, buf, 4);
-            lastError = ok ? 0 : Marshal.GetLastWin32Error();
-            return ok;
-        }
-
-        /// <summary>Flush session cookies / cached credentials of the browser session.</summary>
-        public static bool EndBrowserSession(out int lastError)
-        {
-            bool ok = InternetSetOptionA(IntPtr.Zero, INTERNET_OPTION_END_BROWSER_SESSION, IntPtr.Zero, 0);
-            lastError = ok ? 0 : Marshal.GetLastWin32Error();
-            return ok;
-        }
-    }
-
-    /// <summary>WebBrowser with the DWebBrowserEvents2 events the stock control does not expose:
-    /// NewWindow2/NewWindow3 (popups hosted by a control we supply), WindowClosing and FileDownload.</summary>
-    public class ExtWebBrowser : WebBrowser
-    {
-        /// <summary>Short name used in the log ("tab1", "tab2", ...).</summary>
-        public string Name2 = "";
-        /// <summary>Returns the (already created) control that will host a popup; null cancels the popup.</summary>
-        public Func<ExtWebBrowser, string, uint, ExtWebBrowser> NewWindowFactory;
-        /// <summary>window.close() was called on this tab's document.</summary>
-        public Action<ExtWebBrowser> CloseRequested;
-        /// <summary>A real file download (FileDownload with ActiveDocument == false) started.</summary>
-        public Action<ExtWebBrowser> DownloadDetected;
-
-        AxHost.ConnectionPointCookie cookie;
-        Sink sink;
-
-        protected override void CreateSink()
-        {
-            base.CreateSink();
-            try
-            {
-                sink = new Sink(this);
-                cookie = new AxHost.ConnectionPointCookie(ActiveXInstance, sink, typeof(DWebBrowserEvents2));
-            }
-            catch (Exception ex) { Log.Write("event sink FAILED for " + Name2 + ": " + ex.Message); }
-        }
-
-        protected override void DetachSink()
-        {
-            if (cookie != null)
-            {
-                try { cookie.Disconnect(); } catch (Exception) { }
-                cookie = null;
-            }
-            base.DetachSink();
-        }
-
-        protected override WebBrowserSiteBase CreateWebBrowserSiteBase()
-        {
-            return new CommandSite(this);
-        }
-
-        /// <summary>The control's site with an IOleCommandTarget.  When script calls window.close() MSHTML
-        /// sends OLECMDID_CLOSE (standard group) to the site, for script-opened popups directly and for the
-        /// top-level page after IE's own "close this window?" confirmation.  (DWebBrowserEvents2.WindowClosing
-        /// is never raised by this engine build, so the command is the reliable signal.)  Every other command
-        /// is declined so the control keeps its default behaviour.</summary>
-        protected class CommandSite : WebBrowserSite, IOleCommandTarget
-        {
-            const int S_OK = 0;
-            const int OLECMDERR_E_NOTSUPPORTED = unchecked((int)0x80040100);
-            const int OLECMDERR_E_UNKNOWNGROUP = unchecked((int)0x80040104);
-            const uint OLECMDID_CLOSE = 45;
-            const uint OLECMDID_SHOWSCRIPTERROR = 40;
-            static readonly Guid CGID_DocHostCommandHandler = new Guid("F38BC242-B950-11D1-8918-00C04FC2C836");
-
-            readonly ExtWebBrowser owner;
-            public CommandSite(ExtWebBrowser host) : base(host) { owner = host; }
-
-            public int QueryStatus(IntPtr pguidCmdGroup, uint cCmds, IntPtr prgCmds, IntPtr pCmdText)
-            {
-                return pguidCmdGroup == IntPtr.Zero ? OLECMDERR_E_NOTSUPPORTED : OLECMDERR_E_UNKNOWNGROUP;
-            }
-
-            public int Exec(IntPtr pguidCmdGroup, uint nCmdID, uint nCmdexecopt, IntPtr pvaIn, IntPtr pvaOut)
-            {
-                if (pguidCmdGroup != IntPtr.Zero)
-                {
-                    Guid group;
-                    try { group = (Guid)Marshal.PtrToStructure(pguidCmdGroup, typeof(Guid)); }
-                    catch (Exception) { return OLECMDERR_E_UNKNOWNGROUP; }
-                    if (group == CGID_DocHostCommandHandler && nCmdID == OLECMDID_SHOWSCRIPTERROR)
-                    {
-                        // A script error on a legacy page: no dialog, keep running the page's scripts
-                        // (pvaOut = TRUE).  Only this prompt is suppressed; login / security prompts still show.
-                        try { if (pvaOut != IntPtr.Zero) Marshal.GetNativeVariantForObject(true, pvaOut); }
-                        catch (Exception) { }
-                        Log.Write("script error suppressed in " + owner.Name2);
-                        return S_OK;
-                    }
-                    return group == CGID_DocHostCommandHandler ? OLECMDERR_E_NOTSUPPORTED : OLECMDERR_E_UNKNOWNGROUP;
-                }
-                if (nCmdID == OLECMDID_CLOSE)
-                {
-                    Log.Write("OLECMDID_CLOSE " + owner.Name2 + " (window.close)");
-                    try { if (owner.CloseRequested != null) owner.CloseRequested(owner); }
-                    catch (Exception ex) { Log.Write("close request failed: " + ex.Message); }
-                    return S_OK;
-                }
-                return pguidCmdGroup == IntPtr.Zero ? OLECMDERR_E_NOTSUPPORTED : OLECMDERR_E_UNKNOWNGROUP;
-            }
-        }
-
-        class Sink : DWebBrowserEvents2
-        {
-            readonly ExtWebBrowser owner;
-            public Sink(ExtWebBrowser o) { owner = o; }
-
-            public void NewWindow2(ref object ppDisp, ref bool Cancel)
-            {
-                Log.Write("NewWindow2 from " + owner.Name2);
-                Host(ref ppDisp, ref Cancel, 0, "");
-            }
-
-            public void NewWindow3(ref object ppDisp, ref bool Cancel, uint dwFlags, string bstrUrlContext, string bstrUrl)
-            {
-                Log.Write("NewWindow3 from " + owner.Name2 + " flags=0x" + dwFlags.ToString("x") + " url=" + bstrUrl);
-                Host(ref ppDisp, ref Cancel, dwFlags, bstrUrl);
-            }
-
-            void Host(ref object ppDisp, ref bool Cancel, uint flags, string url)
-            {
-                ExtWebBrowser target = null;
-                try { if (owner.NewWindowFactory != null) target = owner.NewWindowFactory(owner, url, flags); }
-                catch (Exception ex) { Log.Write("  -> new tab FAILED: " + ex.Message); }
-                if (target == null) { Cancel = true; Log.Write("  -> cancelled (no tab)"); return; }
-                object ax = target.ActiveXInstance;
-                if (ax == null) { Cancel = true; Log.Write("  -> cancelled (ActiveXInstance null)"); return; }
-                ppDisp = ax;   // the engine navigates THIS control itself (keeps opener / name / POST body)
-                Log.Write("  -> hosted in " + target.Name2);
-            }
-
-            public void WindowClosing(bool IsChildWindow, ref bool Cancel)
-            {
-                Log.Write("WindowClosing " + owner.Name2 + " child=" + IsChildWindow);
-                if (owner.CloseRequested != null) owner.CloseRequested(owner);
-            }
-
-            public void FileDownload(bool ActiveDocument, ref bool Cancel)
-            {
-                // ActiveDocument == true fires for every ordinary page; false is a real file download.
-                if (ActiveDocument) return;
-                Log.Write("FileDownload " + owner.Name2 + " (file download)");
-                if (owner.DownloadDetected != null) owner.DownloadDetected(owner);
-            }
-        }
-    }
-
-    /// <summary>Parsed command line.</summary>
-    public class Options
-    {
-        public string Proxy;
-        public string Bypass = "";
-        public string Url = "about:blank";
-        public string Title = "reqrec 記録用ブラウザ";
-        public string LogPath;
-        public bool SelfTest;
-        public int Seconds = 20;
-
-        public static Options Parse(string[] args)
-        {
-            Options o = new Options();
-            for (int i = 0; i < args.Length; i++)
-            {
-                string a = args[i];
-                bool hasValue = i + 1 < args.Length;
-                switch (a)
-                {
-                    case "--proxy": if (hasValue) o.Proxy = args[++i]; break;
-                    case "--bypass": if (hasValue) o.Bypass = args[++i] ?? ""; break;
-                    case "--url": if (hasValue) o.Url = args[++i]; break;
-                    case "--title": if (hasValue) o.Title = args[++i]; break;
-                    case "--log": if (hasValue) o.LogPath = args[++i]; break;
-                    case "--selftest": o.SelfTest = true; break;
-                    case "--seconds":
-                        if (hasValue)
-                        {
-                            int n;
-                            if (int.TryParse(args[++i], out n) && n > 0) o.Seconds = n;
-                        }
-                        break;
-                    default: break;   // unknown arguments are ignored
-                }
-            }
-            if (string.IsNullOrEmpty(o.Url)) o.Url = "about:blank";
-            if (string.IsNullOrEmpty(o.Title)) o.Title = "reqrec 記録用ブラウザ";
-            return o;
-        }
-    }
-
-    public class MainForm : Form
-    {
-        const int MaxTabText = 40;
-
-        readonly Options opt;
-        readonly TabControl tabs = new TabControl();
-        readonly TextBox addressBox = new TextBox();
-        readonly Button backButton = new Button();
-        readonly Button forwardButton = new Button();
-        readonly Button reloadButton = new Button();
-        readonly Button closeTabButton = new Button();
-        readonly Button stopButton = new Button();
-        readonly ToolStripStatusLabel eventLabel = new ToolStripStatusLabel();
-        int tabCounter = 0;
-        bool selfTestStarted = false;
-
-        public MainForm(Options options)
-        {
-            opt = options;
-            Text = opt.Title + " — 記録中";
-            Font baseFont = SystemFonts.MessageBoxFont ?? SystemFonts.DefaultFont;
-            Font = new Font(baseFont.FontFamily, Math.Max(baseFont.Size, 10F));
-            StartPosition = FormStartPosition.CenterScreen;
-            MaximizeBox = true;
-            MinimumSize = new Size(640, 400);
-            Rectangle area = Screen.PrimaryScreen.WorkingArea;
-            Size = new Size(Math.Min(1100, area.Width - 20), Math.Min(800, area.Height - 20));
-
-            BuildToolbar();
-            BuildStatusStrip();
-
-            tabs.Dock = DockStyle.Fill;
-            tabs.Padding = new Point(14, 5);
-            tabs.SelectedIndexChanged += delegate { UpdateToolbar(); };
-            Controls.Add(tabs);
-            tabs.BringToFront();
-
-            ExtWebBrowser first = NewTab(false);
-            if (opt.SelfTest)
-            {
-                first.DocumentCompleted += FirstPageCompletedForSelfTest;
-                Timer guard = new Timer();
-                guard.Interval = opt.Seconds * 1000;
-                guard.Tick += delegate
-                {
-                    guard.Stop();
-                    Log.Write("selftest: guard timeout after " + opt.Seconds + " s -> exit 3");
-                    Program.ExitCode = 3;
-                    Close();
-                };
-                guard.Start();
-            }
-            NavigateTab(first, opt.Url);
-            UpdateToolbar();
-            FormClosed += delegate { Log.Write("window closed -> exit " + Program.ExitCode); };
-        }
-
-        // ------------------------------------------------------------------ UI construction
-
-        void BuildToolbar()
-        {
-            TableLayoutPanel bar = new TableLayoutPanel();
-            bar.Dock = DockStyle.Top;
-            bar.AutoSize = true;
-            bar.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-            bar.ColumnCount = 6;
-            bar.RowCount = 1;
-            bar.Padding = new Padding(6, 4, 6, 4);
-            bar.BackColor = SystemColors.Control;
-            bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            bar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-
-            SetupToolButton(backButton, "← 戻る");
-            SetupToolButton(forwardButton, "→ 進む");
-            SetupToolButton(reloadButton, "⟳ 更新");
-            SetupToolButton(closeTabButton, "⨯ タブを閉じる");
-            backButton.Click += delegate { ExtWebBrowser b = Active; if (b != null && b.CanGoBack) Safe(delegate { b.GoBack(); }); };
-            forwardButton.Click += delegate { ExtWebBrowser b = Active; if (b != null && b.CanGoForward) Safe(delegate { b.GoForward(); }); };
-            reloadButton.Click += delegate { ExtWebBrowser b = Active; if (b != null) Safe(delegate { b.Refresh(WebBrowserRefreshOption.Normal); }); };
-            closeTabButton.Click += delegate { if (tabs.SelectedTab != null) CloseTab(tabs.SelectedTab); };
-
-            addressBox.Anchor = AnchorStyles.Left | AnchorStyles.Right;
-            addressBox.Margin = new Padding(6, 3, 6, 3);
-            addressBox.KeyDown += AddressKeyDown;
-
-            stopButton.Text = "■ 記録をおわる";
-            stopButton.AutoSize = true;
-            stopButton.Padding = new Padding(16, 5, 16, 5);
-            stopButton.Margin = new Padding(8, 2, 2, 2);
-            stopButton.FlatStyle = FlatStyle.Flat;
-            stopButton.FlatAppearance.BorderSize = 0;
-            stopButton.BackColor = Color.FromArgb(196, 30, 30);
-            stopButton.ForeColor = Color.White;
-            stopButton.UseVisualStyleBackColor = false;
-            stopButton.Font = new Font(Font.FontFamily, Font.Size + 2F, FontStyle.Bold);
-            stopButton.Click += delegate { Log.Write("stop button"); Program.ExitCode = 0; Close(); };
-
-            bar.Controls.Add(backButton, 0, 0);
-            bar.Controls.Add(forwardButton, 1, 0);
-            bar.Controls.Add(reloadButton, 2, 0);
-            bar.Controls.Add(addressBox, 3, 0);
-            bar.Controls.Add(closeTabButton, 4, 0);
-            bar.Controls.Add(stopButton, 5, 0);
-            Controls.Add(bar);
-        }
-
-        void SetupToolButton(Button b, string text)
-        {
-            b.Text = text;
-            b.AutoSize = true;
-            b.Padding = new Padding(8, 4, 8, 4);
-            b.Margin = new Padding(2);
-            b.UseVisualStyleBackColor = true;
-        }
-
-        void BuildStatusStrip()
-        {
-            StatusStrip strip = new StatusStrip();
-            strip.SizingGrip = false;
-            ToolStripStatusLabel recording = new ToolStripStatusLabel(
-                "● 記録中 — このウィンドウで開いた http:// のページの通信を記録しています（https:// は記録されません）");
-            recording.Spring = true;
-            recording.TextAlign = ContentAlignment.MiddleLeft;
-            recording.ForeColor = Color.FromArgb(170, 0, 0);
-            eventLabel.TextAlign = ContentAlignment.MiddleRight;
-            strip.Items.Add(recording);
-            strip.Items.Add(eventLabel);
-            Controls.Add(strip);
-        }
-
-        // ------------------------------------------------------------------ tabs
-
-        ExtWebBrowser Active
-        {
-            get
-            {
-                TabPage page = tabs.SelectedTab;
-                if (page == null || page.Controls.Count == 0) return null;
-                return page.Controls[0] as ExtWebBrowser;
-            }
-        }
-
-        /// <summary>Creates a tab with a fresh control (handle forced so ActiveXInstance exists) and selects it.</summary>
-        ExtWebBrowser NewTab(bool isPopup)
-        {
-            tabCounter++;
-            string name = "tab" + tabCounter;
-            TabPage page = new TabPage("新しいタブ");
-            ExtWebBrowser wb = new ExtWebBrowser();
-            wb.Name2 = name;
-            wb.Dock = DockStyle.Fill;
-            // Not Silent (= ScriptErrorsSuppressed): that would also hide the 「Windows セキュリティ」 login
-            // prompt of Basic / Windows authentication.  Script errors are suppressed in CommandSite.Exec.
-            wb.ScriptErrorsSuppressed = false;
-            wb.IsWebBrowserContextMenuEnabled = true;
-            wb.NewWindowFactory = delegate(ExtWebBrowser source, string url, uint flags) { return NewTab(true); };
-            wb.CloseRequested = delegate(ExtWebBrowser b)
-            {
-                // Deferred: the engine is still inside window.close() (OLECMDID_CLOSE / WindowClosing)
-                // when this runs, so the control must not be disposed synchronously.
-                BeginInvoke(new Action(delegate { CloseTab(page); }));
-            };
-            wb.DownloadDetected = delegate(ExtWebBrowser b)
-            {
-                SetStatus(IsUnrecordedHttps(b.Url) ? "このダウンロード (https://) は記録されません" : "ダウンロードを記録しました");
-            };
-            bool titleAnnounced = !isPopup;
-            wb.DocumentTitleChanged += delegate
-            {
-                string title = "";
-                try { title = wb.DocumentTitle ?? ""; } catch (Exception) { }
-                page.Text = TabText(title, wb);
-                if (!titleAnnounced && title.Trim().Length > 0)
-                {
-                    titleAnnounced = true;
-                    SetStatus("新しいタブ: " + Shorten(title.Trim(), MaxTabText));
-                }
-            };
-            wb.Navigated += delegate(object s, WebBrowserNavigatedEventArgs e)
-            {
-                Log.Write("Navigated " + name + " -> " + e.Url);
-                if (IsUnrecordedHttps(e.Url)) SetStatus("このページ (https://) は記録されません。http:// のページで操作してください");
-                if (tabs.SelectedTab == page) UpdateToolbar();
-            };
-            wb.DocumentCompleted += delegate { if (tabs.SelectedTab == page) UpdateToolbar(); };
-            wb.CanGoBackChanged += delegate { if (tabs.SelectedTab == page) UpdateToolbar(); };
-            wb.CanGoForwardChanged += delegate { if (tabs.SelectedTab == page) UpdateToolbar(); };
-            page.Controls.Add(wb);
-            tabs.TabPages.Add(page);
-            tabs.SelectedTab = page;
-            IntPtr h = wb.Handle;   // force creation: ActiveXInstance must exist before the engine gets it
-            if (isPopup) SetStatus("新しいタブを開きました");
-            Log.Write("new tab " + name + (isPopup ? " (popup)" : "") + " handle=0x" + h.ToInt64().ToString("x"));
-            return wb;
-        }
-
-        void CloseTab(TabPage page)
-        {
-            if (page == null || !tabs.TabPages.Contains(page)) return;
-            ExtWebBrowser wb = page.Controls.Count > 0 ? page.Controls[0] as ExtWebBrowser : null;
-            Log.Write("close tab " + (wb != null ? wb.Name2 : "?"));
-            tabs.TabPages.Remove(page);
-            try { if (wb != null) wb.Dispose(); } catch (Exception ex) { Log.Write("dispose failed: " + ex.Message); }
-            try { page.Dispose(); } catch (Exception) { }
-            if (tabs.TabPages.Count == 0)
-            {
-                ExtWebBrowser fresh = NewTab(false);   // never leave the window without a tab
-                NavigateTab(fresh, "about:blank");
-            }
-            UpdateToolbar();
-        }
-
-        static string TabText(string title, ExtWebBrowser wb)
-        {
-            string t = (title ?? "").Trim();
-            if (t.Length == 0)
-            {
-                try { if (wb.Url != null && wb.Url.ToString() != "about:blank") t = wb.Url.Host; } catch (Exception) { }
-            }
-            if (t.Length == 0) t = "新しいタブ";
-            return Shorten(t, MaxTabText);
-        }
-
-        static string Shorten(string s, int max)
-        {
-            if (s.Length <= max) return s;
-            return s.Substring(0, max - 1) + "…";
-        }
-
-        // ------------------------------------------------------------------ navigation / toolbar
-
-        void NavigateTab(ExtWebBrowser wb, string url)
-        {
-            string target = (url ?? "").Trim();
-            if (target.Length == 0) return;
-            if (target.IndexOf("://", StringComparison.Ordinal) < 0 && !target.StartsWith("about:", StringComparison.OrdinalIgnoreCase))
-                target = "http://" + target;
-            try { wb.Navigate(target); }
-            catch (Exception ex) { Log.Write("navigate failed: " + ex.Message); SetStatus("このアドレスは開けません"); }
-        }
-
-        void AddressKeyDown(object sender, KeyEventArgs e)
-        {
-            if (e.KeyCode != Keys.Enter) return;
-            e.SuppressKeyPress = true;
-            e.Handled = true;
-            ExtWebBrowser b = Active;
-            if (b != null) NavigateTab(b, addressBox.Text);
-        }
-
-        void UpdateToolbar()
-        {
-            ExtWebBrowser b = Active;
-            string url = "";
-            bool back = false, forward = false;
-            if (b != null)
-            {
-                try { if (b.Url != null) url = b.Url.ToString(); } catch (Exception) { }
-                try { back = b.CanGoBack; forward = b.CanGoForward; } catch (Exception) { }
-            }
-            if (url == "about:blank") url = "";
-            if (!addressBox.Focused || addressBox.Text.Length == 0) addressBox.Text = url;
-            backButton.Enabled = back;
-            forwardButton.Enabled = forward;
-        }
-
-        static bool IsUnrecordedHttps(Uri url)
-        {
-            return url != null && url.Scheme == Uri.UriSchemeHttps;
-        }
-
-        void SetStatus(string text)
-        {
-            eventLabel.Text = text;
-            Log.Write("status: " + text);
-        }
-
-        static void Safe(Action a)
-        {
-            try { a(); } catch (Exception ex) { Log.Write("action failed: " + ex.Message); }
-        }
-
-        // ------------------------------------------------------------------ --selftest
-
-        void FirstPageCompletedForSelfTest(object sender, WebBrowserDocumentCompletedEventArgs e)
-        {
-            if (selfTestStarted) return;
-            if (e.Url != null && e.Url.ToString() == "about:blank") return;
-            selfTestStarted = true;
-            ExtWebBrowser main = (ExtWebBrowser)sender;
-            Log.Write("selftest: first page completed " + e.Url);
-            Queue<Action> steps = new Queue<Action>();
-            // doClosePopup (optional) opens a popup that closes itself: exercises the OLECMDID_CLOSE path.
-            string[] functions = { "doOpen", "doBlankPost", "doBlankLink", "doModeless", "doModal", "doClosePopup" };
-            foreach (string fn in functions)
-            {
-                string name = fn;
-                steps.Enqueue(delegate
-                {
-                    if (SafeEval(main, "typeof " + name) != "function") { Log.Write("selftest: " + name + " not present, skipped"); return; }
-                    object r = null;
-                    try { r = main.Document.InvokeScript(name); }
-                    catch (Exception ex) { Log.Write("selftest: " + name + " error: " + ex.Message); return; }
-                    Log.Write("selftest: " + name + " -> " + (r == null ? "(null)" : r.ToString()));
-                });
-            }
-            steps.Enqueue(delegate
-            {
-                Log.Write("selftest: tabs=" + tabs.TabPages.Count);
-                foreach (TabPage p in tabs.TabPages)
-                {
-                    ExtWebBrowser b = p.Controls.Count > 0 ? p.Controls[0] as ExtWebBrowser : null;
-                    if (b == null) continue;
-                    string url = "(none)";
-                    try { if (b.Url != null) url = b.Url.ToString(); } catch (Exception) { }
-                    Log.Write("tab: " + url + " mode=" + SafeEval(b, "document.documentMode") + " opener=" + SafeEval(b, "window.opener ? 'yes' : 'no'") + " name=" + SafeEval(b, "window.name"));
-                }
-            });
-            steps.Enqueue(delegate { Log.Write("selftest: done -> exit 0"); Program.ExitCode = 0; Close(); });
-
-            Timer timer = new Timer();
-            timer.Interval = 1500;
-            timer.Tick += delegate
-            {
-                if (steps.Count == 0) { timer.Stop(); return; }
-                try { steps.Dequeue()(); }
-                catch (Exception ex) { Log.Write("selftest: step error: " + ex.Message); }
-            };
-            timer.Start();
-        }
-
-        static string SafeEval(ExtWebBrowser b, string expression)
-        {
-            try
-            {
-                if (b.Document == null) return "(no document)";
-                object r = b.Document.InvokeScript("eval", new object[] { expression });
-                return r == null ? "" : r.ToString();
-            }
-            catch (Exception ex) { return "(error " + ex.Message + ")"; }
-        }
-    }
-
-    internal static class Program
-    {
-        public static int ExitCode = 0;
-
-        [STAThread]
-        static int Main(string[] args)
-        {
-            Options opt = Options.Parse(args);
-            Log.Open(opt.LogPath);
-            Log.Write("RecBrowser start");
-            if (string.IsNullOrEmpty(opt.Proxy))
-            {
-                Log.Write("proxy (none) -> FAILED: --proxy 127.0.0.1:PORT is required");
-                Log.Close();
-                return 2;
-            }
-
-            // All WinINet options are set before the first WebBrowser control exists.  None of them
-            // touches the registry or Internet Options; failures are logged and never fatal.
-            int err;
-            bool ok = WinInet.EndBrowserSession(out err);
-            Log.Write("end browser session -> " + (ok ? "ok" : "FAILED (error " + err + ")"));
-            ok = WinInet.SuppressCookiePersist(out err);
-            Log.Write("suppress cookie persist -> " + (ok ? "ok" : "FAILED (error " + err + ")"));
-            ok = WinInet.SetProcessProxy(opt.Proxy, opt.Bypass, out err);
-            Log.Write("proxy " + opt.Proxy + " -> " + (ok ? "ok" : "FAILED (error " + err + ")"));
-            if (!ok)
-            {
-                // Without the per-process proxy the window would say 「記録中」 while recording nothing.
-                Log.Write("exit 4 (proxy could not be set)");
-                Log.Close();
-                MessageBox.Show(
-                    "記録用の中継設定に失敗したため、記録できません (エラー " + err + ")。\n" +
-                    "reqrec の画面でもう一度 [記録をはじめる] を押してください。直らない場合は管理者に連絡してください。",
-                    "reqrec 記録用ブラウザ", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return 4;
-            }
-            Log.Write("proxy bypass=\"" + opt.Bypass + "\"");
-            int hr = WinInet.SetUrlmonProxy(opt.Proxy, opt.Bypass);
-            Log.Write("urlmon proxy -> hr=0x" + hr.ToString("x"));
-
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
-            Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e)
-            {
-                Log.Write("unhandled: " + e.Exception);
-            };
-            try
-            {
-                MainForm form = new MainForm(opt);
-                Log.Write("title " + form.Text);
-                Application.Run(form);
-            }
-            catch (Exception ex)
-            {
-                Log.Write("fatal: " + ex);
-                Log.Close();
-                return 1;
-            }
-            Log.Write("exit " + ExitCode);
-            Log.Close();
-            return ExitCode;
-        }
-    }
-}
-'''
 
 
 # ===== former reqrec/gui.py: Flask GUI (reqrec gui) =====
@@ -8895,7 +9282,7 @@ namespace Reqrec.IeHost
 
 # ===== former reqrec/webapp/launch.py: the recording browser's first address / open a folder =====
 # Contract: DESIGN.md §13.11.  The only browser reqrec opens for recording is its own IE-engine
-# recording browser (iehost section); this section checks the address it starts with and opens the
+# recording browser (recorder section); this section checks the address it starts with and opens the
 # 保存先フォルダ.  Every function takes injectable callables so the logic is unit tested on any OS
 # without launching anything.
 
@@ -9510,13 +9897,11 @@ class AppState:
         self.last_code: Optional[str] = None
         self.last_secrets: list[dict[str, Any]] = []
         self.last_script_name: Optional[str] = None
+        #: The recording browser + proxy child process (``reqrec record``) of the current / last recording.
         self.recorder = recorder or RecorderManager()
         self.runner = runner or ScriptRunner()
-        #: Last ``iehost.launch`` failure of this session (e.g. the exe blocked by AppLocker), for the page.
-        self.iehost_error: Optional[str] = None
-        #: The in-app recording browser (``iehost.BrowserProcess``) of the current / last
-        #: recording (DESIGN.md §13.12); ``None`` when none was started.
-        self.browser: Optional[Any] = None
+        #: Why the recording browser could not be opened the last time in this GUI session (for the page).
+        self.record_error: Optional[str] = None
         self.ensure_dirs()
 
     # ------------------------------------------------------------------ folders & paths
@@ -9605,27 +9990,9 @@ class AppState:
                 "excluded_self_flows": int(rec.meta.get("excluded_self_flows", 0)) if rec is not None else 0,
             }
 
-    # ------------------------------------------------------------------ recording browser
-
-    def close_browser(self, timeout: float = 5.0) -> Optional[int]:
-        """Close the in-app recording browser (if any) and forget it; returns its exit code.
-
-        Never raises: a browser that cannot be closed is still dropped from the state so the GUI
-        is not stuck with it.  ``None`` when there was no browser or it did not exit in time.
-        """
-        browser = self.browser
-        if browser is None:
-            return None
-        self.browser = None
-        try:
-            return browser.close(timeout=timeout)
-        except Exception:
-            return None
-
     # ------------------------------------------------------------------ shutdown
 
     def close(self) -> None:
-        self.close_browser()
         self.recorder.close()
         self.runner.close()
 
@@ -9645,29 +10012,6 @@ def _plain_meta(meta: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-# --------------------------------------------------------------------------- free port (recording proxy)
-
-def find_free_port(host: str = "127.0.0.1", preferred: int = 8080, avoid: Iterable[int] = (), attempts: int = 40) -> int:
-    """A TCP port the recording proxy can bind: ``preferred`` first, then the following ports,
-    finally one chosen by the OS.  Ports in ``avoid`` (the GUI's own) are skipped.
-
-    Every recording uses this so the user never has to know what a port is.
-    """
-    skip = {int(p) for p in avoid}
-    for port in range(int(preferred), int(preferred) + max(1, int(attempts))):
-        if port in skip or not 1 <= port <= 65535:
-            continue
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            try:
-                sock.bind((host, port))
-            except OSError:
-                continue
-            return port
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((host, 0))
-        return int(sock.getsockname()[1])
-
-
 # ===== former reqrec/webapp/routes.py: JSON API + page (blueprint bp) =====
 # JSON API + page of the GUI.  Contract: DESIGN.md §13.6.
 #
@@ -9685,21 +10029,6 @@ bp = Blueprint("reqrec", __name__, root_path=os.path.dirname(os.path.abspath(__f
 #: Response / request bodies returned by ``/api/flow/<id>`` are cut here (characters).
 BODY_LIMIT = 200 * 1024
 _GUI_FLOW_ID_RE = re.compile(r"^f\d{4,}$")
-
-#: Window title of the in-app recording browser (DESIGN.md §13.12); the host appends 「— 記録中」.
-BROWSER_TITLE = "reqrec 記録用ブラウザ"
-#: Extra mitmdump arguments that tunnel HTTPS untouched (no CA certificate needed; only http:// is recorded).
-#: Every recording is started with them.
-#: A catch-all pattern: ``:443$`` matched port 443 only, so ``https://kanri:8443/`` was intercepted with
-#: the untrusted mitmproxy CA (certificate error) although the status line says HTTPS is not recorded.
-#: In regular (explicit proxy) mode mitmproxy applies ``ignore_hosts`` only when deciding the layer of a
-#: ``CONNECT`` tunnel; plain ``http://`` requests (absolute-form, what WinINet sends to a proxy) never
-#: reach that check and are still recorded.  Measured with mitmdump 12.2.3 (see
-#: tests/test_gui.py::TestHttpsPassthroughWithRealMitmdump): http:// recorded, https on a
-#: non-443 port tunnelled with the origin server's own certificate and not recorded.
-HTTPS_PASSTHROUGH_ARGS = ("--ignore-hosts", ".*")
-#: Seconds ``record_start`` waits for mitmdump to accept connections before opening the recording browser.
-PROXY_READY_TIMEOUT = 20.0
 
 
 # --------------------------------------------------------------------------- helpers
@@ -9938,33 +10267,25 @@ def _script_name(raw: Any) -> str:
     return name
 
 
-def _iehost_info(state: AppState) -> dict[str, Any]:
-    """``iehost.availability`` reduced to what the page / ``/api/state`` expose, plus the
-    current 表示モード (preset name of the HKCU value, ``"default"`` when unset) and the last launch
-    error of this GUI session (shown on the easy screen so a blocked exe is explained)."""
-    info = iehost.availability(state.workdir)
-    out = {k: info.get(k) for k in ("available", "reason", "exe", "built", "shipped")}
-    out["emulation"] = "default"
-    if info.get("available"):
-        try:
-            value = iehost.get_emulation()
-        except Exception:
-            value = None
-        if value is not None:
-            names = [k for k, v in iehost.EMULATION_LEVELS.items() if v == value]
-            out["emulation"] = names[0] if names else "custom"
-    out["last_error"] = state.iehost_error
-    return out
+def _record_info(state: AppState) -> dict[str, Any]:
+    """``{"available", "reason", "last_error"}``: can this PC record (Windows with the IE engine), and
+    why the recording browser could not be opened the last time in this GUI session."""
+    info = dict(recorder_availability())
+    info["last_error"] = state.record_error
+    return info
 
 
-def _require_iehost(state: AppState) -> None:
-    """400 unless the in-app recording browser can be used on this PC (Windows + csc.exe or a prebuilt exe)."""
-    info = iehost.availability(state.workdir)
+def _require_recording_browser() -> None:
+    """400 unless the recording browser can be used on this PC and the page is opened on it."""
+    if not _is_loopback_addr(flask_request.remote_addr):
+        raise ApiError("記録は、reqrec を動かしている PC の画面からだけ始められます。"
+                       "他の PC では HAR ファイルを読み込んでください。", status=400)
+    info = recorder_availability()
     if not info.get("available"):
-        raise ApiError(info.get("reason") or "記録用ブラウザ (IE エンジン) はこの PC では使えません。", status=400, iehost=info)
+        raise ApiError(info.get("reason") or "記録用ブラウザ (IE エンジン) はこの PC では使えません。", status=400)
 
 
-def _iehost_start_url(raw: Any) -> Optional[str]:
+def _start_url(raw: Any) -> Optional[str]:
     """The optional first page of the recording browser: ``None`` when blank, else a validated
     ``http(s)://`` URL (a bare host name gets ``http://``; ``edge://`` and other schemes are refused)."""
     text = str(raw or "").strip()
@@ -9976,34 +10297,10 @@ def _iehost_start_url(raw: Any) -> Optional[str]:
         raise ApiError(str(exc)) from exc
 
 
-def _browser_payload(proc: Any) -> dict[str, Any]:
-    """``{"kind": "iehost", "pid", "running", "log", "exit_code"}`` for a ``BrowserProcess``."""
-    code = proc.poll()
-    return {
-        "kind": "iehost",
-        "pid": getattr(proc, "pid", None),
-        "running": code is None,
-        "exit_code": code,
-        "log": getattr(proc, "log_path", None),
-    }
-
-
-def _browser_status(state: AppState) -> dict[str, Any]:
-    """``{"kind": "iehost"|None, "running": bool, "pid": ...|None, "exit_code": ...|None}``."""
-    proc = state.browser
-    if proc is None:
-        return {"kind": None, "running": False, "pid": None, "exit_code": None}
-    payload = _browser_payload(proc)
-    payload.pop("log", None)
-    return payload
-
-
 #: ``kind`` of the 500 errors of ``record_start`` (the easy screen explains each one differently):
-#: ``proxy`` = mitmdump never accepted connections, ``emulation`` = 表示モード (HKCU value) could not be
-#: written, ``iehost`` = the recording browser could not be built or started (only this one gets the
-#: 「RecBrowser.exe が止められた可能性」 guidance and is remembered as ``iehost.last_error``).
+#: ``proxy`` = the recording browser could not set its per-process proxy (exit code
+#: :data:`RECORD_EXIT_PROXY`), ``iehost`` = the recording browser could not be started or opened.
 ERROR_KIND_PROXY = "proxy"
-ERROR_KIND_EMULATION = "emulation"
 ERROR_KIND_IEHOST = "iehost"
 
 
@@ -10029,10 +10326,8 @@ def _forget_recording(state: AppState) -> None:
 
 
 def _abandon_start(state: AppState, out: str) -> None:
-    """Undo a ``record_start`` that failed after mitmdump was spawned (proxy never listened, 表示モード
-    or the recording browser failed): stop the recorder, delete the half-made file (normally absent:
-    no browser ever used the proxy) and forget it.  Does nothing when another recording owns the
-    recorder by now."""
+    """Undo a ``record_start`` whose recording browser never got ready: stop the child, delete the
+    (empty) recording file and forget it.  Does nothing when another recording owns the recorder by now."""
     with state.lock:
         current = getattr(state.recorder, "out", out)
         if current and os.path.abspath(current) != os.path.abspath(out):
@@ -10040,28 +10335,6 @@ def _abandon_start(state: AppState, out: str) -> None:
         state.recorder.stop()
         _remove_quietly(out)
         _forget_recording(state)
-
-
-def _proxy_address(port: int) -> str:
-    """``127.0.0.1:PORT``: the recording proxy as the recording browser is told to use it."""
-    return f"{RECORD_LISTEN_HOST}:{int(port)}"
-
-
-def _launch_iehost(state: AppState, proxy_address: str, start_url: Optional[str]) -> Any:
-    """Start ``RecBrowser.exe`` (building it first when needed) and remember it as ``state.browser``.
-
-    Raises :class:`ApiError` 500 (``kind: "iehost"``) with a Japanese message; the compiler's output
-    is part of the message when the build failed (``IEHostError`` carries it).
-    """
-    try:
-        proc = iehost.launch(state.workdir, proxy_address, url=start_url, title=BROWSER_TITLE)
-    except Exception as exc:
-        current_app.logger.exception("iehost launch failed")
-        state.iehost_error = str(exc)
-        raise ApiError(f"記録用ブラウザを起動できませんでした: {exc}", status=500, kind=ERROR_KIND_IEHOST) from exc
-    state.iehost_error = None
-    state.browser = proc
-    return proc
 
 
 def _apply_loaded(state: AppState, recording: Recording, sources: list[str], from_gui_recorder: bool) -> dict[str, Any]:
@@ -10082,13 +10355,15 @@ def _apply_loaded(state: AppState, recording: Recording, sources: list[str], fro
 @bp.get("/")
 def index() -> str:
     state = get_state()
+    # Recording opens the recording browser on the PC that runs reqrec, for the person in front of
+    # it: a page opened from another PC makes scripts from HAR files only (no recording controls).
+    can_record = bool(recorder_availability().get("available") and _is_loopback_addr(flask_request.remote_addr))
     return render_template(
         _GUI_TEMPLATE,
         token=state.token,
         version=__version__,
         workdir=state.workdir,
-        mitmproxy_available=mitmproxy_available(),
-        iehost=_iehost_info(state),
+        can_record=can_record,
         logged_in=bool(flask_session.get(_SESSION_AUTH_KEY)),
     )
 
@@ -10100,15 +10375,13 @@ def api_state() -> Response:
         "version": __version__,
         "workdir": state.workdir,
         "gui_address": flask_request.host,
-        "mitmproxy_available": mitmproxy_available(),
         "recorder": state.recorder.status(),
+        "record": _record_info(state),
         "recording": state.recording_summary(),
         "plan_loaded": state.plan is not None,
         "plan_options": options_to_plain(state.plan_options),
         "gen_options": options_to_plain(state.gen_options),
         "run": state.runner.status(),
-        "iehost": _iehost_info(state),
-        "browser": _browser_status(state),
         "last_script": state.last_script_name,
         "secrets": list(state.last_secrets),
     })
@@ -10118,112 +10391,60 @@ def api_state() -> Response:
 
 @bp.post("/api/record/start")
 def record_start() -> Response:
-    """Start the recorder and open the recording browser through it (DESIGN.md §13.12).
+    """Open the recording browser (``reqrec record`` as a child process: the IE engine plus the
+    recording proxy, DESIGN.md §13.12) and wait until it is ready.
 
-    The proxy listens on ``127.0.0.1`` on a free port and tunnels every HTTPS connection untouched
-    (:data:`HTTPS_PASSTHROUGH_ARGS`), so only ``http://`` is recorded and no certificate is needed.
-    Every site opened in the recording browser is recorded.
-    Body (all optional): ``{"start_url": "...", "emulation": "keep" | <preset>}``.
+    Only ``http://`` is recorded; ``https://`` passes through untouched, no certificate is needed and
+    nothing in Windows is changed.  Body (all optional): ``{"start_url": "...", "emulation": <mode>}``
+    with a mode of :data:`EMULATION_MODES`.
     """
     state = get_state()
     body = _json_body(required=False)
-    start_url = _iehost_start_url(body.get("start_url"))
-    emulation = str(body.get("emulation") or "keep").strip().lower()
-    if emulation != "keep" and emulation not in iehost.EMULATION_LEVELS:
-        raise ApiError(f"表示モード (emulation) は keep / {' / '.join(iehost.EMULATION_LEVELS)} のいずれかで指定してください")
-
+    start_url = _start_url(body.get("start_url"))
+    emulation = str(body.get("emulation") or "default").strip().lower()
+    if emulation not in EMULATION_MODES:
+        raise ApiError(f"表示モード (emulation) は {' / '.join(EMULATION_MODES)} のいずれかで指定してください")
     if state.recorder.running:
-        raise ApiError("すでに記録中です。先に [記録停止] を押してください。", status=409)
-    if state.recorder.command_builder is _default_command_builder() and not mitmproxy_available():
-        raise ApiError(
-            "mitmproxy がインストールされていないため記録できません。コマンドプロンプトで "
-            'pip install "reqrec[record]" を実行してから GUI を再起動してください。', status=400,
-        )
-    _require_iehost(state)
-    try:
-        port = find_free_port(RECORD_LISTEN_HOST, preferred=8080, avoid=(state.port,))
-    except OSError as exc:
-        raise ApiError(f"記録用の空きポートが見つかりません: {exc}", status=500) from exc
+        raise ApiError("すでに記録中です。先に [記録をおわる] を押してください。", status=409)
+    _require_recording_browser()
 
     out = os.path.join(state.subdir("recordings"), _timestamp_name("rec", ".json"))
-    proxy_address = _proxy_address(port)
+    log_path = os.path.join(state.workdir, "logs", _timestamp_name("recbrowser", ".log"))
     with state.lock:
-        state.close_browser()  # a browser left over from an earlier session must not record into the new one
         try:
-            status = state.recorder.start(out, port=port, extra_args=list(HTTPS_PASSTHROUGH_ARGS))
+            state.recorder.start(out, url=start_url, emulation=emulation, title=BROWSER_TITLE, log_path=log_path)
         except RecorderError as exc:
-            raise ApiError(str(exc), status=400) from exc
-    time.sleep(0.15)  # give an immediately failing child (port in use) the chance to report
-    status = state.recorder.status()
-    browser_result: Optional[dict[str, Any]] = None
-    warnings: list[str] = []
-    if status.get("running"):
-        # mitmdump needs a second or two before it accepts connections; a browser pointed at it
-        # earlier shows 「ページを表示できません」 for the first page.  Wait without the lock.
-        wait = getattr(state.recorder, "wait_until_listening", None)
-        if wait is not None and not wait(timeout=PROXY_READY_TIMEOUT):
-            failed = state.recorder.status()
-            _abandon_start(state, out)
-            tail = (failed.get("stderr_tail") or "").strip().splitlines()
-            detail = failed.get("error") or (tail[-1] if tail else "時間内に待ち受けを開始しませんでした")
-            raise ApiError(f"記録用プロキシを起動できませんでした: {detail}", status=500, kind=ERROR_KIND_PROXY)
-        # The recorder is up: point the recording browser at it.  Document mode first (a per-exe
-        # HKCU value read by the engine at start-up), then the process itself.
-        with state.lock:
-            if not state.recorder.running or os.path.abspath(state.recorder.out or "") != os.path.abspath(out):
-                raise ApiError("記録用ブラウザを開く前に記録が止まりました。もう一度 [記録をはじめる] を押してください。", status=409)
-            level = iehost.EMULATION_LEVELS.get(emulation)
-            if emulation == "keep":
-                pass  # the 表示モード chosen earlier stays; the registry is not touched
-            elif level is None:
-                # 既定 (IE7 相当): nothing to write.  Only a value left by an earlier non-default
-                # choice is removed, and failing to remove it never blocks the recording.
-                try:
-                    if iehost.get_emulation() is not None:
-                        iehost.set_emulation(None)
-                except Exception as exc:
-                    warnings.append(f"表示モードの設定を既定に戻せませんでした（記録は続けます）: {exc}")
-            else:
-                try:
-                    iehost.set_emulation(level)
-                except Exception as exc:
-                    _abandon_start(state, out)
-                    raise ApiError(f"記録用ブラウザの表示モードを設定できませんでした: {exc}", status=500,
-                                   kind=ERROR_KIND_EMULATION) from exc
-            try:
-                proc = _launch_iehost(state, proxy_address, start_url)
-            except ApiError:
-                _abandon_start(state, out)
-                raise
-            browser_result = _browser_payload(proc)
+            state.record_error = str(exc)
+            raise ApiError(f"記録用ブラウザを起動できませんでした: {exc}", status=500, kind=ERROR_KIND_IEHOST) from exc
+    # A first start imports Flask in the child and loads the IE engine: wait without the lock.
+    if not state.recorder.wait_until_ready(timeout=RECORD_READY_TIMEOUT):
+        failed = state.recorder.status()
+        _abandon_start(state, out)
+        code = failed.get("exit_code")
+        tail = [line for line in (failed.get("stderr_tail") or "").strip().splitlines() if line.strip()]
+        detail = failed.get("error") or (tail[-1] if tail else "時間内に開きませんでした")
+        state.record_error = detail
+        kind = ERROR_KIND_PROXY if code == RECORD_EXIT_PROXY else ERROR_KIND_IEHOST
+        raise ApiError(f"記録用ブラウザを開けませんでした: {detail}", status=500, kind=kind, exit_code=code)
+    state.record_error = None
     return _ok(
         out=os.path.basename(out),
         out_path=out,
-        port=port,
-        proxy_address=proxy_address,
-        status=status,
-        browser=browser_result,
+        status=state.recorder.status(),
         emulation=emulation,
-        warnings=warnings,
         self_excluded_hosts=sorted(gui_netlocs(state.host, state.port, flask_request.host)),
     )
 
 
-def _default_command_builder():
-    return build_command
-
-
 @bp.get("/api/record/status")
 def record_status() -> Response:
-    state = get_state()
-    status = state.recorder.status()
-    status["mitmproxy_available"] = mitmproxy_available()
-    status["browser"] = _browser_status(state)
-    return jsonify(status)
+    return jsonify(get_state().recorder.status())
 
 
 @bp.post("/api/record/stop")
 def record_stop() -> Response:
+    """Close the recording browser (it writes the recording) and load the recording; ``{"discard":
+    true}`` ([やめる]) deletes it instead.  Also called after the browser was closed by the user."""
     state = get_state()
     body = _json_body(required=False)
     discard = _bool(body.get("discard"), False)
@@ -10231,48 +10452,30 @@ def record_stop() -> Response:
         was_running = state.recorder.running
         if not was_running and state.recorder.out is None:
             raise ApiError("記録は開始されていません", status=409)
-        # The recording browser goes first so its in-flight requests reach the proxy before mitmdump
-        # flushes and exits; ``close_browser`` never raises and forgets the process either way.
-        had_browser = state.browser is not None
-        browser_exit_code = state.close_browser(timeout=5.0)
         exit_code = state.recorder.stop()
         if discard:
             # [やめる]: nothing is loaded (the recording already loaded stays as it was), the
-            # half-made file is removed and the recorder forgets it.
+            # file is removed and the recorder forgets it.
             removed = _remove_quietly(state.recorder.out)
             _forget_recording(state)
-            return _ok(discarded=True, removed=removed, exit_code=exit_code,
-                       browser_exit_code=browser_exit_code, recording=state.recording_summary())
+            return _ok(discarded=True, removed=removed, exit_code=exit_code, recording=state.recording_summary())
         out_path = state.recorder.out
         try:
             recording = state.recorder.load_recording()
         except RecorderError as exc:
             if not (out_path and not os.path.exists(out_path) and exit_code is not None):
                 raise ApiError(str(exc), status=400, exit_code=exit_code,
-                               browser_exit_code=browser_exit_code, stderr_tail=state.recorder.status()["stderr_tail"]) from exc
-            # The addon writes the file after the first response only, and on Windows the stop
-            # (CTRL_BREAK) ends mitmdump before its final flush: no file = nothing was recorded.
-            recording = Recording(flows=[], meta={})
+                               stderr_tail=state.recorder.status()["stderr_tail"]) from exc
+            recording = Recording(flows=[], meta={})  # the browser never got going: nothing was recorded
         if not recording.flows:
-            if had_browser:
-                message = (
-                    "何も記録されませんでした。記録用ブラウザでページを開く前にブラウザが閉じられたか、"
-                    "https:// のページ（記録されません）だけを開いた可能性があります。"
-                    "もう一度 [記録をはじめる] を押し、http:// のページを開いて操作してください。"
-                )
-            else:
-                message = (
-                    "何も記録されませんでした。記録用ブラウザが開く前に記録が止まった可能性があります。"
-                    "もう一度 [記録をはじめる] を押し、http:// のページを開いて操作してください。"
-                )
             raise ApiError(
-                message,
-                status=400, exit_code=exit_code, browser_exit_code=browser_exit_code,
-                out=os.path.basename(state.recorder.out or ""), empty=True,
+                "何も記録されませんでした。記録用ブラウザでページを開く前にブラウザが閉じられたか、"
+                "https:// のページ（記録されません）だけを開いた可能性があります。"
+                "もう一度 [記録をはじめる] を押し、http:// のページを開いて操作してください。",
+                status=400, exit_code=exit_code, out=os.path.basename(state.recorder.out or ""), empty=True,
             )
         summary = _apply_loaded(state, recording, [f"recordings/{os.path.basename(state.recorder.out or '')}"], from_gui_recorder=True)
-    summary.update(out=os.path.basename(state.recorder.out or ""), out_path=state.recorder.out, exit_code=exit_code,
-                   browser_exit_code=browser_exit_code)
+    summary.update(out=os.path.basename(state.recorder.out or ""), out_path=state.recorder.out, exit_code=exit_code)
     return _ok(**summary)
 
 
@@ -10571,31 +10774,6 @@ def run_save_output() -> Response:
 _OPENABLE_FOLDERS = ("workdir", "scripts", "outputs", "recordings", "uploads")
 
 
-@bp.post("/api/browser/open")
-def browser_open() -> Response:
-    """(Re)open the in-app recording browser of the running recording at ``{"url": ...}``.
-
-    When it is still running nothing happens (``relaunched: false``); otherwise it is started again
-    against the recorder's proxy (``relaunched: true``).  409 when nothing is being recorded.
-    """
-    body = _json_body(required=False)
-    state = get_state()
-    start_url = _iehost_start_url(body.get("url"))
-    with state.lock:
-        proc = state.browser
-        if proc is not None and proc.poll() is None:
-            return _ok(running=True, relaunched=False, browser=_browser_payload(proc))
-        if not state.recorder.running:
-            raise ApiError("記録が開始されていません", status=409)
-        _require_iehost(state)
-        port = getattr(state.recorder, "port", None) or state.recorder.status().get("port")
-        if not port:
-            raise ApiError("記録用プロキシのポートが分かりません", status=500)
-        state.close_browser(timeout=2.0)  # an exited process object is dropped before the new one starts
-        proc = _launch_iehost(state, _proxy_address(int(port)), start_url)
-    return _ok(running=True, relaunched=True, browser=_browser_payload(proc))
-
-
 @bp.post("/api/folder/open")
 def folder_open() -> Response:
     """Show one of the work folders in Explorer / Finder: ``{"folder": "scripts"}``."""
@@ -10632,8 +10810,8 @@ def easy_build() -> Response:
         plan = _rebuild_plan(state, plan_opts)
         if not plan.steps:
             raise ApiError(
-                "スクリプトにできる通信が記録にありませんでした。記録中に記録用ブラウザで"
-                " http:// のサイトの画面を開いたかを確認してください。",
+                "スクリプトにできる通信が記録にありませんでした。http:// のサイトの画面を開いた操作が"
+                "記録（HAR ファイル）に入っているかを確認してください。",
                 status=400,
             )
         try:
@@ -10700,9 +10878,9 @@ def easy_build() -> Response:
 # ===== former reqrec/webapp/__init__.py: app factory (create_app / run_gui) and the security hook =====
 # Flask based no-code GUI for reqrec.  Contract: DESIGN.md §13.6.
 #
-# ``create_app(workdir)`` builds the Flask application; ``run_gui`` starts it (and opens a browser).
-# ``create_app()`` without arguments is the factory ``flask --app reqrec run`` finds (for example on a
-# LAN server started from a JupyterLab terminal).
+# ``create_app(workdir)`` builds the Flask application; ``run_gui`` starts it (and opens a browser):
+# ``python reqrec.py``.  ``create_app()`` without arguments is the factory ``python -m flask --app
+# reqrec run`` finds.
 #
 # Security model (the user's browser visits arbitrary sites while this GUI runs):
 #
@@ -10859,7 +11037,7 @@ def create_app(workdir: Optional[str] = None, **config: Any) -> Flask:
 
     ``workdir`` defaults to the environment variable ``REQREC_WORKDIR`` or ``reqrec_work``; called
     without arguments this is the factory ``flask --app reqrec run`` finds, and the children it starts
-    (recorder, recording browser, script run) are then stopped at exit.  ``config`` may hold
+    (the recording browser, a script run) are then stopped at exit.  ``config`` may hold
     ``host`` / ``port`` (what the server binds; used for the Host check and for excluding the GUI's
     own traffic from recordings), ``token`` (per-process CSRF token; generated when omitted),
     ``password`` (the login password for other PCs; defaults to the environment variable
@@ -11143,7 +11321,7 @@ def run_gui(host: str = "127.0.0.1", port: int = 8765, workdir: str = "reqrec_wo
 
 
 def _shutdown(state: AppState) -> None:
-    """Stop the children (recorder, recording browser, script run)."""
+    """Stop the children (the recording browser, a script run)."""
     try:
         state.close()
     except Exception:
@@ -11482,6 +11660,7 @@ body.easy-mode .content { max-width: 960px; }
 
 .easy-ready li.bad { color: #7a1e14; }
 #easy-emulation + .hint { margin-top: .25rem; }
+.easy-har-hint { text-align: center; margin-top: 0; }
 
 /* ------------------------------------------------------------------ 詳細設定 (スクリプトの詳細と変更) */
 .detail-settings h3:first-child { margin-top: 0; }
@@ -11499,10 +11678,7 @@ textarea.code-editor[readonly] { opacity: .7; }
 {% endraw %}
 </style>
 </head>
-<body class="easy-mode" data-token="{{ token }}"
-      data-mitm-available="{{ 'true' if mitmproxy_available else 'false' }}"
-      data-iehost-available="{{ 'true' if iehost and iehost.available else 'false' }}"
-      data-iehost-reason="{{ (iehost.reason if iehost and iehost.reason else '') }}">
+<body class="easy-mode" data-token="{{ token }}" data-can-record="{{ 'true' if can_record else 'false' }}">
 
 <header class="topbar">
   <div class="topbar-row">
@@ -11524,15 +11700,9 @@ textarea.code-editor[readonly] { opacity: .7; }
 <!-- ===================================================== かんたん画面 (既定) -->
 <section id="panel-easy" class="easy" aria-labelledby="h-easy">
 
-  {% if not mitmproxy_available %}
-  <div class="notice warn">
-    <strong>記録機能の準備ができていません。</strong> 管理者（または IT 担当）に「mitmproxy が入っていない」と伝えてください。
-    コマンドプロンプトで <code>pip install "reqrec[record]"</code> を実行してから、この画面を開き直すと使えるようになります。
-  </div>
-  {% endif %}
-
-  <!-- 待機中 -->
+  <!-- 待機中: 記録できる PC では記録 (HAR も可)、それ以外 (サーバーを別の PC から開いたときなど) は HAR ファイルから -->
   <div class="easy-stage" id="easy-idle">
+    {% if can_record %}
     <div class="easy-hero">
       <h1 id="h-easy">サイトの操作を記録して、自動取得スクリプトを作ります</h1>
       <p class="lead">やることは 3 つだけです。ポートやプロキシなどの設定はすべて自動で行います。Windows の設定や証明書は変更しません。</p>
@@ -11542,7 +11712,19 @@ textarea.code-editor[readonly] { opacity: .7; }
         <li><span class="easy-flow-num">3</span><div><strong>記録をおわる</strong> を押す<br><span class="hint">ブラウザを閉じるだけでスクリプトが自動でできあがります</span></div></li>
       </ol>
     </div>
+    {% else %}
+    <div class="easy-hero">
+      <h1 id="h-easy">HAR ファイルから、自動取得スクリプトを作ります</h1>
+      <p class="lead">サイトを操作したときの通信を IE の F12 開発者ツールで HAR ファイルに保存して、ここで選ぶだけです。</p>
+      <ol class="easy-flow">
+        <li><span class="easy-flow-num">1</span><div><strong>F12 開発者ツールを開く</strong><br><span class="hint">Edge の IE モードでサイトを開き、IEChooser.exe でそのタブを選んで「ネットワーク」の記録を始めます</span></div></li>
+        <li><span class="easy-flow-num">2</span><div><strong>いつもどおりサイトを操作する</strong><br><span class="hint">ログイン → 欲しいデータの画面まで。終わったら「HAR としてエクスポート」で保存します</span></div></li>
+        <li><span class="easy-flow-num">3</span><div><strong>HAR ファイルを選ぶ</strong> を押す<br><span class="hint">保存したファイルを選ぶと、スクリプトが自動でできあがります</span></div></li>
+      </ol>
+    </div>
+    {% endif %}
     <div class="card easy-card">
+      <div id="easy-record-ui"{% if not can_record %} hidden{% endif %}>
       <div class="form-grid compact">
         <label for="easy-url">開くサイトのアドレス <span class="hint">(任意)</span></label>
         <div><input id="easy-url" type="text" class="w-full" placeholder="例: http://kanri/  または  http://192.168.1.10/seisan/" autocomplete="url">
@@ -11554,21 +11736,31 @@ textarea.code-editor[readonly] { opacity: .7; }
             <option value="ie11">IE11 相当 (ページの指定に従う)</option>
             <option value="ie11_force">IE11 強制</option>
           </select>
-          <div class="hint">ふだんは「既定」のままで構いません。記録用ブラウザで画面が崩れるときだけ変えてください。既定以外を選ぶと、この記録用ブラウザだけに効く設定を Windows のユーザー設定 (レジストリの HKCU) に書き込みます。選んだモードは次回も使われます。</div></div>
+          <div class="hint">ふだんは「既定」のままで構いません。記録用ブラウザで画面が崩れるときだけ変えてください。表示モードは記録用ブラウザの中だけで切り替わります (Windows の設定やレジストリは変更しません)。選んだモードは次回も使われます。</div></div>
       </div>
       <div class="easy-actions">
-        <button type="button" id="easy-start" class="btn primary xl" {% if not (mitmproxy_available and iehost and iehost.available) %}disabled{% endif %}>● 記録をはじめる</button>
+        <button type="button" id="easy-start" class="btn primary xl"{% if not can_record %} disabled{% endif %}>● 記録をはじめる</button>
       </div>
       <ul class="easy-ready" id="easy-ready" aria-live="polite"></ul>
+      </div>
+      {% if not can_record %}
+      <div class="easy-actions">
+        <button type="button" id="easy-har-pick" class="btn primary xl">HAR ファイルを選ぶ…</button>
+      </div>
+      <p class="hint easy-har-hint">.har ファイルを選びます。別のタブで開いた画面の HAR は、まとめて選べます。<br>
+        IEChooser.exe は <code>C:\Windows\System32\F12</code> にあります。</p>
+      {% endif %}
       <div class="easy-loaded" id="easy-loaded" hidden>
         <span class="hint">すでに読み込まれている記録があります:</span>
         <button type="button" id="easy-build-loaded" class="btn">読み込み済みの記録 (<span id="easy-loaded-count">0</span> 件) からスクリプトを作る</button>
       </div>
+      {% if can_record %}
       <div class="easy-loaded" id="easy-har">
         <span class="hint">IE の F12 開発者ツールで保存した HAR ファイルからも作れます:</span>
         <button type="button" id="easy-har-pick" class="btn">HAR ファイルから作る…</button>
-        <input id="easy-har-input" type="file" multiple accept=".har,.json" hidden>
       </div>
+      {% endif %}
+      <input id="easy-har-input" type="file" multiple accept=".har,.json" hidden>
     </div>
   </div>
 
@@ -11578,11 +11770,9 @@ textarea.code-editor[readonly] { opacity: .7; }
       <div class="easy-live"><span class="rec-light"></span><span>記録中</span></div>
       <div class="easy-count"><span class="easy-count-num" id="easy-count">0</span><span class="easy-count-label">件の通信を記録しました</span></div>
       <p class="easy-guide">記録用のブラウザが開きました。そのウィンドウでいつもどおりサイトを操作してください。<br>終わったら、ブラウザの赤い <strong>[記録をおわる]</strong> か、この画面の <strong>[記録をおわる]</strong> を押します。</p>
-      <div class="notice info" id="easy-browser-note" hidden></div>
       <div class="notice error" id="easy-rec-error" hidden></div>
       <div class="easy-actions">
         <button type="button" id="easy-stop" class="btn danger xl">■ 記録をおわる</button>
-        <button type="button" id="easy-open-browser" class="btn">ブラウザをもう一度開く</button>
         <button type="button" id="easy-cancel" class="btn ghost">やめる (記録を破棄)</button>
       </div>
       <p class="hint">件数が増えないときは、記録用のブラウザ (タイトルに「記録中」と付いた窓) でサイトを開いているか確認してください。https:// のページは記録されません。</p>
@@ -11656,7 +11846,7 @@ textarea.code-editor[readonly] { opacity: .7; }
     <p class="lead">かんたん画面で作ったスクリプトの中身を確認して、細かく変更できます。手順を使う・使わないや待ち時間などを変えて [設定から作り直す] を押すか、下のコードを直接書き換えて [保存] します。どちらも [試しに実行する] ですぐに確かめられます。新しく記録すると、ここの設定は最初の状態に戻ります。</p>
   </div>
 
-  <div id="detail-empty" class="notice info">まだ記録がありません。右上の [かんたん画面に戻る] を押して記録するか、HAR ファイルを読み込むと、ここでスクリプトの中身を確認・変更できます。</div>
+  <div id="detail-empty" class="notice info">まだ記録がありません。右上の [かんたん画面に戻る] を押して HAR ファイルを読み込む（または記録する）と、ここでスクリプトの中身を確認・変更できます。</div>
 
   <div id="detail-body" hidden>
   <div class="card">
@@ -12531,26 +12721,22 @@ textarea.code-editor[readonly] { opacity: .7; }
   })();
 
   // ================================================================== かんたん画面 (既定)
-  // 「記録をはじめる」→ 記録用ブラウザでサイトを操作 → 「記録をおわる」だけで、ポート選択・記録用ブラウザの
-  // 起動・解析・生成・保存をすべて自動で行う。HAR ファイルからも同じように作れる。
+  // 「記録をはじめる」→ 記録用ブラウザでサイトを操作 → 「記録をおわる」(または記録用ブラウザを閉じる) だけで、
+  // 記録用ブラウザの起動・解析・生成・保存をすべて自動で行う。HAR ファイルからも同じように作れる。
   // できたスクリプトの中身の確認と細かい変更は「詳細設定を表示」(Detail) で行う。
   const Easy = (() => {
-    const MITM_AVAILABLE = body.dataset.mitmAvailable === 'true';
-    // アプリ内の記録用ブラウザ (IE エンジン, DESIGN.md §13.12): Windows でコンパイラか exe があるときだけ使える。
-    // Windows の設定や証明書は変更しない。使えない PC では記録できない (HAR ファイルからは作れる)。
-    const IEHOST = body.dataset.iehostAvailable === 'true';
-    const IEHOST_REASON = body.dataset.iehostReason || '';
-    const CAN_RECORD = MITM_AVAILABLE && IEHOST;
+    // 記録できるのは、記録用ブラウザ (IE エンジン) が使える Windows の PC で、その PC から開いたときだけ
+    // (サーバー側の判断: data-can-record)。それ以外の画面は HAR ファイルから作る (記録用の項目は出さない)。
+    const CAN_RECORD = body.dataset.canRecord === 'true';
+    const EMULATION_KEY = 'reqrec.emulation';  // 表示モード: remembered in this browser, sent with every start
     const stages = { idle: $('#easy-idle'), recording: $('#easy-recording'), processing: $('#easy-processing'), done: $('#easy-done') };
     const errEl = $('#easy-error');
     const btnStart = $('#easy-start');
     const btnStop = $('#easy-stop');
     const emuSel = $('#easy-emulation');
     let current = 'idle';
-    let emuCurrent = 'default'; // 表示モード in the registry: an unchanged select sends 'keep' (nothing is written)
-    let browserSeen = false;    // the recording browser was seen running during this recording (guards the auto-stop against racing the launch)
-    let autoStopped = false;    // the auto-stop already fired for this recording
-    let lastIEError = null;     // last failure to start the recording browser in this GUI session
+    let autoStopped = false;    // the recording browser was closed: stop + build already fired for this recording
+    let lastIEError = null;     // last failure to open the recording browser in this GUI session
 
     // ---------------------------------------------------------------- stages
     function stage(name, text) {
@@ -12566,17 +12752,11 @@ textarea.code-editor[readonly] { opacity: .7; }
     // ---------------------------------------------------------------- readiness (idle)
     function readiness() {
       refreshLoaded();
+      if (!CAN_RECORD) return;  // HAR files only: the recording controls are not shown
       const list = clear($('#easy-ready'));
       const add = (cls, text) => list.appendChild(el('li', { class: cls, text }));
-      if (!MITM_AVAILABLE) { add('bad', '記録機能: 準備できていません (mitmproxy が未インストール)'); return; }
-      add('ok', '記録機能: 使えます');
-      if (IEHOST) {
-        if (lastIEError) add('bad', '記録用ブラウザ (IE エンジン): 前回、起動できませんでした: ' + lastIEError);
-        else add('ok', '記録用ブラウザ (IE エンジン): 使えます (Windows の設定や証明書は変更しません)');
-        return;
-      }
-      add('bad', '記録用ブラウザ (IE エンジン): 準備できていません: ' + (IEHOST_REASON || '理由不明'));
-      add('warn', 'この PC では記録できません。管理者に連絡してください (下の [HAR ファイルから作る] は使えます)。');
+      if (lastIEError) add('bad', '記録用ブラウザ (IE エンジン): 前回、開けませんでした: ' + lastIEError);
+      else add('ok', '記録用ブラウザ (IE エンジン): 使えます (Windows の設定や証明書は変更しません)');
     }
     // a recording loaded earlier (before a page reload, or one that could not be turned into a script)
     function refreshLoaded() {
@@ -12585,40 +12765,32 @@ textarea.code-editor[readonly] { opacity: .7; }
       if (loaded) $('#easy-loaded-count').textContent = S.recording.flows;
     }
 
-    // ---------------------------------------------------------------- 表示モード
-    function setEmulation(name) {
-      const other = emuSel.querySelector('option[value="keep"]');
-      if (other) other.remove();
-      if (name && !emuSel.querySelector(`option[value="${name}"]`)) {
-        // a value written outside reqrec: kept as it is unless another mode is chosen
-        emuSel.appendChild(el('option', { value: 'keep', text: '今の設定のまま' }));
-        name = 'keep';
-      }
-      emuSel.value = name || 'default';
-      emuCurrent = emuSel.value;
+    // ---------------------------------------------------------------- 表示モード (this browser remembers it)
+    function loadEmulation() {
+      let name = 'default';
+      try { name = localStorage.getItem(EMULATION_KEY) || 'default'; } catch (e) { /* ignore */ }
+      if (!emuSel.querySelector(`option[value="${name}"]`)) name = 'default';
+      emuSel.value = name;
     }
+    emuSel.addEventListener('change', () => {
+      try { localStorage.setItem(EMULATION_KEY, emuSel.value); } catch (e) { /* ignore */ }
+    });
 
     // ---------------------------------------------------------------- live count (polled every second)
     function renderLive(st) {
       $('#easy-count').textContent = st.flows ?? 0;
       const err = $('#easy-rec-error');
-      if (st.error) { err.textContent = '記録用の中継サーバーが止まりました: ' + st.error; err.hidden = false; }
-      else err.hidden = true;
-      if (st.running === false && current === 'recording' && !st.error) {
-        err.textContent = '記録用の中継サーバーが終了しています。[記録をおわる] を押して保存するか、[やめる] で破棄してください。';
-        err.hidden = false;
-      }
+      err.textContent = st.error ? '記録用ブラウザが終了しました: ' + st.error : '';
+      err.hidden = !st.error;
     }
     function onRecordStatus(st) {
       if (current !== 'recording') return;
       renderLive(st);
-      if (!st.browser || st.browser.kind !== 'iehost') return;
-      if (st.browser.running) { browserSeen = true; return; }
-      // Closing the recording browser is the natural "I'm done": stop + build once.
-      if (!browserSeen || autoStopped) return;
-      autoStopped = true;  // handled once per recording ([ブラウザをもう一度開く] re-arms it)
-      if (st.browser.exit_code === 4) {  // RecBrowser could not set its per-process proxy: nothing was recorded
-        discardSilently('記録用ブラウザの中継設定に失敗したため、記録できませんでした。もう一度 [記録をはじめる] を押してください。直らない場合は管理者に連絡してください。');
+      if (st.running || autoStopped) return;
+      // The recording browser was closed (its own [記録をおわる] or the window's ×): stop + build once.
+      autoStopped = true;
+      if (st.exit_code === 4) {  // the per-process proxy could not be set: nothing was recorded
+        discardSilently('記録用ブラウザの中継設定に失敗したため、記録できませんでした。もう一度 [記録をはじめる] を押してください。');
         return;
       }
       setStatus('記録用ブラウザが閉じられました。スクリプトを作成します…', 'busy');
@@ -12633,83 +12805,44 @@ textarea.code-editor[readonly] { opacity: .7; }
     function startPolling() { if (!S.recPoll) S.recPoll = setInterval(pollRecord, 1000); }
     function stopPolling() { clearInterval(S.recPoll); S.recPoll = null; }
 
-    // ---------------------------------------------------------------- browser
-    async function openBrowser() {
-      const url = $('#easy-url').value.trim();
-      try {
-        const res = await api('/api/browser/open', { method: 'POST', json: { url } });
-        if (res.browser && res.browser.running) { browserSeen = true; autoStopped = false; }
-        setStatus(res.relaunched ? '記録用ブラウザを開き直しました。' : '記録用ブラウザはすでに開いています。', 'ok');
-        return res;
-      } catch (e) {
-        if (e.data && e.data.kind === 'iehost') lastIEError = e.message;  // the exe itself could not be started
-        $('#easy-browser-note').textContent = '記録用ブラウザを開けませんでした (' + e.message + ')。';
-        $('#easy-browser-note').hidden = false;
-        return null;
-      }
-    }
-
     // ---------------------------------------------------------------- start / stop / cancel
     function okToStartOver() {  // a new recording replaces the current script of 詳細設定
       return !Detail.dirty() || window.confirm('詳細設定で書き換えたコードが、まだ保存されていません。保存しないで新しく作りますか？');
     }
     async function start() {
-      if (!CAN_RECORD) {
-        showError(!MITM_AVAILABLE
-          ? '記録機能の準備ができていません (mitmproxy が未インストール)。'
-          : '記録用ブラウザが使えないため記録できません: ' + (IEHOST_REASON || '理由不明') + '　管理者に連絡してください。');
-        return;
-      }
-      if (!okToStartOver()) return;
+      if (!CAN_RECORD || !okToStartOver()) return;
       showError('');
       btnStart.disabled = true;
-      $('#easy-browser-note').hidden = true;
       $('#easy-rec-error').hidden = true;
       $('#easy-count').textContent = '0';
-      browserSeen = false;
       autoStopped = false;
-      stage('processing', '記録の準備をしています… (記録用ブラウザを開きます。初回は数秒かかります)');
+      stage('processing', '記録の準備をしています… (記録用ブラウザを開きます。数秒かかります)');
       let res;
       try {
         res = await api('/api/record/start', { method: 'POST', json: {
           start_url: $('#easy-url').value.trim(),
-          emulation: emuSel.value === emuCurrent ? 'keep' : emuSel.value,  // the registry is written only for a change
+          emulation: emuSel.value,
         } });
       } catch (e) {
         stage('idle');
         const kind = e.data && e.data.kind;
         if (kind === 'iehost') {
-          // RecBrowser.exe could not be built or started: typically blocked by a security policy (AppLocker)
           lastIEError = e.message;
           readiness();
-          showError(e.message + '　パソコンのセキュリティ設定で記録用ブラウザ (RecBrowser.exe) が止められた可能性があります。'
-            + '管理者に「reqrec のフォルダで python -m reqrec browser build を実行し、そのフォルダの RecBrowser.exe の実行を許可する」よう依頼してください。');
+          showError(e.message + '　もう一度 [記録をはじめる] を押してください。何度やっても同じときは、パソコンを再起動してから試してください。');
         } else if (kind === 'proxy') {
-          // the recording proxy (mitmdump) did not start listening: not a security-policy problem
-          showError(e.message + '　記録用の中継サーバーが動きませんでした。もう一度 [記録をはじめる] を押してください。'
-            + '何度やっても同じときは、パソコンを再起動してから試すか、管理者に連絡してください。');
-        } else if (kind === 'emulation') {
-          showError(e.message + '　「表示モード」を「既定」にして、もう一度記録してください。');
+          showError(e.message + '　記録用の中継を設定できませんでした。もう一度 [記録をはじめる] を押してください。');
         } else {
           showError('記録を始められませんでした: ' + e.message);
         }
         setStatus('記録を始められませんでした', 'error');
         return;
       }
-      if (res.status && res.status.error) {
-        stage('idle');
-        showError('記録用の中継サーバーを起動できませんでした: ' + res.status.error);
-        setStatus('記録を始められませんでした', 'error');
-        return;
-      }
-      emuCurrent = emuSel.value;
+      lastIEError = null;
       stage('recording');
       renderLive(res.status || { running: true, flows: 0 });
       startPolling();
-      // the server already opened the recording browser
-      browserSeen = !!(res.browser && res.browser.running);
-      const notes = (res.warnings || []).join(' ');
-      setStatus('記録中です。開いた記録用ブラウザでサイトを操作してください。' + (notes ? ' ' + notes : ''), notes ? 'info' : 'ok');
+      setStatus('記録中です。開いた記録用ブラウザでサイトを操作してください。', 'ok');
     }
 
     async function stop() {
@@ -12864,16 +12997,14 @@ textarea.code-editor[readonly] { opacity: .7; }
     btnStart.addEventListener('click', start);
     btnStop.addEventListener('click', stop);
     $('#easy-cancel').addEventListener('click', cancel);
-    $('#easy-open-browser').addEventListener('click', openBrowser);
     $('#easy-url').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !btnStart.disabled) start(); });
 
     function initFromState(st) {
-      lastIEError = (st.iehost && st.iehost.last_error) || null;
-      setEmulation(st.iehost && st.iehost.emulation);
+      lastIEError = (st.record && st.record.last_error) || null;
+      loadEmulation();
       if (st.recorder && st.recorder.running) {
         // a page reload during a recording: it is finished here (closing the browser still stops it)
         setMode('easy', false);
-        browserSeen = !!(st.browser && st.browser.kind === 'iehost' && st.browser.running);
         autoStopped = false;
         stage('recording');
         renderLive(st.recorder);
@@ -12931,7 +13062,7 @@ textarea.code-editor[readonly] { opacity: .7; }
 '''
 
 
-# ===== former reqrec/cli.py: argparse CLI (reqrec import / inspect / generate / gui / browser) =====
+# ===== former reqrec/cli.py: argparse CLI (reqrec import / inspect / generate / gui / record) =====
 # argparse CLI.  Contract: DESIGN.md §9.  Recording itself is done in the GUI (``reqrec gui``).
 #
 # Sub-commands::
@@ -13402,17 +13533,19 @@ reqrec - Web サイトの HTTP 通信を記録して、同じ操作を再現す�
 「HTTP レベルのマクロ記録」を行います。"""
 
 _EPILOG = """\
-典型的な流れ:
-  1. 記録する   reqrec gui                           （記録用ブラウザで操作。IE の F12 で保存した HAR も可）
-  2. 確認する   reqrec inspect rec.json
-  3. 生成する   reqrec generate rec.json -o scrape.py
+ふだんは引数なしで起動します:  python reqrec.py   （GUI が開きます。記録・スクリプト作成・実行をボタンで行えます）
+
+コマンドで使う場合の典型的な流れ:
+  1. 記録する   python reqrec.py record --out rec.json --url http://kanri/   （記録用ブラウザを閉じると保存）
+  2. 確認する   python reqrec.py inspect rec.json
+  3. 生成する   python reqrec.py generate rec.json -o scrape.py
   4. 実行する   python scrape.py
 
-別タブで開いた画面の HAR は複数指定して結合できます:  reqrec generate tab1.har tab2.har -o scrape.py
-手動で取捨選択:  reqrec generate rec.json -o scrape.py --exclude-flow f0012 --final-step 3
-コードを書かずに使う GUI:  reqrec gui
+IE の F12 で保存した HAR も使えます。別タブの HAR は複数指定して結合できます:
+  python reqrec.py generate tab1.har tab2.har -o scrape.py
+手動で取捨選択:  python reqrec.py generate rec.json -o scrape.py --exclude-flow f0012 --final-step 3
 
-各コマンドの詳細: reqrec <コマンド> -h"""
+各コマンドの詳細: python reqrec.py <コマンド> -h"""
 
 
 _INPUT_HELP = ("入力ファイル（.har / .json）。複数指定すると時刻順に結合して 1 つの記録として扱います"
@@ -13420,7 +13553,7 @@ _INPUT_HELP = ("入力ファイル（.har / .json）。複数指定すると時�
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the top-level parser with its sub-commands (import / inspect / generate / gui / browser)."""
+    """Build the top-level parser with its sub-commands (import / inspect / generate / gui / record)."""
     parser = _ArgumentParser(prog="reqrec", description=_DESCRIPTION, epilog=_EPILOG)
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}", help="バージョンを表示して終了する")
 
@@ -13483,29 +13616,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_gui.add_argument("--no-browser", action="store_true", help="ブラウザを自動で開かない")
     p_gui.set_defaults(func=cmd_gui)
 
-    # -- browser ----------------------------------------------------------------------------------
-    p_browser = subparsers.add_parser(
-        "browser",
-        help="記録用ブラウザ（IE エンジン・Windows）を reqrec.py と同じフォルダに事前に作成する / 作成済みか確認する",
-        description="記録用ブラウザ（RecBrowser.exe）を reqrec.py と同じフォルダ（配布フォルダ）に事前に作成します。\n"
-                    "作成しておくと、そのフォルダを使うどの PC でもその exe をそのまま使い、各 PC の作業フォルダでの\n"
-                    "コンパイルは行いません（IT 担当者が配布フォルダを用意するとき用。Windows 標準の csc.exe が必要）。",
+    # -- record ---------------------------------------------------------------------------------
+    p_record = subparsers.add_parser(
+        "record",
+        help="記録用ブラウザ（IE エンジン・Windows）を開いて、操作した http:// の通信を記録する（GUI が使います）",
+        description="記録用ブラウザ（Edge の IE モードと同じエンジン）を開き、閉じるまでに開いた http:// のページの通信を\n"
+                    "記録して --out のファイル（reqrec の記録形式）に保存します。GUI の [記録をはじめる] はこのコマンドを使います。\n"
+                    "Windows の設定・レジストリ・証明書は変更しません（中継はこの記録用ブラウザだけに設定します）。",
     )
-    browser_actions = p_browser.add_subparsers(dest="browser_action", title="操作")
-    p_browser_build = browser_actions.add_parser(
-        "build",
-        help="記録用ブラウザを reqrec.py と同じフォルダに作成する（32 ビット版）",
-        description="記録用ブラウザ（RecBrowser.exe）と、元にしたソースのハッシュ（RecBrowser.exe.sha256）を\n"
-                    "reqrec.py と同じフォルダに作成します。",
-    )
-    p_browser_build.set_defaults(func=cmd_browser_build)
-    p_browser_status = browser_actions.add_parser(
-        "status",
-        help="このバージョン用の記録用ブラウザが reqrec.py と同じフォルダに作成済みか確認する",
-        description="reqrec.py と同じフォルダに、このバージョンのソースから作った記録用ブラウザがあるか表示します。",
-    )
-    p_browser_status.set_defaults(func=cmd_browser_status)
-    p_browser.set_defaults(func=cmd_browser_usage)
+    p_record.add_argument("--out", required=True, metavar="FILE", help="記録の保存先（JSON）")
+    p_record.add_argument("--url", default=None, metavar="URL", help="最初に開くアドレス（省略すると空白のページ）")
+    p_record.add_argument("--title", default=BROWSER_TITLE, metavar="TEXT", help="窓のタイトル（「— 記録中」が付きます）")
+    p_record.add_argument("--emulation", default="default", choices=list(EMULATION_MODES),
+                          help="表示モード（既定: default = IE7 互換表示）")
+    p_record.add_argument("--log", default=None, metavar="FILE", help="記録用ブラウザのログの保存先")
+    p_record.add_argument("--bypass", default="", metavar="LIST", help=argparse.SUPPRESS)
+    p_record.add_argument("--control", default="none", choices=("none", "stdin"),
+                          help="stdin: 標準入力の stop（または入力の終わり）で記録を終える（GUI 用）")
+    p_record.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    p_record.add_argument("--seconds", type=int, default=30, help=argparse.SUPPRESS)
+    p_record.add_argument("--functions", default=None, help=argparse.SUPPRESS)
+    p_record.add_argument("--headless", action="store_true", help=argparse.SUPPRESS)
+    p_record.set_defaults(func=cmd_record)
 
     return parser
 
@@ -13568,39 +13700,25 @@ def _input_label(paths: Sequence[str]) -> str:
     return ", ".join(str(p) for p in paths)
 
 
-# --------------------------------------------------------------------------- browser / gui / import
+# --------------------------------------------------------------------------- record / gui / import
 
-#: ``reqrec browser`` without ``build`` / ``status`` (the former ``python -m reqrec.iehost`` usage text).
-_BROWSER_USAGE = (
-    "使い方: reqrec browser build   （記録用ブラウザを reqrec.py と同じフォルダに作成）\n"
-    "        reqrec browser status  （作成済みか確認）"
-)
-
-
-def cmd_browser_build(args: argparse.Namespace) -> int:
-    """``reqrec browser build``: prebuild the recording browser into the distribution folder (former
-    ``python -m reqrec.iehost build``)."""
-    try:
-        exe = iehost.build_shipped()
-    except IEHostError as exc:
-        _error(str(exc))
-        return EXIT_ERROR
-    # always 32-bit, so the 32-bit ActiveX controls of legacy intranet pages load (as in IE mode)
-    print(f"記録用ブラウザを作成しました (32 ビット版): {exe}")
-    return EXIT_OK
-
-
-def cmd_browser_status(args: argparse.Namespace) -> int:
-    """``reqrec browser status``: is there a prebuilt recording browser for this version?"""
-    exe = iehost.shipped_exe()
-    print(f"配布フォルダの記録用ブラウザ: {exe}" if exe else "配布フォルダの記録用ブラウザ: なし（各 PC の作業フォルダで初回にコンパイルします）")
-    return EXIT_OK
-
-
-def cmd_browser_usage(args: argparse.Namespace) -> int:
-    """``reqrec browser`` alone: print the usage and return the usage exit code."""
-    print(_BROWSER_USAGE, file=sys.stderr)
-    return EXIT_USAGE
+def cmd_record(args: argparse.Namespace) -> int:
+    """``reqrec record``: the recording browser (the GUI starts it as a child process)."""
+    code = run_recorder(
+        args.out, url=args.url, title=args.title, emulation=args.emulation, log_path=args.log, bypass=args.bypass,
+        control=args.control, selftest=args.selftest, seconds=args.seconds, headless=args.headless,
+        functions=[f for f in (args.functions or "").split(",") if f.strip()] or None,
+    )
+    if not args.headless and is_windows():
+        # The IE engine's COM objects must not be torn down by the interpreter's exit: the
+        # recording is written already, so the process ends here.
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(code)
+    return code
 
 
 def cmd_gui(args: argparse.Namespace) -> int:
@@ -14030,9 +14148,9 @@ def cmd_generate(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-# ===== entry point: main() (console script ``reqrec``, ``python -m reqrec``) =====
-# Former end of reqrec/cli.py.  ``python -m reqrec`` runs :func:`main` (the guard at the very end);
-# ``mitmdump -s reqrec.py`` loads this file as a script and only uses ``addons`` (recorder section).
+# ===== entry point: main() (``python reqrec.py``, console script ``reqrec``, ``python -m reqrec``) =====
+# Former end of reqrec/cli.py.  ``python reqrec.py`` runs :func:`main` (the guard at the very end):
+# without arguments the GUI, with a command the CLI (``record`` is the GUI's recording browser).
 
 
 def _exit_code_from_system_exit(code: Any) -> int:
@@ -14047,11 +14165,34 @@ def _exit_code_from_system_exit(code: Any) -> int:
     return EXIT_USAGE
 
 
+def default_workdir() -> str:
+    """``python reqrec.py``'s work folder: ``REQREC_WORKDIR``, else ``reqrec_work`` next to reqrec.py."""
+    return os.environ.get(WORKDIR_ENV) or os.path.join(os.path.dirname(SCRIPT_PATH), "reqrec_work")
+
+
+def first_free_port(host: str = "127.0.0.1", preferred: int = 8765, attempts: int = 20) -> int:
+    """``preferred`` or the next port that can be bound (``preferred`` when none: the GUI explains)."""
+    for port in range(int(preferred), int(preferred) + max(1, int(attempts))):
+        if 1 <= port <= 65535 and _port_free(host, port) is None:
+            return port
+    return int(preferred)
+
+
+def run_default_gui() -> int:
+    """``python reqrec.py`` without arguments: the GUI on this PC (``127.0.0.1``, port 8765 or the next
+    free one), opened in the browser; recordings and scripts go to :func:`default_workdir`."""
+    return run_gui(host="127.0.0.1", port=first_free_port("127.0.0.1", 8765), workdir=default_workdir(), open_browser=True)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Run the CLI and return the process exit code (0 ok, 1 error, 2 usage)."""
+    """Run the CLI and return the process exit code (0 ok, 1 error, 2 usage).  Without arguments
+    (``python reqrec.py``) the GUI starts (:func:`run_default_gui`)."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        return run_default_gui()
     parser = build_parser()
     try:
-        args = parser.parse_args(list(argv) if argv is not None else None)
+        args = parser.parse_args(arguments)
     except SystemExit as exc:  # argparse: --help / --version (0) or usage error (2)
         return _exit_code_from_system_exit(exc.code)
 

@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-# reqrec（reqrec.py）を動かすために pip で入れるライブラリです。
-# JupyterLab のターミナルで、このファイルのあるフォルダに移動してから実行します。
-#   pip install -r requirements.txt
+# reqrec（reqrec.py）を動かすために pip で入れるライブラリです（Python 3.10 以上）。
+# コマンドプロンプトで、このファイルのあるフォルダに移動してから実行します。
+#   python -m pip install -r requirements.txt
 #
 # バージョンは動作確認したものに固定しています。
+# 記録用ブラウザは Python に最初から入っている機能だけで動くので、ここにはありません。
 
-# 画面（Web アプリ）。flask --app reqrec run で起動します
+# 画面（Web アプリ）。python reqrec.py で起動します
 flask==3.1.3
 
 # 作ったスクリプトと [試しに実行する] が使う
