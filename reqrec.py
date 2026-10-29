@@ -112,6 +112,7 @@ __all__ = [
     "RecordedResponse", "Flow", "Recording", "Ref", "RefKind", "Extractor", "ExtractorKind", "MultipartPart",
     "Loop", "Step", "Constant", "InitialCookie", "Dropped", "AuthInfo", "Plan", "PlanOptions", "GenOptions",
     "BodyKind", "ResponseKind", "to_plain", "NOT_WINDOWS_MESSAGE", "is_windows",
+    "VALUE_CLASSES", "Binding", "CookieLookup", "CookieSet", "CookieInfo", "SessionSwitch",
     # importers
     "load_recording", "load_recordings", "load_har", "recording_from_har", "HAR_EXTENSIONS",
     "parse_har_timestamp", "decode_header_fields", "infer_resource_type",
@@ -120,6 +121,9 @@ __all__ = [
     "SESSION_AUTH_SCHEMES", "AUTH_FAMILIES", "classify_noise", "filter_flows", "collapse_redirects",
     "classify_cookies", "compute_base_headers", "clean_request_headers", "parse_cookie_header",
     "parse_set_cookie", "normalise_flow_id", "collapse_auth_handshakes", "auth_family",
+    "COOKIE_PROFILES", "cookie_profile_for", "SetCookieInfo", "parse_set_cookie_attrs", "set_cookie_lines",
+    "cookie_domain_match", "cookie_default_path", "cookie_path_match", "cookie_scope_url", "CookieVersion",
+    "CookieTimeline", "initial_cookie_for", "split_path_segment", "describe_extractor", "describe_cookie",
     "authorization_scheme", "parse_www_authenticate", "parse_ntlm_type3", "ntlm_type3_user",
     "decode_basic_credentials", "digest_username", "auth_username", "Candidate", "MultipartField",
     "parse_multipart", "json_leaves", "json_dotted", "parse_json_text", "split_form_segments",
@@ -245,7 +249,8 @@ class RecordedRequest:
 
     @property
     def query_pairs(self) -> list[tuple[str, str]]:
-        return parse_query(self.query)
+        # byte level: a value a Shift_JIS page sent keeps its percent-encoded spelling (never U+FFFD)
+        return parse_form_bytes(query_bytes(self.query))
 
     def header(self, name: str) -> Optional[str]:
         return header_get(self.headers, name)
@@ -480,8 +485,8 @@ class Ref:
 
 
 ExtractorKind = Literal[
-    "cookie",      # session.cookies.get(name)                        -> name
-    "header",      # resp.headers.get(name)                           -> name
+    "cookie",      # _cookie(session, name, cookie_url, path=, domain=)  -> name (+ scope); RFC 6265
+    "header",      # resp.headers.get(name) (+ optional pattern; ``hop`` = redirect response)  -> name
     "json",        # resp.json()[path[0]][path[1]]...                 -> path
     "html_input",  # soup.find("input", {"name": name})["value"]      -> name
     "html_meta",   # soup.find("meta", {"name": name})["content"]     -> name
@@ -511,6 +516,14 @@ class Extractor:
     pattern: Optional[str] = None
     sample: Optional[str] = None
     note: Optional[str] = None
+    #: index into the step's redirect chain (``list(resp.history) + [resp]``) for values that only an
+    #: intermediate redirect response carried (``header`` with ``name``, or its ``Location`` matched by
+    #: ``pattern``); None = the final response
+    hop: Optional[int] = None
+    #: kind ``cookie``: the cookie's scope (``_cookie(session, name, cookie_url, path=, domain=)``)
+    cookie_url: Optional[str] = None
+    cookie_path: Optional[str] = None
+    cookie_domain: Optional[str] = None
 
 
 @dataclass
@@ -579,6 +592,11 @@ class Step:
     source_flow_ids: list[str] = field(default_factory=list)
     comment: str = ""
     allow_redirects: bool = True
+    #: cookie values read from the jar before the request (class D) and cookies set before it
+    lookups: list[CookieLookup] = field(default_factory=list)
+    cookie_sets: list[CookieSet] = field(default_factory=list)
+    #: where each dynamic value of this request comes from (classes B-E, plus untraced A values)
+    bindings: list[Binding] = field(default_factory=list)
 
     def literal_url(self) -> Optional[str]:
         """URL string if all pieces are literal, else None."""
@@ -600,16 +618,134 @@ class Constant:
     secret: bool = False
     env_var: Optional[str] = None
     comment: str = ""
+    #: ``"input"`` - a value the user typed or chose (class B, the script's 入力値 section);
+    #: ``"shared"`` - a fixed value used in several places (class A); ``"auth"`` - HTTP auth
+    kind: str = "shared"
+    #: a password / credential: reports and the GUI never show its value (the script holds it in plain
+    #: text unless ``secret``, as the user decided)
+    sensitive: bool = False
+    #: the value was sent in this legacy charset (a Shift_JIS page): the constant holds the text and the
+    #: requests send ``NAME.encode(encoding)``
+    encoding: Optional[str] = None
 
 
 @dataclass
 class InitialCookie:
-    """A cookie the browser already had when recording started (never seen in Set-Cookie)."""
+    """A cookie the browser sent although no recorded response had set it in that scope.
+
+    ``origin`` is ``"pre-existing"`` (the browser had it before the recording started) or
+    ``"script"`` (the page wrote it, e.g. ``document.cookie``, with a value that could not be traced
+    to an earlier response).  ``domain`` is the host it was sent to (or the Domain it was adopted
+    from, see ``CookieTimeline``), ``path`` the narrowest path consistent with where it was and was
+    not sent, ``url`` the scope URL the generated script sets it for (``_set_cookie``), so host-only
+    cookies of dot-less LAN hosts (``http://kanri/``) are stored exactly like server cookies."""
 
     name: str
     value: str
     domain: str
     path: str = "/"
+    url: str = ""
+    host_only: bool = True
+    origin: str = "pre-existing"
+
+
+#: Value classes of the dependency analysis (DESIGN.md §14): how a request value is obtained when the
+#: generated script runs.
+VALUE_CLASSES: dict[str, str] = {
+    "A": "固定値",
+    "B": "入力値",
+    "C": "レスポンスから取得",
+    "D": "Cookie / セッション",
+    "E": "実行時の値",
+}
+
+
+@dataclass
+class Binding:
+    """Where one request value of a step comes from (the dependency graph, value-free).
+
+    * ``location`` - ``path`` | ``path_param`` | ``query`` | ``form`` | ``json`` | ``multipart`` |
+      ``header`` | ``cookie`` | ``referer`` | ``auth``; ``name`` - parameter / header / cookie name,
+      dotted JSON path or path segment number;
+    * ``value_class`` - ``A`` fixed, ``B`` user input, ``C`` response-derived, ``D`` cookie /
+      session-derived, ``E`` runtime environment (see ``VALUE_CLASSES``);
+    * ``source`` - plain-Japanese description of the source (never the value itself);
+      ``source_step`` / ``source_kind`` - producing step and locator kind (``set-cookie``,
+      ``cookie-jar``, ``html_input``, ``json``, ``header``, ``url``, ``time``, ``input`` ...);
+    * ``var`` - the script variable / constant carrying the value; ``cookie`` / ``cookie_domain`` /
+      ``cookie_path`` - the cookie identity for class D."""
+
+    location: str
+    name: str
+    value_class: str
+    source: str = ""
+    source_step: Optional[int] = None
+    source_kind: str = ""
+    var: Optional[str] = None
+    cookie: Optional[str] = None
+    cookie_domain: Optional[str] = None
+    cookie_path: Optional[str] = None
+    note: str = ""
+
+
+@dataclass
+class CookieLookup:
+    """A cookie value a step reads from the session's jar right before its request (class D):
+    ``var = _cookie(session, name, url, path=path, domain=domain)`` - the cookie of that name the jar
+    would send to ``url``, the recorded ``path`` / ``domain`` breaking ties between same-name
+    cookies (RFC 6265: several cookies may share a name in different scopes)."""
+
+    var: str
+    name: str
+    url: str
+    path: Optional[str] = None
+    domain: Optional[str] = None
+    note: str = ""
+
+
+@dataclass
+class CookieSet:
+    """A cookie a step sets in the jar right before its request: a cookie the page's script wrote
+    (``document.cookie``) or one copied into another scope, whose value is ``value`` (a Ref: traced,
+    cookie-derived or literal).  Emitted as ``_set_cookie(session, url, name, value, path=...)``."""
+
+    name: str
+    url: str
+    value: Ref
+    path: Optional[str] = None
+    domain: Optional[str] = None
+    note: str = ""
+
+
+@dataclass
+class CookieInfo:
+    """One cookie identity (name, domain, path) of the recording, for the generated script's cookie
+    table and the debug output: where it came from and which steps sent it."""
+
+    name: str
+    domain: str
+    path: str
+    host_only: bool = True
+    origin: str = "server"  # "server" (Set-Cookie) | "pre-existing" | "script" | "dropped"
+    issued_steps: list[int] = field(default_factory=list)
+    used_steps: list[int] = field(default_factory=list)
+    switch_steps: list[int] = field(default_factory=list)
+    note: str = ""
+
+
+@dataclass
+class SessionSwitch:
+    """A step whose response (re)issued a cookie that later steps send instead of an earlier value of
+    the same name: ``kind`` ``"rotation"`` (same name, domain and path; e.g. a new session id at
+    login) or ``"context"`` (same name in a new domain / path; e.g. a portal handing over to a
+    business application)."""
+
+    step: int
+    name: str
+    domain: str
+    path: str
+    kind: str
+    previous: str = ""
 
 
 @dataclass
@@ -655,6 +791,32 @@ class Plan:
     meta: dict[str, Any] = field(default_factory=dict)
     auth: Optional[AuthInfo] = None  # HTTP auth scheme to configure on the session (see AuthInfo)
     final_step_index: Optional[int] = None  # Step.index whose result main() prints; None = last step
+    #: every cookie identity (name, domain, path) the steps send or receive, and the session switches
+    cookies: list[CookieInfo] = field(default_factory=list)
+    session_switches: list[SessionSwitch] = field(default_factory=list)
+    #: dot-less hosts (``http://kanri/``) that set cookies with ``Domain=<host>`` (an RFC 6265 browser
+    #: sends them back, Python's cookie jar only after the script's ``_host_cookie_hook``; the IE engine
+    #: refuses them)
+    dotless_domain_hosts: list[str] = field(default_factory=list)
+    #: hosts that set (or delete) cookies with ``Domain=<that host>``: browsers treat them as the host-only
+    #: cookie of the same name, Python's jar as a second cookie - the script's ``_host_cookie_hook``
+    #: (``_ie_cookie_hook`` for the IE engine) aligns them
+    domain_is_host_hosts: list[str] = field(default_factory=list)
+    #: hosts whose ``Set-Cookie`` lines carry attributes browsers ignore but Python's jar does not (an
+    #: empty Domain, a Max-Age that is not an integer, a Path not starting with ``/``): Python would drop
+    #: the cookie or never send it - the script's ``_cookie_attr_hook`` removes them
+    malformed_cookie_hosts: list[str] = field(default_factory=list)
+    #: IE engine: hosts that set cookies without ``Path`` below the root (IE's default path keeps the
+    #: trailing ``/``, Python's does not) - the script's ``_ie_cookie_hook`` gives them IE's path
+    ie_default_path_hosts: list[str] = field(default_factory=list)
+    #: RFC 6265 browsers: hosts whose host-only cookies the browser did not send to a sub-domain the
+    #: plan requests, while Python's default cookie policy would - the script then uses ``_Session``
+    host_only_cookie_hosts: list[str] = field(default_factory=list)
+    #: IE engine: hosts that set or delete cookies with ``Domain=<a parent domain>`` that the parent host
+    #: also has without ``Domain``: one cookie for IE, two in Python's jar - the script's
+    #: ``_ie_cookie_hook`` removes the parent host's copy
+    parent_domain_cookie_hosts: list[str] = field(default_factory=list)
+    cookie_profile: str = "rfc6265"  # the recording browser's cookie rules (COOKIE_PROFILES)
 
 
 # --------------------------------------------------------------------------- options
@@ -681,6 +843,9 @@ class PlanOptions:
     include_flow_ids: list[str] = field(default_factory=list)  # kept even if a noise rule would drop them
     final_flow_id: Optional[str] = None  # the flow whose step becomes Plan.final_step_index
     detect_auth: bool = True  # detect NTLM / Negotiate / Basic / Digest handshakes -> Plan.auth
+    #: put back a request the noise filter dropped (static file, tracker, 304) when its response sets a
+    #: cookie or carries a value that a kept request needs and no kept response provides
+    include_producers: bool = True
 
 
 @dataclass
@@ -857,11 +1022,16 @@ def url_extension(url: str) -> str:
 
 
 def value_variants(value: str) -> set[str]:
-    """Spellings a request value may have had inside a response: raw, URL-(un)quoted, HTML-escaped."""
+    """Spellings a request value may have had inside a response: raw, URL-(un)quoted, HTML-escaped.
+    A percent-encoded value whose bytes are not UTF-8 (cp932 from a Shift_JIS page) has no unquoted
+    spelling: decoding it gives U+FFFD, which only matches garbled text by coincidence."""
     out = {value}
     try:
-        out.add(unquote(value))
-        out.add(unquote_plus(value))
+        out.add(unquote(value, errors="strict"))
+        out.add(unquote_plus(value, errors="strict"))
+    except UnicodeDecodeError:
+        pass
+    try:
         out.add(quote(value, safe=""))
         out.add(quote(value, safe="/:"))
     except Exception:  # pragma: no cover
@@ -876,7 +1046,7 @@ def value_variants(value: str) -> set[str]:
 _IDENT_CLEAN_RE = re.compile(r"[^0-9a-zA-Z_]+")
 _RESERVED = set(keyword.kwlist) | set(dir(builtins)) | {
     "session", "resp", "soup", "data", "ctx", "main", "step", "requests", "re", "json", "os", "sys", "time",
-    "BeautifulSoup", "BASE_HEADERS", "INITIAL_COOKIES", "TIMEOUT",
+    "BeautifulSoup", "BASE_HEADERS", "INITIAL_COOKIES", "TIMEOUT", "DEBUG", "DEPENDENCIES",
 }
 
 
@@ -914,7 +1084,7 @@ def now_iso() -> str:
 def looks_like_timestamp(value: str, around: Optional[float] = None, tolerance_days: float = 400.0) -> Optional[str]:
     """If ``value`` is an epoch timestamp (seconds or milliseconds) near ``around`` (default: now),
     return ``'s'`` or ``'ms'``; otherwise None.  Used to replace cache-busters like ``_=1696...``."""
-    if not value.isdigit():
+    if not (value.isascii() and value.isdigit()):  # '①' is a digit to str.isdigit() but not to int()
         return None
     n = int(value)
     ref = around if around is not None else time.time()
@@ -2030,26 +2200,806 @@ def collapse_redirects(flows: list[Flow]) -> list[list[Flow]]:
     return groups
 
 
-# --------------------------------------------------------------------------- cookies
+# --------------------------------------------------------------------------- cookies (RFC 6265 model)
+#
+# Cookies are identified the way a browser identifies them - by name, domain and path (RFC 6265
+# §5.3) - never by name alone: a portal and a business application often both issue a cookie named
+# like a session id, on different paths or hosts, and both are live at the same time.
 
-def classify_cookies(flows: list[Flow]) -> tuple[list[InitialCookie], set[str]]:
-    """Pre-existing cookies (sent before any response set them) and the set of managed names."""
-    managed: set[str] = set()
+@dataclass
+class SetCookieInfo:
+    """One ``Set-Cookie`` header as the recording browser applies it (``CookieTimeline`` profiles).
+
+    ``path`` is the browser's path, ``py_path`` the path Python's cookie jar (the generated script)
+    stores: the same path - for a cookie without ``Path`` recorded by the IE engine (whose default path
+    keeps the trailing ``/``) the script's ``_ie_cookie_hook`` gives Python IE's path."""
+
+    name: str
+    value: str
+    domain: str  # lower-case, no leading dot; the request host for host-only cookies
+    host_only: bool
+    path: str
+    secure: bool = False
+    http_only: bool = False
+    expires: Optional[float] = None  # absolute epoch seconds; None = session cookie
+    deletion: bool = False  # Max-Age <= 0 or an Expires date in the past: removes the cookie
+    py_path: str = ""
+    domain_is_host: bool = False  # a Domain attribute equal to the request host (host-only in browsers)
+
+
+#: Without a usable clock (no recording time, no response Date) only dates before this count as "in
+#: the past" - the usual way of deleting a cookie (``expires=Thu, 01 Jan 1970 00:00:00 GMT``).
+_COOKIE_EPOCH_FLOOR = 946684800.0  # 2000-01-01
+_MAX_AGE_RE = re.compile(r"^-?\d+$")
+#: ``Set-Cookie`` attributes browsers ignore (RFC 6265 §5.2) but Python's http.cookiejar does not: an
+#: empty / value-less / dots-only Domain, a Max-Age that is not an integer (Python drops the cookie) and
+#: a value-less Path or one not starting with ``/`` (dropped, or stored where it is never sent).  The
+#: generated ``_cookie_attr_hook`` removes exactly these (same pattern).
+_IGNORED_COOKIE_ATTR_RE = re.compile(
+    r";\s*(?:domain\s*(?:=[\s.]*)?|max-age\s*(?:=(?!\s*-?\d+\s*(?:;|$))[^;]*)?|path\s*(?:=\s*[^\s;/][^;]*)?)(?=;|$)",
+    re.I)
+_COOKIE_PATH_ATTR_RE = re.compile(r";\s*path\s*=\s*/", re.I)  # a usable Path attribute
+
+#: Cookie rules of the recording browser.  ``rfc6265``: RFC 6265 (Chrome / Edge / Firefox HAR
+#: files).  ``wininet``: the IE engine (reqrec's recording browser, Edge IE mode, IE11 HAR files), as
+#: observed on Windows 11: a ``Path`` matches as a plain prefix (``/app`` reaches ``/application``),
+#: the default path keeps its trailing ``/``, a cookie without ``Domain`` reaches sub-domains too,
+#: ``Domain=<name without a dot>`` is refused, and host-only / ``Domain=<host>`` are one cookie.
+COOKIE_PROFILES = ("rfc6265", "wininet")
+
+
+def cookie_profile_for(recording: "Recording") -> str:
+    """``"wininet"`` for recordings of the IE engine (reqrec's recording browser, or a HAR whose
+    requests carry an IE ``User-Agent``), else ``"rfc6265"``."""
+    meta = recording.meta if isinstance(recording.meta, dict) else {}
+    if str(meta.get("source") or "").lower() == "recbrowser":
+        return "wininet"
+    for flow in recording.flows[:50]:
+        agent = flow.request.header("user-agent") or ""
+        if "Trident/" in agent or "MSIE " in agent:
+            return "wininet"
+    return "rfc6265"
+
+
+def _cookie_host(url: str) -> str:
+    """Lower-case host of ``url`` without port (cookies ignore ports, RFC 6265 §8.5)."""
+    try:
+        return (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+
+
+def _is_ip_host(host: str) -> bool:
+    try:
+        ipaddress.ip_address((host or "").strip("[]"))
+    except ValueError:
+        return False
+    return True
+
+
+def cookie_domain_match(host: str, domain: str) -> bool:
+    """RFC 6265 §5.1.3: ``host`` equals ``domain`` or is a sub-domain of it; an IP address only
+    matches itself."""
+    host = (host or "").lower().rstrip(".")
+    domain = (domain or "").lower().lstrip(".").rstrip(".")
+    if not host or not domain:
+        return False
+    if host == domain:
+        return True
+    return host.endswith("." + domain) and not _is_ip_host(host)
+
+
+def cookie_default_path(url: str, profile: str = "rfc6265") -> str:
+    """The default path of a cookie set without ``Path``: RFC 6265 §5.1.4 (the request path up to, not
+    including, its last ``/``; Python's cookie jar does the same) or, for ``wininet``, up to and
+    including it (``/app/login.aspx`` -> ``/app/``)."""
+    try:
+        path = urlsplit(url).path
+    except ValueError:
+        return "/"
+    if not path.startswith("/"):
+        return "/"
+    if profile == "wininet":
+        return path[: path.rfind("/") + 1] or "/"
+    if path.count("/") <= 1:
+        return "/"
+    return path[: path.rfind("/")]
+
+
+def cookie_path_match(request_path: str, cookie_path: str, profile: str = "rfc6265") -> bool:
+    """RFC 6265 §5.1.4 path-match; for ``wininet`` a plain, case-sensitive prefix test."""
+    request_path = request_path or "/"
+    cookie_path = cookie_path or "/"
+    if profile == "wininet":
+        return request_path.startswith(cookie_path)
+    if request_path == cookie_path:
+        return True
+    if request_path.startswith(cookie_path):
+        return cookie_path.endswith("/") or request_path[len(cookie_path):len(cookie_path) + 1] == "/"
+    return False
+
+
+def cookie_scope_url(url: str, path: Optional[str]) -> str:
+    """``scheme://host[:port]`` of ``url`` followed by the cookie ``path``: a URL the cookie is sent
+    to, used by the generated script to pick the cookie out of the jar (``_cookie``) or to store
+    it there (``_set_cookie``)."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    return urlunsplit((parts.scheme or "http", parts.netloc, path or "/", "", ""))
+
+
+def _cookie_date(text: str) -> Optional[float]:
+    """Epoch seconds of a cookie / HTTP date (RFC 1123, RFC 850 with dashes, asctime ...)."""
+    import http.cookiejar  # stdlib; imported on first use
+
+    try:
+        return http.cookiejar.http2time(str(text).strip())
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def set_cookie_lines(response: Optional["RecordedResponse"]) -> list[str]:
+    """Every ``Set-Cookie`` value of a response; a value some exporters joined with line breaks is
+    split (a cookie line never contains one)."""
+    if response is None:
+        return []
+    out: list[str] = []
+    for raw in response.set_cookies:
+        out.extend(line for line in str(raw).replace("\r", "\n").split("\n") if line.strip())
+    return out
+
+
+def parse_set_cookie_attrs(raw: Optional[str], request_url: str, clock: Optional[float] = None,
+                           profile: str = "rfc6265") -> Optional[SetCookieInfo]:
+    """Parse one ``Set-Cookie`` value the way the recording browser stores it for a response to
+    ``request_url`` (see ``COOKIE_PROFILES``).
+
+    Returns None for an unparsable header and for a cookie the browser ignores (a ``Domain`` the
+    request host does not domain-match; for ``wininet`` also a ``Domain`` without an embedded dot).
+    ``clock`` (epoch seconds of the recording) decides whether ``Expires`` lies in the past; without
+    one only dates before 2000 count (the usual deletion idiom).  ``Max-Age`` wins over ``Expires``
+    (RFC 6265 §5.3 step 3)."""
+    parsed = parse_set_cookie(raw)
+    if parsed is None:
+        return None
+    name, value = parsed
+    host = _cookie_host(request_url)
+    domain_attr: Optional[str] = None
+    path_attr: Optional[str] = None
+    secure = http_only = False
+    max_age: Optional[int] = None
+    expires: Optional[float] = None
+    for part in str(raw).split(";")[1:]:
+        key, _sep, val = part.partition("=")
+        key = key.strip().lower()
+        val = val.strip()
+        if key == "domain":
+            if val.strip("."):  # RFC 6265 §5.2.3: an empty Domain attribute is ignored
+                domain_attr = val.strip().lstrip(".").lower()
+        elif key == "path":
+            path_attr = val if val.startswith("/") else None  # §5.2.4: otherwise the default-path
+        elif key == "secure":
+            secure = True
+        elif key == "httponly":
+            http_only = True
+        elif key == "max-age":
+            if _MAX_AGE_RE.match(val):
+                max_age = int(val)
+        elif key == "expires":
+            when = _cookie_date(val)
+            if when is not None:
+                expires = when
+    domain_is_host = False
+    if domain_attr:
+        if profile == "wininet" and "." not in domain_attr:
+            return None  # IE refuses Domain=kanri / .kanri
+        if not cookie_domain_match(host, domain_attr):
+            return None  # RFC 6265 §5.3 step 6: a cookie for a foreign domain is ignored
+        domain, host_only = domain_attr, False
+        domain_is_host = domain_attr == host
+    else:
+        domain, host_only = host, True
+    path = path_attr or cookie_default_path(request_url, profile)
+    py_path = path  # IE's default path too: the script's _ie_cookie_hook gives it to Python's jar
+    deletion = False
+    absolute: Optional[float] = None
+    if max_age is not None:
+        if max_age <= 0:
+            deletion = True
+        elif clock is not None:
+            absolute = clock + max_age
+    elif expires is not None:
+        if expires <= (clock if clock is not None else _COOKIE_EPOCH_FLOOR):
+            deletion = True
+        else:
+            absolute = expires
+    return SetCookieInfo(name=name, value=value, domain=domain, host_only=host_only, path=path, secure=secure,
+                         http_only=http_only, expires=absolute, deletion=deletion, py_path=py_path,
+                         domain_is_host=domain_is_host)
+
+
+@dataclass(eq=False)
+class CookieVersion:
+    """One value of one cookie in the simulated browser jar.  The identity is ``key`` (name,
+    domain, path); a later ``Set-Cookie`` with the same key starts a new version (``previous`` /
+    ``replaced_by``).  ``origin`` is ``"server"`` (a ``Set-Cookie``) or ``"external"`` (sent by the
+    browser although no recorded response set it in that scope: written by the page's script, there
+    before the recording, or set by a response that was not recorded); ``external_kind`` tells
+    ``"pre-existing"`` (sent before the host answered anything) from ``"script"``.  ``py_path`` is
+    the path the generated script's jar stores (``_cookie`` / ``_set_cookie`` use it)."""
+
+    name: str
+    value: str
+    domain: str
+    host_only: bool
+    path: str
+    secure: bool = False
+    expires: Optional[float] = None
+    origin: str = "server"
+    external_kind: str = ""
+    flow: Optional[Flow] = None  # the flow whose response set it / whose request first sent it
+    created: int = 0  # creation order of the key (RFC 6265 §5.4.2; kept when a value replaces another)
+    seq: int = 0
+    previous: Optional["CookieVersion"] = None
+    replaced_by: Optional["CookieVersion"] = None
+    ended_by: Optional[Flow] = None  # the flow that replaced / deleted it (None: alive to the end)
+    sent_by: list[Flow] = field(default_factory=list)
+    py_path: str = ""
+    #: the browser was expected to send it but a request with cookies did not (blocked, expired in the
+    #: browser, never really stored): not a source until a request sends it again
+    held: bool = True
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.name, self.domain, self.path)
+
+    @property
+    def jar_path(self) -> str:
+        return self.py_path or self.path
+
+    def scope_url(self, base_url: Optional[str] = None) -> str:
+        """A URL this cookie is sent to: ``base_url``'s (default: the setting flow's) scheme and
+        host with the cookie path (as the generated script's jar stores it)."""
+        base = base_url or (self.flow.request.url if self.flow is not None else "")
+        return cookie_scope_url(base, self.jar_path)
+
+
+def _infer_cookie_path(sent_paths: Sequence[str], unsent_paths: Sequence[str]) -> str:
+    """The shallowest cookie path that path-matches every request path that carried a cookie and
+    none of the (same host, same lifetime) request paths that did not; the deepest common directory
+    when the observations contradict each other.  RFC 6265 path-match (the generated script's jar)."""
+    dirs: list[list[str]] = []
+    for path in sent_paths:
+        directory = cookie_default_path("http://h" + (path if str(path).startswith("/") else "/" + str(path)))
+        dirs.append([s for s in directory.split("/") if s])
+    common: list[str] = []
+    for parts in zip(*dirs) if dirs else ():
+        if all(p == parts[0] for p in parts):
+            common.append(parts[0])
+        else:
+            break
+    candidates = ["/"] + ["/" + "/".join(common[:i]) for i in range(1, len(common) + 1)]
+    for candidate in candidates:
+        if not any(cookie_path_match(p, candidate) for p in unsent_paths):
+            return candidate
+    return candidates[-1]
+
+
+def _shared_folder(a: tuple[str, ...], b: tuple[str, ...]) -> tuple[str, ...]:
+    """The leading folder segments ``a`` and ``b`` have in common."""
+    n = 0
+    while n < len(a) and n < len(b) and a[n] == b[n]:
+        n += 1
+    return a[:n]
+
+
+def _request_path(flow: Flow) -> str:
+    """The request path without ``;name=value`` path parameters (a session id there is never part of a
+    cookie path the script would write)."""
+    try:
+        path = urlsplit(flow.request.url).path or "/"
+    except ValueError:
+        return "/"
+    return "/".join(seg.split(";", 1)[0] for seg in path.split("/")) or "/"
+
+
+class CookieTimeline:
+    """The recording browser's cookie jar replayed over a recording, driven by the recorded
+    ``Set-Cookie`` headers and checked against the recorded ``Cookie`` headers.
+
+    ``profile`` selects the browser's cookie rules (``COOKIE_PROFILES``: RFC 6265, or WinINet for the
+    IE engine).  Every flow - kept and dropped, redirect and 401 hops, in recording order - is
+    processed in two phases.  The request phase matches each recorded ``Cookie`` pair to a cookie the
+    jar holds for that URL (domain match, path match, Secure, expiry; longest path first): such a pair
+    is *explained* and carries its cookie identity.  A pair equal to a cookie of that name the jar
+    holds for the host under another path is a *leak* of that cookie (a browser quirk) and is
+    explained by it too.  Anything else becomes an *external* version (written by the page's script,
+    there before the recording, or set by an unrecorded response); a new external value of a name
+    replaces the old one when the request no longer sends the old one and one path fits both.  A cookie
+    the jar should have sent but a request with cookies did not is marked not held until it is sent
+    again.  The response
+    phase applies the ``Set-Cookie`` headers (store / replace / delete).  The clock is the recording
+    time, so cookies that were valid while recording never count as expired.
+
+    After the walk each external version gets the narrowest scope consistent with where it was and was
+    not sent (``_infer_cookie_path``; one scope for the values the page wrote over each other), and
+    adopts the domain / path of a later server ``Set-Cookie`` of the same name that took its place on
+    that host (the browser replaced it, so both had the same identity).  An external value sent in place
+    of a cookie the jar holds (the page's script overwrote it), and one a ``Set-Cookie`` deletes or
+    replaces, takes that cookie's identity at once."""
+
+    def __init__(self, flows: Sequence[Flow], profile: str = "rfc6265") -> None:
+        self.flows: list[Flow] = list(flows)
+        self.profile = profile if profile in COOKIE_PROFILES else "rfc6265"
+        self.versions: list[CookieVersion] = []
+        self.externals: list[CookieVersion] = []
+        #: hosts whose responses set cookies with ``Domain=<that host>``: Python keeps those apart from
+        #: the host-only cookie of the same name (browsers do not), see the generated ``_host_cookie_hook``
+        self.domain_is_host_hosts: set[str] = set()
+        #: hosts without a dot that set cookies with ``Domain=<host>`` (accepted by RFC browsers; Python's
+        #: jar never sends them back)
+        self.dotless_domain_hosts: set[str] = set()
+        #: hosts whose ``Set-Cookie`` lines carry attributes browsers ignore but Python does not
+        #: (``_IGNORED_COOKIE_ATTR_RE``), and (IE engine) hosts that set cookies without ``Path`` below the
+        #: root: see ``_hook_hosts``
+        self.malformed_cookie_hosts: set[str] = set()
+        self.ie_default_path_hosts: set[str] = set()
+        #: IE engine: ``(host, cookie key)`` of each line that sets / deletes ``Domain=<a parent domain>``
+        self.parent_domain_lines: list[tuple[str, tuple[str, str, str]]] = []
+        self._jar: dict[tuple[str, str, str], CookieVersion] = {}
+        self._externals_live: list[CookieVersion] = []
+        self._sent: dict[int, list[tuple[str, str, CookieVersion]]] = {}
+        self._live: dict[int, list[CookieVersion]] = {}
+        self._stored: dict[int, list[CookieVersion]] = {}
+        self._index: dict[int, int] = {}
+        self._answered_hosts: set[str] = set()
+        self._seq = 0
+        #: externals whose identity is known (the cookie the page's script overwrote, the Set-Cookie that
+        #: deleted / replaced them): kept in the jar under it and never re-inferred
+        self._scoped: set[int] = set()
+        #: a value the page wrote over other externals -> ``(folders, unsent)`` of those (``_chain_scope``)
+        self._chains: dict[int, tuple[tuple[str, ...], list[str]]] = {}
+        #: per flow position: the request's cookie host, path and folder (segments), for the window scans
+        self._hosts = [_cookie_host(f.request.url) for f in self.flows]
+        self._paths = [_request_path(f) for f in self.flows]
+        self._folders = [tuple(s for s in cookie_default_path("http://h" + p).split("/") if s) for p in self._paths]
+        for pos, flow in enumerate(self.flows):
+            self._index[id(flow)] = pos
+            clock = self._clock(flow)
+            self._request_phase(flow, clock)
+            if flow.response is not None:
+                self._response_phase(flow, clock)
+                self._answered_hosts.add(_cookie_host(flow.request.url))
+        self._infer_external_scopes()
+
+    # ------------------------------------------------------------------ queries
+
+    def position(self, flow: Flow) -> int:
+        return self._index.get(id(flow), -1)
+
+    def sent_with(self, flow: Flow) -> list[tuple[str, str, CookieVersion]]:
+        """``(name, value, version)`` for every cookie the flow's request sent, in header order."""
+        return list(self._sent.get(id(flow), ()))
+
+    def live_at(self, flow: Flow) -> list[CookieVersion]:
+        """Every cookie the browser held when the flow's request was sent (all hosts and paths)."""
+        return list(self._live.get(id(flow), ()))
+
+    def stored_by(self, flow: Flow) -> list[CookieVersion]:
+        """The cookie versions the flow's response stored (``Set-Cookie``, deletions excluded)."""
+        return list(self._stored.get(id(flow), ()))
+
+    def _host_match(self, host: str, ver: CookieVersion) -> bool:
+        if self.profile == "wininet" or not ver.host_only:
+            return cookie_domain_match(host, ver.domain)
+        return host == ver.domain
+
+    def cookies_for(self, url: str, clock: Optional[float] = None) -> list[CookieVersion]:
+        """The cookies the jar sends to ``url`` now, longest path first."""
+        host = _cookie_host(url)
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return []
+        path = parts.path or "/"
+        https = (parts.scheme or "").lower() == "https"
+        out: list[CookieVersion] = []
+        for ver in list(self._jar.values()) + self._externals_live:
+            if not self._host_match(host, ver):
+                continue
+            if not cookie_path_match(path, ver.path, self.profile):
+                continue
+            if ver.secure and not https:
+                continue
+            if ver.expires is not None and clock is not None and ver.expires <= clock:
+                continue
+            out.append(ver)
+        out.sort(key=lambda v: (-len(v.path), v.created))
+        return out
+
+    def switch_events(self, kept: set[int]) -> list[tuple[Flow, CookieVersion, str, CookieVersion]]:
+        """Session switches among kept flows (``id(flow)`` in ``kept``): ``(flow, new version, kind,
+        previous version)``.  ``"rotation"``: the response gave a cookie identity that was in use a
+        new value that later requests send; ``"context"``: it issued a cookie whose name was in use
+        in another scope.  Cookies whose every value is sent at most once by kept requests (a value
+        refreshed on each response) are not switches."""
+        out: list[tuple[Flow, CookieVersion, str, CookieVersion]] = []
+        for ver in self.versions:
+            if ver.origin != "server" or ver.flow is None or id(ver.flow) not in kept:
+                continue
+            if not any(id(f) in kept for f in ver.sent_by) or self._volatile(ver, kept):
+                continue
+            pos = self.position(ver.flow)
+            prev = ver.previous
+            if prev is not None:
+                if prev.value != ver.value and any(id(f) in kept for f in prev.sent_by):
+                    out.append((ver.flow, ver, "rotation", prev))
+                continue
+            rivals = [
+                v for v in self.versions
+                if v is not ver and v.name == ver.name and v.seq < ver.seq and v.value != ver.value
+                and (v.ended_by is None or self.position(v.ended_by) >= pos)
+                and any(id(f) in kept and self.position(f) < pos for f in v.sent_by)
+            ]
+            if rivals:
+                rival = rivals[-1]
+                out.append((ver.flow, ver, "rotation" if rival.key == ver.key else "context", rival))
+        return out
+
+    # ------------------------------------------------------------------ the walk
+
+    @staticmethod
+    def _clock(flow: Flow) -> Optional[float]:
+        """The client's clock (the recording time); the response ``Date`` only without one."""
+        if flow.started_at:
+            return flow.started_at
+        date = flow.response.header("date") if flow.response is not None else None
+        return _cookie_date(date) if date else None
+
+    def _leak_source(self, flow: Flow, name: str, value: str, taken: set[int]) -> Optional[CookieVersion]:
+        """A cookie of that name and value the browser holds for this host under another path (or a
+        parent domain): the browser sent it outside the scope our rules give it.  Never a host-only
+        cookie a response of another host set, for an RFC 6265 browser: it never sends one there, so the
+        pair is this host's own cookie with the same value (``lang=ja``)."""
+        host = _cookie_host(flow.request.url)
+        for ver in list(self._jar.values()) + self._externals_live:
+            if id(ver) in taken or ver.name != name or ver.value != value:
+                continue
+            if self.profile != "wininet" and ver.origin == "server" and ver.host_only and ver.domain != host:
+                continue
+            if cookie_domain_match(host, ver.domain):
+                return ver
+        return None
+
+    def _request_phase(self, flow: Flow, clock: Optional[float]) -> None:
+        predicted = self.cookies_for(flow.request.url, clock)
+        pairs = [p for raw in header_get_all(flow.request.headers, "cookie") for p in parse_cookie_header(raw)]
+        taken: set[int] = set()
+        sent: list[list[Any]] = []
+        host = _cookie_host(flow.request.url)
+        for name, value in pairs:
+            match = next((v for v in predicted if id(v) not in taken and v.name == name and v.value == value), None)
+            if match is None:
+                match = self._leak_source(flow, name, value, taken)
+            if match is None:
+                # a pre-existing / script cookie first sent to a sub-domain of this host: one cookie of this
+                # (parent) domain reaches both (the IE engine sends host-only cookies to sub-domains too)
+                match = next((v for v in self._externals_live if id(v) not in taken and v.name == name and v.value == value
+                              and v.domain != host and cookie_domain_match(v.domain, host)), None)
+                if match is not None:
+                    match.domain, match.host_only = host, self.profile == "wininet"
+            if match is not None:
+                taken.add(id(match))
+            sent.append([name, value, match])
+        fresh: list[CookieVersion] = []
+        for entry in sent:
+            if entry[2] is None:
+                entry[2] = self._new_external(flow, entry[0], entry[1])
+                fresh.append(entry[2])
+        sent_ids = {id(entry[2]) for entry in sent}
+        predicted_ids = {id(v) for v in predicted}
+        for ver in fresh:
+            # the page's script overwrote a cookie the jar holds for this URL (sent in its place): the new
+            # value has that cookie's identity and is set right before the step (never INITIAL_COOKIES)
+            target = next((v for v in predicted if v.name == ver.name and id(v) not in sent_ids
+                           and self._jar.get(v.key) is v), None)
+            if target is not None:
+                self._settle(ver, target.domain, target.host_only, target.path, target.jar_path)
+                ver.created, ver.previous, ver.external_kind = target.created, target, "script"
+                target.ended_by, target.replaced_by = flow, ver
+                continue
+            # the page wrote a new value for the name: the old value is not sent any more (the same cookie:
+            # the new value keeps its domain - with the IE engine a cookie of the parent host).  Not when no one
+            # path fits both: then the old value's own path keeps it off this request (another cookie)
+            for old in list(self._externals_live):
+                if (old is not ver and old.name == ver.name and id(old) not in sent_ids and id(old) in predicted_ids
+                        and self._one_scope(old, flow)):
+                    old.ended_by, old.replaced_by = flow, ver
+                    self._externals_live.remove(old)
+                    if ver.previous is None:
+                        ver.previous, ver.created, ver.external_kind = old, old.created, "script"
+                        ver.domain, ver.host_only = old.domain, old.host_only
+                        folders, unsent = self._chain_scope(old)
+                        self._chains[id(ver)] = (folders, unsent + list(self._unsent(old, self.position(flow))))
+        for entry in sent:
+            entry[2].sent_by.append(flow)
+            entry[2].held = True
+        if pairs:
+            # a request that carried cookies but not one the rules say it should have: the browser did
+            # not hold that one (blocked, expired in the browser ...)
+            for ver in predicted:
+                if id(ver) not in sent_ids:
+                    ver.held = False
+        self._sent[id(flow)] = [(entry[0], entry[1], entry[2]) for entry in sent]
+        live = list(self._jar.values()) + list(self._externals_live)
+        self._live[id(flow)] = [v for v in live if v.held and (v.expires is None or clock is None or v.expires > clock)]
+
+    def _new_external(self, flow: Flow, name: str, value: str) -> CookieVersion:
+        host = _cookie_host(flow.request.url)
+        self._seq += 1
+        ver = CookieVersion(
+            name=name, value=value, domain=host, host_only=True, path="/", origin="external",
+            external_kind="script" if host in self._answered_hosts else "pre-existing",
+            flow=flow, created=self._seq, seq=self._seq,
+        )
+        self._externals_live.append(ver)
+        self.versions.append(ver)
+        self.externals.append(ver)
+        return ver
+
+    def _response_phase(self, flow: Flow, clock: Optional[float]) -> None:
+        stored: list[CookieVersion] = []
+        host = _cookie_host(flow.request.url)
+        for raw in set_cookie_lines(flow.response):
+            info = parse_set_cookie_attrs(raw, flow.request.url, clock, self.profile)
+            if info is None:
+                continue
+            key = (info.name, info.domain, info.path)
+            old = self._jar.get(key)
+            if old is None:
+                old = self._external_ended_by(flow, info)  # a pre-existing / script cookie this line ends
+            if info.deletion:
+                if old is not None:
+                    old.ended_by = flow
+                    del self._jar[key]
+                continue
+            self._seq += 1
+            ver = CookieVersion(
+                name=info.name, value=info.value, domain=info.domain, host_only=info.host_only, path=info.path,
+                secure=info.secure, expires=info.expires, origin="server", flow=flow,
+                created=old.created if old is not None else self._seq, seq=self._seq, previous=old,
+                py_path=info.py_path,
+            )
+            if old is not None:
+                old.ended_by, old.replaced_by = flow, ver
+            self._jar[key] = ver
+            self.versions.append(ver)
+            stored.append(ver)
+        self._stored[id(flow)] = stored
+        self._hook_hosts(flow, host)
+
+    def _hook_hosts(self, flow: Flow, host: str) -> None:
+        """Register the hosts whose ``Set-Cookie`` lines (deletions included) the generated script's response
+        hooks rewrite, so that Python's jar stores, replaces and deletes the cookies the recording browser
+        did: ``Domain=<that host>`` (dot-less hosts too: Python never sends those back by itself),
+        attributes browsers ignore, and for the IE engine a missing ``Path`` below the root and
+        ``Domain=<a parent domain>`` (one cookie with the parent host's own one: the builder decides)."""
+        url = flow.request.url
+        for raw in set_cookie_lines(flow.response):
+            info = parse_set_cookie_attrs(raw, url, None, self.profile)
+            if info is None:
+                continue
+            if info.domain_is_host:
+                self.domain_is_host_hosts.add(host)
+                if "." not in host and not _is_ip_host(host):
+                    self.dotless_domain_hosts.add(host)
+            if _IGNORED_COOKIE_ATTR_RE.search(raw):
+                self.malformed_cookie_hosts.add(host)
+            if self.profile == "wininet" and not _COOKIE_PATH_ATTR_RE.search(raw) and info.path != cookie_default_path(url):
+                self.ie_default_path_hosts.add(host)
+            if self.profile == "wininet" and not info.host_only and not info.domain_is_host:
+                self.parent_domain_lines.append((host, (info.name, info.domain, info.path)))
+
+    def _volatile(self, ver: CookieVersion, kept: Optional[set[int]] = None) -> bool:
+        """A cookie identity whose value changes on (almost) every response: three or more values,
+        none of them sent more than once (by kept requests, when ``kept`` is given)."""
+        chain: list[CookieVersion] = []
+        cur: Optional[CookieVersion] = ver
+        while cur is not None and len(chain) < 64:
+            chain.append(cur)
+            cur = cur.previous
+        cur = ver.replaced_by
+        while cur is not None and len(chain) < 128:
+            chain.append(cur)
+            cur = cur.replaced_by
+
+        def uses(v: CookieVersion) -> int:
+            return sum(1 for f in v.sent_by if kept is None or id(f) in kept)
+
+        return len(chain) >= 3 and all(uses(v) <= 1 for v in chain)
+
+    def _infer_external_scopes(self) -> None:
+        def rewrite(ver: Optional[CookieVersion], prev: Optional[CookieVersion]) -> bool:
+            # ``ver`` is a value the page's script wrote over ``prev``, another pre-existing / script cookie
+            return (ver is not None and prev is not None and ver.previous is prev and prev.replaced_by is ver
+                    and ver.origin == prev.origin == "external")
+
+        for ver in self.externals:
+            if id(ver) in self._scoped or rewrite(ver, ver.previous):
+                continue  # its identity is known (``_settle``) / the one of the value it replaced (below)
+            chain = [ver]  # with the values the page's script wrote over it later: one cookie, one identity
+            while rewrite(chain[-1].replaced_by, chain[-1]):
+                chain.append(chain[-1].replaced_by)
+            known = next((link for link in chain if id(link) in self._scoped), None)  # a later value's is known
+            if known is None:
+                sent_paths: list[str] = []
+                unsent_paths: list[str] = []
+                for link in chain:
+                    sent_paths += [_request_path(f) for f in link.sent_by]
+                    unsent_paths += self._unsent(link, self.position(link.ended_by) if link.ended_by is not None else len(self.flows))
+                known = chain[-1]
+                known.path = _infer_cookie_path(sent_paths, unsent_paths)
+                known.py_path = known.path
+                self._adopt_server_scope(known)
+            for link in chain:
+                if id(link) not in self._scoped:
+                    link.domain, link.host_only, link.path, link.py_path = known.domain, known.host_only, known.path, known.py_path
+
+    def _adopt_server_scope(self, ver: CookieVersion) -> None:
+        """A later server cookie of the same name took this external value's place on its host: the
+        browser replaced it, so the external value had that cookie's identity."""
+        host = ver.domain
+        for later in self.versions:
+            if later.origin != "server" or later.name != ver.name or later.seq <= ver.seq or later.flow is None:
+                continue
+            set_pos = self.position(later.flow)
+            evidence = [
+                f for f in later.sent_by
+                if self.position(f) > set_pos and _cookie_host(f.request.url) == host
+                and cookie_path_match(_request_path(f), ver.path) and ver not in [s[2] for s in self._sent.get(id(f), ())]
+            ]
+            if not evidence:
+                continue
+            if any(self.position(f) > set_pos for f in ver.sent_by):
+                continue  # still sent next to the server cookie: a different identity
+            ver.domain, ver.host_only, ver.path, ver.py_path = later.domain, later.host_only, later.path, later.jar_path
+            if ver.ended_by is None or self.position(ver.ended_by) > set_pos:
+                ver.ended_by, ver.replaced_by = later.flow, later
+            if later.previous is None:
+                later.previous = ver
+            return
+
+    def _settle(self, ext: CookieVersion, domain: str, host_only: bool, path: str, py_path: str) -> None:
+        """Give an external cookie a known identity and keep it in the jar under it (a later
+        ``Set-Cookie`` of that identity replaces / deletes it like any cookie)."""
+        if ext in self._externals_live:
+            self._externals_live.remove(ext)
+        ext.domain, ext.host_only, ext.path, ext.py_path = domain, host_only, path, py_path
+        self._jar[ext.key] = ext
+        self._scoped.add(id(ext))
+
+    def _unsent(self, ext: CookieVersion, end: int) -> Iterator[str]:
+        """The paths of the requests of its hosts that did not send an external cookie, from its first
+        request up to flow position ``end``.  The IE engine sends every cookie that applies; an RFC 6265
+        browser leaves cookies off cross-site requests, so there only requests with cookies count."""
+        start = self.position(ext.flow) if ext.flow is not None else 0
+        sent = {self.position(f) for f in ext.sent_by}
+        return (self._paths[i] for i in range(start, end)
+                if i not in sent and (self.profile == "wininet" or self.flows[i].request.header("cookie"))
+                and self._host_match(self._hosts[i], ext))
+
+    def _one_scope(self, old: CookieVersion, flow: Flow) -> bool:
+        """Whether a value first sent by ``flow`` can be the external ``old`` (with the values the page
+        wrote before it) written over: one path reaches every request that sent them and this one, and
+        none of the requests that did not send them so far (no path fits when the deepest folder holding
+        the first ones holds one of the others)."""
+        pos = self.position(flow)
+        folders, unsent = self._chain_scope(old)
+        folder = "/" + "/".join(_shared_folder(folders, self._folders[pos]))
+        return not any(cookie_path_match(p, folder) for p in unsent) and not any(
+            cookie_path_match(p, folder) for p in self._unsent(old, pos))
+
+    def _chain_scope(self, ext: CookieVersion) -> tuple[tuple[str, ...], list[str]]:
+        """The folder (segments) holding every request that sent the external ``ext`` or the values the
+        page wrote before it, and the paths of the requests that did not send those earlier values (kept
+        for each value when it is written over: a long chain is walked once)."""
+        folders, unsent = self._chains.get(id(ext), (None, []))
+        for f in ext.sent_by:
+            mine = self._folders[self.position(f)]
+            folders = mine if folders is None else _shared_folder(folders, mine)
+        return folders or (), unsent
+
+    def _external_ended_by(self, flow: Flow, info: SetCookieInfo) -> Optional[CookieVersion]:
+        """A live external cookie (there before the recording / written by the page) that this
+        ``Set-Cookie`` deletes or replaces: same name, sent (from its first request up to this one)
+        exactly by the requests the line's identity reaches, and no later request sends its value again
+        (before a response sets that value again).  The browser replaced it, so it had the line's
+        identity: it moves into the jar under it.  A cookie of a parent domain first sent to two sibling
+        hosts is an external on each: the live externals with its value are tried together first (never
+        those a request sent together: two cookies)."""
+
+        def in_scope(i: int) -> bool:
+            host = self._hosts[i]
+            if not (host == info.domain if info.host_only and self.profile != "wininet" else cookie_domain_match(host, info.domain)):
+                return False
+            return cookie_path_match(self._paths[i], info.path, self.profile)
+
+        def ends(members: list[CookieVersion]) -> bool:
+            sent = {self.position(f) for ext in members for f in ext.sent_by}
+            start = min(self.position(ext.flow) if ext.flow is not None else 0 for ext in members)
+            if any((i in sent) != in_scope(i) for i in range(start, pos + 1)):
+                return False
+            value = members[0].value
+            if info.deletion or info.value != value:  # a re-set to the same value: later sends are the new one's
+                for later in self.flows[pos + 1:]:
+                    pairs = [p for raw in header_get_all(later.request.headers, "cookie") for p in parse_cookie_header(raw)]
+                    if (info.name, value) in pairs:  # still sent (on another host: a cookie of a parent domain)
+                        return False
+                    if (info.name, value) in [parse_set_cookie(line) for line in set_cookie_lines(later.response)]:
+                        break
+            return True
+
+        pos = self.position(flow)
+        named = [ext for ext in self._externals_live if ext.name == info.name]
+        for ext in named:
+            group = [other for other in named if other.value == ext.value]
+            apart = len({id(f) for other in group for f in other.sent_by}) == sum(len(other.sent_by) for other in group)
+            for members in ([group, [ext]] if len(group) > 1 and apart else [[ext]]):
+                if ends(members):
+                    for other in members:
+                        if other is not ext:  # one cookie: ends here too
+                            self._settle(other, info.domain, info.host_only, info.path, info.py_path)
+                            other.ended_by = flow
+                    self._settle(ext, info.domain, info.host_only, info.path, info.py_path)
+                    return ext
+        return None
+
+    def script_scope(self, ver: CookieVersion, url: str) -> tuple[str, Optional[str]]:
+        """``(url, domain)`` with which the generated script stores ``ver`` (``_set_cookie``,
+        ``INITIAL_COOKIES``) for a request to ``url``.  ``domain`` is None (host-only, ``url`` on the
+        cookie's own host) for a host-only cookie and for a cookie of a host without a dot (Python never
+        sends a ``Domain=<dot-less host>`` cookie back).  A ``Domain=<host>`` cookie stays a domain cookie:
+        the script's ``_host_cookie_hook`` deletes the other copy when the server sets either, so the jar
+        never holds both (the stale one would be sent first)."""
+        host = _cookie_host(url)
+        host_only = ver.host_only or "." not in ver.domain
+        if host_only and ver.domain and ver.domain != host:
+            try:
+                scheme = urlsplit(url).scheme or "http"
+            except ValueError:
+                scheme = "http"
+            url = f"{scheme}://{'[' + ver.domain + ']' if ':' in ver.domain else ver.domain}/"
+        return cookie_scope_url(url, ver.jar_path), None if host_only else ver.domain
+
+
+def initial_cookie_for(ver: CookieVersion, first_sender: Optional[Flow] = None,
+                       timeline: Optional[CookieTimeline] = None) -> InitialCookie:
+    """The ``InitialCookie`` that recreates an external cookie version at run time (stored as
+    ``CookieTimeline.script_scope`` decides when ``timeline`` is given)."""
+    base = (first_sender or ver.flow).request.url if (first_sender or ver.flow) is not None else ""
+    url, domain = timeline.script_scope(ver, base) if timeline is not None else (
+        cookie_scope_url(base, ver.jar_path), None if ver.host_only else ver.domain)
+    return InitialCookie(
+        name=ver.name, value=ver.value, domain=ver.domain, path=ver.jar_path,
+        url=url, host_only=domain is None,
+        origin=ver.external_kind or "pre-existing",
+    )
+
+
+def classify_cookies(flows: list[Flow], profile: str = "rfc6265") -> tuple[list[InitialCookie], set[str]]:
+    """Cookies the browser sent although no earlier response set them in that scope (pre-existing or
+    written by the page; copies of a cookie the jar already held under another scope excluded) and
+    the names of the cookies responses set.  See ``CookieTimeline``."""
+    timeline = CookieTimeline(flows, profile)
     initial: list[InitialCookie] = []
-    seen: set[tuple[str, str]] = set()
-    for flow in flows:
-        host = flow.request.host
-        for raw in [v for k, v in flow.request.headers if k.lower() == "cookie"]:
-            for name, value in parse_cookie_header(raw):
-                if name in managed or (name, host) in seen:
-                    continue
-                seen.add((name, host))
-                initial.append(InitialCookie(name=name, value=value, domain=host, path="/"))
-        if flow.response is not None:
-            for sc in flow.response.set_cookies:
-                parsed = parse_set_cookie(sc)
-                if parsed:
-                    managed.add(parsed[0])
+    for ver in timeline.externals:
+        live = timeline.live_at(ver.flow) if ver.flow is not None else []
+        if any(v.origin == "server" and v.name == ver.name and v.value == ver.value for v in live):
+            continue
+        initial.append(initial_cookie_for(ver, timeline=timeline))
+    managed = {v.name for v in timeline.versions if v.origin == "server"}
     return initial, managed
 
 
@@ -2079,6 +3029,9 @@ def compute_base_headers(flows: list[Flow]) -> Headers:
         lname = name.lower()
         if lname in emitted or lname in _NEVER_BASE_HEADERS or lname.startswith("x-"):
             continue
+        traceable = lname not in _SKIP_HEADER_EXACT and not lname.startswith(_SKIP_HEADER_PREFIXES)
+        if traceable and is_dynamic_looking(split_auth_header(value)[1]):
+            continue  # a token sent with every request is still a token: it stays per step and is traced
         if per_flow[0].get(lname) != value:
             continue
         if all(table.get(lname) == value for table in per_flow[1:]):
@@ -2512,7 +3465,10 @@ class MultipartField:
         return self.filename is not None
 
     def text(self) -> str:
-        return self.content.decode("utf-8", errors="replace")
+        """The part's text: UTF-8, else (IE posts the text parts of a Shift_JIS page as cp932 bytes) a
+        percent-encoded spelling like a urlencoded value's - never U+FFFD (``_Builder._field_text``
+        decodes it with the page's charset)."""
+        return _form_text(self.content, None)
 
 
 _BOUNDARY_RE = re.compile(r'boundary=(?:"([^"]+)"|([^;,\s]+))', re.I)
@@ -2674,17 +3630,40 @@ def form_body_is_utf8(body: Optional[bytes]) -> bool:
 
 
 def _form_text(raw: bytes, charset: Optional[str]) -> str:
-    """Decode one form name / value: declared charset first, then UTF-8; a value that is neither
-    keeps a percent-encoded spelling so nothing is lost or garbled."""
+    """Decode one form name / value: bytes that are UTF-8 are that text (they are replayed as UTF-8),
+    else the declared charset; a value that is neither keeps a percent-encoded spelling so nothing is
+    lost or garbled."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
     if charset and charset != "utf-8":
         try:
             return raw.decode(charset)
         except (UnicodeDecodeError, LookupError):
             pass
+    return quote_from_bytes(raw, safe="")
+
+
+_JS_ESCAPE_RE = re.compile(rb"%u[0-9A-Fa-f]{4}")
+_JS_UNIT_RE = re.compile(rb"%u([0-9A-Fa-f]{4})|%([0-9A-Fa-f]{2})|(.)", re.S)
+
+
+def js_unescape(spelling: bytes) -> Optional[str]:
+    """The text of a value an old page script built with JavaScript ``escape()`` (``%u5C71%u7530`` =
+    山田, which IIS / ASP.NET decode), from its spelling on the wire (not yet percent-decoded); None
+    when the spelling has no ``%uXXXX``.  ``%XX`` is then a character code and ``+`` a space."""
+    if not _JS_ESCAPE_RE.search(spelling):
+        return None
+    units = bytearray()
+    for m in _JS_UNIT_RE.finditer(spelling):
+        u4, x2, other = m.groups()
+        code = int(u4, 16) if u4 else int(x2, 16) if x2 else (0x20 if other == b"+" else other[0])
+        units += code.to_bytes(2, "little")
     try:
-        return raw.decode("utf-8")
+        return bytes(units).decode("utf-16-le")
     except UnicodeDecodeError:
-        return quote_from_bytes(raw, safe="")
+        return None  # a lone surrogate
 
 
 def parse_form_bytes(body: Optional[bytes], charset: Optional[str] = None) -> list[tuple[str, str]]:
@@ -2692,11 +3671,13 @@ def parse_form_bytes(body: Optional[bytes], charset: Optional[str] = None) -> li
 
     Equivalent to ``core.parse_form`` for UTF-8 bodies (blank values kept, repeated names kept,
     one pair per non-empty segment) but works on bytes: values in a legacy charset are decoded
-    with ``charset`` when it is declared on the request, otherwise they stay percent-encoded."""
+    with ``charset`` when it is declared on the request, otherwise they stay percent-encoded.  A value
+    built with ``escape()`` (``%uXXXX``) is its text (``js_unescape``)."""
     pairs: list[tuple[str, str]] = []
     for segment in split_form_segments(body):
         name_b, value_b = _form_segment_bytes(segment)
-        pairs.append((_form_text(name_b, charset), _form_text(value_b, charset)))
+        text = js_unescape(segment.partition(b"=")[2])
+        pairs.append((_form_text(name_b, charset), _form_text(value_b, charset) if text is None else text))
     return pairs
 
 
@@ -2706,6 +3687,73 @@ def request_form_charset(request: RecordedRequest) -> Optional[str]:
     if not ct or not parse_content_type(ct)[1].get("charset"):
         return None
     return detect_charset(b"", ct)
+
+
+def query_bytes(query: Optional[str]) -> bytes:
+    """A recorded query string as bytes (a ``str`` URL keeps undecodable bytes as surrogates)."""
+    if not query:
+        return b""
+    try:
+        return query.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return query.encode("utf-8", "surrogatepass")
+
+
+def is_utf8(raw: bytes) -> bool:
+    """True when ``raw`` is valid UTF-8 (ASCII included): a value sent as UTF-8, not in a legacy charset."""
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _encodes_to(text: Any, charset: Optional[str], raw: bytes) -> bool:
+    """Does ``text`` in ``charset`` give back exactly the recorded bytes?"""
+    try:
+        return isinstance(text, str) and bool(charset) and text.encode(charset) == raw
+    except (UnicodeError, LookupError):
+        return False
+
+
+def _legacy_text(raw: bytes, charset: Optional[str]) -> Optional[str]:
+    """``raw`` decoded with a legacy ``charset`` when the text gives back exactly those bytes, else None."""
+    if not charset or charset == "utf-8":
+        return None
+    try:
+        text = raw.decode(charset)
+    except (UnicodeDecodeError, LookupError):
+        return None
+    return text if _encodes_to(text, charset, raw) else None
+
+
+def recorded_fields(req: RecordedRequest, location: str) -> list[tuple[str, str, bytes]]:
+    """``(name, value, recorded value bytes)`` of the query string (``location="query"``), the
+    ``application/x-www-form-urlencoded`` body (``"form"``) or the multipart text parts (``"multipart"``),
+    in order, with the values ``request_params`` gives.  The bytes tell whether a value was sent in a
+    legacy charset (they are not UTF-8), never ``%XX`` in its text: a typed ``%AB%`` is UTF-8 text."""
+    if location == "query":
+        data, charset = query_bytes(req.query), None
+    elif location == "form" and req.body and req.content_type == "application/x-www-form-urlencoded":
+        data, charset = req.body, request_form_charset(req)
+    elif location == "multipart" and req.body and (req.content_type or "").startswith("multipart/"):
+        return [(fld.name, fld.text(), fld.content) for fld in parse_multipart(req.body, req.header("content-type"))
+                if not fld.is_file]
+    else:
+        return []
+    return [(name, value, raw) for (name, value), (_n, raw) in zip(parse_form_bytes(data, charset), form_pairs_bytes(data))]
+
+
+def _field_bytes(req: RecordedRequest, location: str, name: str, occurrence: int) -> Optional[bytes]:
+    """The recorded bytes of the ``occurrence``-th query / form field called ``name`` (None if absent)."""
+    found = [raw for n, _value, raw in recorded_fields(req, location) if n == name]
+    return found[occurrence] if 0 <= occurrence < len(found) else None
+
+
+def _field_list(names: Sequence[str]) -> str:
+    """Field names for a warning (``a, b, c, d …``)."""
+    names = list(dict.fromkeys(names))
+    return ", ".join(names[:4]) + (" …" if len(names) > 4 else "")
 
 
 def classify_body(request: RecordedRequest) -> tuple[str, Any]:
@@ -2737,18 +3785,40 @@ def classify_body(request: RecordedRequest) -> tuple[str, Any]:
     return "raw", None
 
 
+def split_path_segment(segment: str) -> tuple[str, list[tuple[str, Optional[str]]]]:
+    """``"list.do;jsessionid=AB12;v"`` -> ``("list.do", [("jsessionid", "AB12"), ("v", None)])``.
+
+    Path parameters (RFC 3986 §3.3 ``;name=value``) carry URL-embedded session ids
+    (``;jsessionid=``) and similar one-time values; each one is its own dependency candidate.  A
+    parameter without ``=`` has the value None (a flag that stays literal)."""
+    base, *params = segment.split(";")
+    out: list[tuple[str, Optional[str]]] = []
+    for param in params:
+        name, eq, value = param.partition("=")
+        out.append((name, value if eq else None))
+    return base, out
+
+
 def request_params(flow: Flow) -> list[Candidate]:
     """Every parameter of a request as (unfiltered) ``Candidate`` objects, in a stable order:
-    path segments, query pairs, then body values (form / JSON leaves / multipart text fields).
-    Header values are *not* included (see ``header_candidates``)."""
+    path segments (``;name=value`` path parameters as separate ``path_param`` candidates named
+    ``"<segment index>;<name>"``), query pairs, then body values (form / JSON leaves / multipart text
+    fields).  Header values are *not* included (see ``header_candidates``)."""
     req = flow.request
     out: list[Candidate] = []
     path = urlsplit(req.url).path
     segments = path.split("/")[1:] if path.startswith("/") else path.split("/")
     for idx, seg in enumerate(segments):
-        if seg:
-            out.append(Candidate("path", str(idx), seg))
-    for name, value in parse_query(req.query):
+        if not seg:
+            continue
+        base, params = split_path_segment(seg)
+        if base:
+            out.append(Candidate("path", str(idx), base))
+        for pname, pvalue in params:
+            if pvalue:
+                out.append(Candidate("path_param", f"{idx};{pname}", pvalue))
+    # byte level, like form bodies: a value a Shift_JIS page sent keeps its percent-encoded spelling
+    for name, value in parse_form_bytes(query_bytes(req.query)):
         out.append(Candidate("query", name, value))
     kind, parsed = classify_body(req)
     if kind == "form":
@@ -2768,21 +3838,28 @@ def request_params(flow: Flow) -> list[Candidate]:
     return out
 
 
+#: Request headers that never carry a value of an earlier response: protocol / browser headers, and
+#: the Cookie header (cookies are analysed separately, ``CookieTimeline``).  ``If-Match`` /
+#: ``If-Unmodified-Since`` are *not* here: they echo an earlier ``ETag`` / ``Last-Modified``.
 _SKIP_HEADER_EXACT = frozenset(DROP_REQUEST_HEADERS) | frozenset({
     "user-agent", "referer", "origin", "cache-control", "pragma", "dnt", "priority", "content-type",
-    "cookie", "x-requested-with", "upgrade-insecure-requests", "range", "if-match", "if-unmodified-since",
+    "cookie", "x-requested-with", "upgrade-insecure-requests", "range",
     "via", "forwarded", "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "date", "from",
     "max-forwards", "purpose", "service-worker", "save-data", "device-memory", "downlink", "ect", "rtt",
     "viewport-width", "width", "early-data", "alt-used", "content-md5",
 })
 _SKIP_HEADER_PREFIXES = ("accept", "sec-", "proxy-", ":")
+#: The HTTP authentication schemes reqrec knows by name (their credentials may be an auth-param list).
 _AUTH_SCHEME_RE = re.compile(r"^(\s*(?:Bearer|Basic|Digest|Token|JWT|Api-?Key|OAuth|Negotiate|NTLM)\s+)(\S.*?)\s*$", re.I)
+#: Any other ``<scheme> <token68>`` value (RFC 7235 credentials: DPoP, SSWS, vendor schemes ...).
+_GENERIC_CREDENTIALS_RE = re.compile(r"^(\s*[A-Za-z][A-Za-z0-9!#$%&'*+.^_`|~-]*\s+)([A-Za-z0-9._~+/-]+=*)\s*$")
 
 
 def split_auth_header(value: Optional[str]) -> tuple[str, str]:
-    """``"Bearer X"`` -> ``("Bearer ", "X")``; ``("", value)`` when no known scheme prefix."""
+    """``"Bearer X"`` -> ``("Bearer ", "X")``; any ``<scheme> <token68>`` value (``"DPoP X"``) is split
+    the same way, so the token can be traced whatever the scheme is called; ``("", value)`` otherwise."""
     value = (value or "").strip()
-    m = _AUTH_SCHEME_RE.match(value)
+    m = _AUTH_SCHEME_RE.match(value) or _GENERIC_CREDENTIALS_RE.match(value)
     if m:
         return m.group(1), m.group(2)
     return "", value
@@ -2818,6 +3895,12 @@ def header_candidates(flow: Flow, skip_session_auth: bool = True) -> list[Candid
                 continue
             if not value:
                 continue
+        else:
+            # ``X-Auth: <scheme> <token>`` (any header, any scheme word): the token is the candidate
+            # when it is long enough to be traced, the whole value otherwise
+            m = _GENERIC_CREDENTIALS_RE.match(value)
+            if m and len(m.group(2)) >= 8:
+                prefix, value = m.group(1), m.group(2)
         out.append(Candidate("header", lname, value, prefix=prefix))
     return out
 
@@ -2870,10 +3953,11 @@ def is_route_like(value: str) -> bool:
 def is_structural_path_segment(cand: Candidate) -> bool:
     """A route-like path segment (``Login.aspx``, ``orders``, ``SC0010.aspx``; see ``is_route_like``).
 
-    It stays a trace candidate - an all-uppercase key such as ``/s/QZVBNMWRTYPXSDFKHJ/items`` can
-    be a JSON leaf of an earlier response - but the plan section never traces it through markup
+    It stays a trace candidate - a short letters key such as ``/s/QZVBNMWRT/items`` can be a JSON
+    leaf of an earlier response - but the plan section never traces it through markup
     (``html_attr`` / ``html_text`` / ``regex`` / ``url``): tracing ``Login.aspx`` to
-    ``action="Login.aspx"`` would only make the script depend on that markup for a constant."""
+    ``action="Login.aspx"`` would only make the script depend on that markup for a constant (a key
+    a redirect handed out is the exception: ``_Builder._issued_by_redirect``)."""
     return cand.location == "path" and is_route_like(cand.value)
 
 
@@ -2975,13 +4059,122 @@ def _case_irregularities(part: str) -> int:
     return count
 
 
+#: Consonant clusters that start a syllable (``str``, ``sch``) and that end one (``ght``, ``nds``) in
+#: English and romaji words; any single consonant does both.  Every run of consonants inside a word is
+#: the end of one syllable plus the start of the next (``pass|word|change``, ``kan|ri``, ``hac|chuu``),
+#: which random letters (``QZVBNMWRTYPX``) almost never allow.
+_SYLLABLE_STARTS = frozenset("""
+bl br ch chr cl cr dr dw fl fr gh gl gn gr kl kn kr ph phr pl pr ps sc sch scr sh shr sk sl sm sn sp sph spl spr sq
+st str sw th thr tr ts tw wh wr
+""".split())
+_SYLLABLE_END_STEMS = """
+bt ch ck ct dd dg dth ff fth ft gg gh ght gn lb ld lf lk ll lm ln lp lt lth lv mb mn mp mph mpt mt nc nch nct nd ng
+ngth nk nst nt nth nx nz ph pp pt pth rb rc rch rd rf rg rk rl rld rm rn rp rr rsh rst rt rth rv sc sch sh sk sp ss
+st tch th tt tz wd wl wn xt xth zz
+ghth lfth thm
+""".split()
+#: ... and with a plural / third-person ``-s`` (``nds``, ``mpts``, ``ds``)
+_SYLLABLE_ENDS = frozenset(_SYLLABLE_END_STEMS + [c + "s" for c in _SYLLABLE_END_STEMS + list("bcdfgklmnprtvw")
+                                                   if not c.endswith(("s", "sh", "ch", "x", "z"))])
+#: Acronyms and abbreviations that names are built from (``ExportCSV``, ``SHOHINMSTMNT``, ``jquery-ui``,
+#: ``CSRFTOKENCHECK``, ``faqcategory``): file formats, protocols, security, Java / .NET, databases,
+#: business / factory / logistics systems, Japanese-system abbreviations, control prefixes.  Their
+#: letters are not judged (only entries with two consonants side by side, a ``q`` or a ``j`` / ``z``
+#: ending a syllable are needed).
+_NAME_ACRONYMS = frozenset("""
+adm amt apqp aql ascx ashx asmx asn asp aspx awb axd biz bmp bpm btn cbo cdn cfg cgi chk cifs ckeditor cmms cms cnc
+cnt conf cpa cpi crl crm crp csr csrf css csv cvs dcs ddl dfs dhcp dhtml dll dlp dms dns docx dsa dtd dtl dwh ecm
+edr ehr ejb emr eoq erp faq flg fmea frm ftp gcp gpg gps grd gst gtin gwt gzip hdn hdr hmac hmi hotp hrm htm html
+http https img inf ins jdbc jdk jms jndi jpa jpeg jpg jquery jre jsf json jsp jstl jsx jvm jwe jwk jwks jws jwt kbn
+kpi krb lbl ldap lims lms lnk lst lzh mfa mgmt mgr mnt mpeg mpg mps mrp msa msg msi mssql mst mtd mvc mvn mvvm ncr
+nfc nfs npm ntlm ntp oauth ocsp odbc oltp orm otp pdf pdm pgp pgsql php pki plc plm plsql pms png pnl ppap ppm ppt
+pptx proj prt pwa pwd qms qtd qty quiz rbac rdo rdp rfid rpc rpt rsa rss rtf saml scm scp scss sdk sfa sftp
+smb smtp snmp spc sql srch ssh ssl sso sts svc svg svn tbl tcp tfs tgz tiff tls tms totp tpm tqm tsql tsv tsx txt
+udp upc upd url usr vlan vmi vnc vpc vpn wbs wcf wlan wms wpf wsdl www xdr xhtml xls xlsx xml xsd xsl xslt xsrf xss
+ymd ytd
+dwg dxf ecg ecn ecr itsm msds rfq sds usb
+""".split())
+#: every acronym starting at a position, the longest first (grouped by first letter: four times faster)
+_NAME_ACRONYM_RE = re.compile("(?=(" + "|".join(
+    first + "(?:" + "|".join(sorted((a[1:] for a in _NAME_ACRONYMS if a[0] == first), key=len, reverse=True)) + ")"
+    for first in sorted({a[0] for a in _NAME_ACRONYMS})) + "))")
+#: Two-letter acronyms that names start with (``qcresultlist``, ``qrcodereader``): not judged only there
+#: (elsewhere a ``q`` without ``u`` is a strong sign of random letters).
+_NAME_PREFIX_ACRONYMS = ("qa", "qc", "qr")
+_CONSONANT_RUN_RE = re.compile(r"[^aeiouy]+")
+_Q_WITHOUT_U_RE = re.compile(r"q(?!u)")
+#: Words of an identifier part: a capitalised / lowercase word, or an acronym run (``XML`` in ``XMLHttp``).
+_CASE_WORD_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])")
+
+
+def _syllable_run(run: str, first: bool, last: bool) -> bool:
+    """Can a run of consonants stand there in a word (``first`` / ``last``: it starts / ends the word)?
+    A known two-letter word may start or end it (``cd`` in ``tokuisakicd``).  Inside a word a syllable
+    ends in a cluster of ``_SYLLABLE_ENDS`` or in a single consonant other than ``j`` / ``z`` (``ex|port``,
+    ``nav|bar``; never ``jm`` / ``zk``: abbreviations such as ``proj`` / ``biz`` are acronyms)."""
+    if len(run) <= 1 or ((first or last) and run in _TWO_LETTER_WORDS):
+        return True
+    if first:
+        return not last and run in _SYLLABLE_STARTS
+    if last:
+        return run in _SYLLABLE_ENDS
+    return any((i == 0 or (i == 1 and run[0] not in "jz") or run[:i] in _SYLLABLE_ENDS)
+               and (len(run) - i <= 1 or run[i:] in _SYLLABLE_STARTS) for i in range(len(run) + 1))
+
+
+def _unpronounceable(word: str, acronym_start: bool = False) -> bool:
+    """A word (3+ letters) that English and romaji spelling do not allow: a run of consonants that is
+    not a syllable end plus a syllable start (at the start of the word: a start; at its end: an end),
+    or a ``q`` without ``u``.  ``y`` counts as a vowel; the letters of known acronyms
+    (``_NAME_ACRONYMS``; ``_NAME_PREFIX_ACRONYMS`` at the start) are not judged.  ``seisankanri``,
+    ``PASSWORDCHANGE``, ``xmlhttprequest``, ``qcresultlist`` are pronounceable, ``qzvbnmwrtypxsdfkhj`` is not.
+    ``acronym_start``: the consonants a word starts with may be an acronym the table does not know
+    (``pc|management``, ``mfg|orderlist``, ``hq|announcement``, ``Bmn``): up to 4 of them are not judged."""
+    word = word.lower()
+    if len(word) < 3:
+        return False
+    letters = list(word)
+    if word.startswith(_NAME_PREFIX_ACRONYMS):
+        letters[:2] = "aa"
+    for m in _NAME_ACRONYM_RE.finditer(word):
+        letters[m.start():m.start() + len(m.group(1))] = "a" * len(m.group(1))
+    word = "".join(letters)
+    if acronym_start:
+        lead = len(word) - len(word.lstrip("bcdfghjklmnpqrstvwxz"))
+        if lead <= 4:
+            word = "a" * lead + word[lead:]
+    if _Q_WITHOUT_U_RE.search(word):
+        return True
+    return any(not _syllable_run(m.group(0), m.start() == 0, m.end() == len(word))
+               for m in _CONSONANT_RUN_RE.finditer(word))
+
+
+def _spelled_as_words(value: str) -> bool:
+    """Letters (``-`` / ``_`` separated parts, any length) that read as words one by one: single-case
+    parts are pronounceable (``_unpronounceable``); mixed-case parts have no case irregularity and no
+    unpronounceable word of 3+ letters (acronym runs aside).  ``ProductionResult``, ``txtTokuisakiCD``,
+    ``seisankanri`` are words, ``hwtkLiXgkUpljLymEiXB`` and ``QZVBNMWRTYPXSDFKHJ`` are not.  Stricter
+    than ``looks_random_letters`` (no minimum length, every word judged, the consonants it starts with
+    too): used only where behaviour already points to a token.  Values that are not letters-only
+    (``Default.aspx``) count as words."""
+    parts = [p for p in _SEPARATOR_RE.split(value) if p]
+    if not parts or not all(p.isascii() and p.isalpha() for p in parts):
+        return True
+    letters = "".join(parts)
+    if letters.islower() or letters.isupper():
+        return not any(_unpronounceable(p) for p in parts)
+    if any(_case_irregularities(p) for p in parts):
+        return False
+    return not any(_unpronounceable(w) for p in parts for w in _CASE_WORD_RE.findall(p) if not w.isupper())
+
+
 def _strip_extension(value: str) -> str:
     """``xBBHOHpXYZgFKyNZpuWy.pdf`` -> ``xBBHOHpXYZgFKyNZpuWy`` (one short extension at most)."""
     m = _EXTENSION_RE.match(value)
     return m.group(1) if m else value
 
 
-def looks_random_letters(value: str) -> bool:
+def looks_random_letters(value: str, single_case: bool = True) -> bool:
     """A long letters-only value with irregular mixed case (``xBBHOHpXYZgFKyNZpuWy``) is a random
     token, not a word: sites generate such keys (a URL key, a nonce) and about one in ten random
     20-character alphanumeric tokens happens to contain no digit at all.
@@ -2989,9 +4182,24 @@ def looks_random_letters(value: str) -> bool:
     ``-`` / ``_`` separate parts that are judged one by one (base64url without digits:
     ``xBBHOH-pXYZgFKyNZpuWy``) and a file name is judged by its stem (``xBBHOHpXYZgFKyNZpuWy.pdf``).
     Identifiers with acronyms anywhere (``txtTokuisakiCD``, ``CustomerIDList``, ``DownloadAsPDF``,
-    ``getXMLHttpRequest``) are words.  Measured on random mixed-case letter strings: about 96 % of
-    16-24 characters (also with ``-`` / ``_``) and about 89 % of 12-15 characters are recognised as
-    tokens (tests/test_analysis.py, review3 section)."""
+    ``getXMLHttpRequest``) are words.  Mixed case that fits the identifier structure is still random
+    when two of its words, or one of 5+ letters, cannot be pronounced (``_unpronounceable``; one short
+    word may be an acronym written as a word: ``CsrfToken``).  Single-case values
+    (``QZVBNMWRTYPXSDFKHJ``, ``SEARCHRESULTLIST``) have no case structure: their parts of 4+ letters
+    are judged by spelling alone.  The consonants a word starts with may be an unknown acronym
+    (``PCBINSPECTION``, ``hrdepartment``, ``BmnTntMaster``) and are not judged.
+
+    ``single_case=False`` never calls a single-case value random (``is_dynamic_looking``): with no case
+    to judge, spelling alone misjudges some names (a vowel-less abbreviation such as ``SYKKSJISEARCH``),
+    which must still get no positional pattern and keep their 入力値 and selectors; only route names
+    and pattern context use that verdict.
+
+    Measured on random letters (tests/test_analysis.py, review3 and g_pathkey sections): mixed case
+    about 98 % of 16-24 characters and 94 % of 12-15 (also with ``-`` / ``_``), single case about
+    99.2 % of 16-24 (98 % or more at every length) and 96 % of 12-15 are tokens.  About 3,400 route /
+    page / control names and values in English and romaji, also with acronyms (``PRODUCTIONRESULTCSV``,
+    ``tokuisakimaster``, ``shohin_mst_mnt``, ``CSRFTOKENCHECK``, ``pcbinspection``, ``ohtsukahiroshi``),
+    stay words; vowel-less abbreviations (``PRDCTNRSLTLIST``) do not."""
     if not isinstance(value, str) or not value.isascii():
         return False
     stem = _strip_extension(value)
@@ -3002,8 +4210,14 @@ def looks_random_letters(value: str) -> bool:
         return False
     letters = "".join(parts)
     if letters.islower() or letters.isupper():
-        return False
-    return any(_case_irregularities(p) for p in parts)
+        return single_case and any(_unpronounceable(p, acronym_start=True) for p in parts if len(p) >= 4)
+    if any(_case_irregularities(p) for p in parts):
+        return True
+    # well-formed case: random when two words, or one of 5+ letters, cannot be pronounced (one short
+    # word may be an acronym written as a word: ``CsrfToken``, ``ctlMenu``)
+    bad = [w for p in parts for w in _CASE_WORD_RE.findall(p)
+           if not w.isupper() and _unpronounceable(w, acronym_start=True)]
+    return len(bad) >= 2 or any(len(w) >= 5 for w in bad)
 
 
 def _looks_random_stem(stem: str) -> bool:
@@ -3024,8 +4238,9 @@ def _is_dynamic_text(value: str) -> bool:
         return False
     if _UUID_RE.match(value) or _JWT_RE.match(value):
         return True
-    if looks_random_letters(value):
-        return True
+    if looks_random_letters(value, single_case=False) or (
+            value[-1].isdigit() and looks_random_letters(value.rstrip("0123456789"), single_case=False)):
+        return True  # also random letters with a short number behind (``fnXttwFErwXJmYe2``)
     if _URL_RE.match(value) or _PATH_RE.match(value) or _DATE_RE.match(value) or _MIME_RE.match(value) \
             or _VERSION_RE.match(value) or _EMAIL_RE.match(value) or _DOMAIN_RE.match(value):
         return False
@@ -3053,12 +4268,104 @@ _MAX_TEXT_BYTES = 16 * 1024 * 1024
 _SKIP_TEXT_PARENTS = frozenset({"script", "style", "template", "[document]", "head", "html"})
 
 
+#: ``<input type>`` values of controls whose value the user types (``""`` = no type = text).
+_TYPED_INPUT_TYPES = frozenset({
+    "", "text", "search", "email", "tel", "url", "number", "date", "datetime-local", "datetime", "month", "week",
+    "time", "range", "color",
+})
+_BUTTON_INPUT_TYPES = frozenset({"submit", "button", "image", "reset"})
+
+
+@dataclass
+class FormField:
+    """One named control of an HTML form (several radio / checkbox inputs merge into one field).
+
+    ``control``: ``text`` (any typed input), ``password``, ``textarea``, ``select``, ``radio``,
+    ``checkbox``, ``hidden``, ``button``, ``file`` or ``other``.  ``defaults`` are the values the form
+    would send untouched; ``editable`` is True for a visible control the user can change (not hidden,
+    readonly, disabled or a button) - a value sent for it is user input."""
+
+    name: str
+    control: str
+    defaults: list[str] = field(default_factory=list)
+    options: list[str] = field(default_factory=list)
+    editable: bool = False
+
+
+@dataclass
+class FormInfo:
+    """An HTML ``<form>``: its raw ``action`` (resolved against the page URL by the caller), method and
+    named controls."""
+
+    action: str
+    method: str
+    fields: dict[str, FormField] = field(default_factory=dict)
+
+
+def _form_fields(form: Tag) -> dict[str, FormField]:
+    out: dict[str, FormField] = {}
+    for el in form.find_all(["input", "select", "textarea", "button"]):
+        name = el.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        locked = el.has_attr("readonly") or el.has_attr("disabled")
+        tag = el.name
+        value = el.get("value")
+        value = value if isinstance(value, str) else None
+        defaults: list[str] = []
+        options: list[str] = []
+        if tag == "textarea":
+            control, defaults = "textarea", [el.get_text()]
+        elif tag == "select":
+            control = "select"
+            opts = el.find_all("option")
+            for opt in opts:
+                ov = opt.get("value")
+                options.append(ov if isinstance(ov, str) else " ".join(opt.get_text().split()))
+            chosen = [options[i] for i, opt in enumerate(opts) if opt.has_attr("selected")]
+            if not chosen and options and not el.has_attr("multiple"):
+                chosen = [options[0]]
+            defaults = chosen
+        elif tag == "button":
+            control = "button"
+            defaults = [value or ""]
+        else:
+            kind = str(el.get("type") or "").strip().lower()
+            if kind == "password":
+                control, defaults = "password", [value or ""]
+            elif kind == "hidden":
+                control, defaults = "hidden", [value or ""]
+            elif kind in ("radio", "checkbox"):
+                control = kind
+                options = [value if value is not None else "on"]
+                defaults = options[:] if el.has_attr("checked") else []
+            elif kind in _BUTTON_INPUT_TYPES:
+                control, defaults = "button", [value or ""]
+            elif kind == "file":
+                control = "file"
+            elif kind in _TYPED_INPUT_TYPES:
+                control, defaults = "text", [value or ""]
+            else:
+                control, defaults = "other", [value or ""]
+        editable = control in ("text", "password", "textarea", "select", "radio", "checkbox") and not locked
+        known = out.get(name)
+        if known is None:
+            out[name] = FormField(name=name, control=control, defaults=defaults, options=options, editable=editable)
+        else:  # radio groups, checkbox lists, duplicated names
+            known.defaults.extend(defaults)
+            known.options.extend(options)
+            known.editable = known.editable or editable
+    return out
+
+
 class _SoupIndex:
     """Lookup tables over a parsed HTML document (built once per response)."""
 
     def __init__(self, soup: BeautifulSoup) -> None:
         from bs4 import NavigableString, Tag  # imported on first use: importing reqrec stays cheap
 
+        self._soup = soup
+        self._forms: Optional[list[FormInfo]] = None
         self.input_by_value: dict[str, str] = {}  # value -> name of the *first* input with that name
         self.meta_by_content: dict[str, str] = {}
         self.attr_index: dict[str, list[tuple[Tag, str]]] = {}
@@ -3102,6 +4409,19 @@ class _SoupIndex:
             self.text_nodes.append((stripped, parent))
             self.text_index.setdefault(stripped, []).append(parent)
 
+    @property
+    def forms(self) -> list[FormInfo]:
+        """Every ``<form>`` of the page with its named controls (parsed on first use)."""
+        if self._forms is None:
+            forms: list[FormInfo] = []
+            for form in self._soup.find_all("form"):
+                action = form.get("action")
+                method = str(form.get("method") or "GET").strip().upper() or "GET"
+                forms.append(FormInfo(action=action if isinstance(action, str) else "", method=method,
+                                      fields=_form_fields(form)))
+            self._forms = forms
+        return self._forms
+
 
 class _ResponseView:
     """Lazily decoded / parsed view of one response, cached across ``locate_value`` calls."""
@@ -3113,6 +4433,7 @@ class _ResponseView:
         self.mime = (resp.mime_type or "").lower() if resp else ""
         self.body: bytes = (resp.body if resp and resp.body else b"")
         self._text: Optional[str] = None
+        self._unescaped: Optional[str] = None
         self._json: Any = Ellipsis
         self._soup: Any = Ellipsis
         self._index: Optional[_SoupIndex] = None
@@ -3133,6 +4454,15 @@ class _ResponseView:
         if self._text is None:
             self._text = self.flow.response.text() or "" if self.flow.response else ""
         return self._text
+
+    @property
+    def unescaped(self) -> str:
+        """The text with HTML character references resolved (``&#x3D;`` -> ``=``)."""
+        if self._unescaped is None:
+            from html import unescape  # stdlib; imported on first use
+
+            self._unescaped = unescape(self.text) if "&" in self.text else self.text
+        return self._unescaped
 
     @property
     def json_doc(self) -> Any:
@@ -3200,8 +4530,9 @@ def _view(flow: Flow) -> _ResponseView:
 
 
 def clear_cache() -> None:
-    """Drop cached parsed responses (tests / long-running processes)."""
+    """Drop cached parsed responses and the values the last plan traced (tests / long-running processes)."""
     _VIEW_CACHE.clear()
+    _TRACED.values = frozenset()
 
 
 # --------------------------------------------------------------------------- pattern building
@@ -3228,6 +4559,76 @@ def _stable_prefix(prefix: str, haystack: str, win_start: int, cut_at_newline: b
         trimmed = _LEADING_WORD_RE.sub("", trimmed, count=1)
     trimmed = trimmed.lstrip()
     return trimmed or prefix
+
+
+_CONTEXT_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-+=.%~]+")
+_HEXISH_RE = re.compile(r"^[0-9a-fA-F]+$")
+#: Values the plan being built reads afresh on every run (``_note_traced``), per thread; emptied by
+#: ``clear_cache``.
+_TRACED = threading.local()
+
+
+def _note_traced(value: Any) -> None:
+    """Remember a value the plan reads afresh on every run (an extractor's sample, a cookie the script
+    looks up): later patterns leave it out of their context (``_run_specific``), so the token after a
+    short path key (``/s/QZVBNMWRT/list?tk=...``) is read with ``/list?tk=``, which still matches on the
+    next run.  Plain words (``search``) stay context."""
+    if (isinstance(value, str) and len(value) >= _MIN_REGEX_VALUE_LEN and not any(ch.isspace() for ch in value)
+            and not (_PLAIN_WORDS_RE.match(value) and _spelled_as_words(value))):
+        _TRACED.values = getattr(_TRACED, "values", frozenset()) | {value}
+
+
+def _run_specific(token: str) -> bool:
+    """A piece of pattern context that probably differs on the next run: a value the plan being built
+    reads afresh (``_note_traced``; also the piece of one the context window cut off), a number of 3+
+    digits (a record id, the tail of a session id), a UUID / JWT, a hex string mixing letters and
+    digits, or a random-looking token.  Identifiers such as ``ctl00_MainContent_txtUser`` are not."""
+    tok = token.strip("-_.=+~%")
+    if not tok:
+        return False
+    if len(tok) >= _MIN_REGEX_VALUE_LEN and any(  # (traced values are at least that long)
+            v in tok or ((v.startswith(tok) or v.endswith(tok)) and _CONTEXT_TOKEN_RE.fullmatch(v))
+            for v in getattr(_TRACED, "values", ())):
+        return True
+    if tok.isdigit():
+        return len(tok) >= 3
+    if _UUID_RE.match(tok) or _JWT_RE.match(tok):
+        return True
+    if len(tok) >= 8 and _HEXISH_RE.match(tok) and any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok):
+        return True
+    if looks_random_letters(tok):
+        return True
+    return len(tok) >= 16 and is_dynamic_looking(tok) and len(_DIGIT_RUN_RE.findall(tok)) >= 3
+
+
+def _stable_context(prefix: str, suffix: str) -> tuple[str, str]:
+    """The pattern context without run-specific tokens: the prefix keeps what follows the last such
+    token, the suffix what precedes the first one."""
+    last = 0
+    for m in _CONTEXT_TOKEN_RE.finditer(prefix):
+        if _run_specific(m.group(0)):
+            last = m.end()
+    if last:
+        prefix = prefix[last:]
+    for m in _CONTEXT_TOKEN_RE.finditer(suffix):
+        if _run_specific(m.group(0)):
+            suffix = suffix[:m.start()]
+            break
+    return prefix, suffix
+
+
+def _verified_pattern(haystack: str, value: str, prefix: str, suffix: str, allow_ambiguous: bool) -> Optional[str]:
+    group = _capture_group(value, greedy=not suffix)
+    pattern = ("" if prefix else "^") + re.escape(prefix) + group + (re.escape(suffix) if suffix else "$")
+    if not prefix or not suffix:
+        pattern = "(?m)" + pattern
+    try:
+        found = [m.group(1) for m, _ in zip(re.finditer(pattern, haystack), range(_MAX_PATTERN_MATCHES))]
+    except re.error:  # pragma: no cover - re.escape makes this unreachable
+        return None
+    if found and found[0] == value and (allow_ambiguous or all(f == value for f in found)):
+        return pattern
+    return None
 
 
 def build_pattern(haystack: str, value: str, context: int = 24, allow_ambiguous: bool = True) -> Optional[str]:
@@ -3276,15 +4677,15 @@ def build_pattern(haystack: str, value: str, context: int = 24, allow_ambiguous:
             cut = min([p for p in (suffix.find("\n"), suffix.find("\r"), suffix.find(value)) if p >= 0], default=-1)
             if cut >= 0:
                 suffix = suffix[:cut]
-            group = _capture_group(value, greedy=not suffix)
-            pattern = ("" if prefix else "^") + re.escape(prefix) + group + (re.escape(suffix) if suffix else "$")
-            if not prefix or not suffix:
-                pattern = "(?m)" + pattern
-            try:
-                found = [m.group(1) for m, _ in zip(re.finditer(pattern, haystack), range(_MAX_PATTERN_MATCHES))]
-            except re.error:  # pragma: no cover - re.escape makes this unreachable
-                continue
-            if found and found[0] == value and (allow_ambiguous or all(f == value for f in found)):
+            # context holding another run-specific value (a session id in the same URL, a record
+            # number) would only match the recorded page: try the context without it first
+            stable_prefix, stable_suffix = _stable_context(prefix, suffix)
+            if (stable_prefix, stable_suffix) != (prefix, suffix) and (len(stable_prefix.strip()) >= 3 or len(stable_suffix.strip()) >= 3):
+                pattern = _verified_pattern(haystack, value, stable_prefix, stable_suffix, allow_ambiguous)
+                if pattern:
+                    return pattern
+            pattern = _verified_pattern(haystack, value, prefix, suffix, allow_ambiguous)
+            if pattern:
                 return pattern
     return None
 
@@ -3311,8 +4712,8 @@ def _unique(soup: BeautifulSoup, selector: str, el: Tag) -> bool:
 def _attr_ok(val: Any, forbidden: list[str]) -> bool:
     if not isinstance(val, str) or not val or "\n" in val or "\r" in val:
         return False
-    if any(f in val for f in forbidden):
-        return False
+    if any(f in val for f in forbidden) or any(v in val for v in getattr(_TRACED, "values", ())):
+        return False  # (a value the plan reads afresh, such as a session key in an id, changes next run)
     return not is_dynamic_looking(val)
 
 
@@ -3395,14 +4796,17 @@ def _selector_for(el: Tag, soup: BeautifulSoup, forbidden: list[str], exclude_at
 
 # --------------------------------------------------------------------------- locators
 
+#: Response headers that never carry a value a later request reuses (protocol / caching / security
+#: headers; ``Set-Cookie`` is handled by ``CookieTimeline``).  ``ETag`` and ``Last-Modified`` are
+#: *not* here: ``If-Match`` / ``If-Unmodified-Since`` send them back.
 _HEADER_DENY = frozenset({
     "set-cookie", "date", "content-length", "content-type", "server", "connection", "transfer-encoding",
-    "vary", "cache-control", "pragma", "expires", "last-modified", "age", "content-encoding", "keep-alive",
+    "vary", "cache-control", "pragma", "expires", "age", "content-encoding", "keep-alive",
     "strict-transport-security", "x-powered-by", "via", "accept-ranges", "content-language",
     "x-content-type-options", "x-frame-options", "x-xss-protection", "referrer-policy",
     "content-security-policy", "alt-svc", "x-cache", "cf-ray", "cf-cache-status", "x-served-by",
 })
-_ALL_KINDS = frozenset({"header", "json", "html_input", "html_meta", "html_attr", "html_text", "regex", "url"})
+_ALL_KINDS = frozenset({"header", "json", "html_input", "html_meta", "html_attr", "html_text", "regex", "url", "location"})
 _BODY_KINDS = frozenset({"json", "html_input", "html_meta", "html_attr", "html_text", "regex"})
 
 
@@ -3412,15 +4816,44 @@ def _ordered_variants(value: str) -> list[str]:
 
 
 def _locate_header(flow: Flow, variants: list[str]) -> Optional[Extractor]:
+    """A response header whose value is the value (exact), else one that contains it (``Refresh:
+    0; url=...?sid=X``, ``Link: <...?cursor=X>``, a ``Location`` of a non-redirect response): then
+    the extractor carries a verified pattern applied to that header."""
     resp = flow.response
-    for name, val in resp.headers:
-        lname = name.lower()
-        if lname in _HEADER_DENY:
-            continue
-        if lname == "location" and 300 <= resp.status < 400:
-            continue  # followed by requests -> only reachable through resp.url (kind "url")
+    usable = [
+        (name, val) for name, val in resp.headers
+        if name.lower() not in _HEADER_DENY and not (name.lower() == "location" and 300 <= resp.status < 400)
+    ]
+    for name, val in usable:
         if val in variants or val.strip() in variants:
             return Extractor(var="", kind="header", name=name, sample=val.strip())
+    for name, val in usable:
+        for v in variants:
+            if len(v) < _MIN_REGEX_VALUE_LEN or v not in val or v == val.strip():
+                continue
+            pattern = build_pattern(val, v, allow_ambiguous=is_dynamic_looking(v))
+            if pattern:
+                return Extractor(var="", kind="header", name=name, pattern=pattern, sample=v)
+    return None
+
+
+def _locate_location(flow: Flow, variants: list[str]) -> Optional[Extractor]:
+    """A value in the ``Location`` of a redirect response (the generated script reads it from that
+    response of the redirect chain, ``Extractor.hop``)."""
+    resp = flow.response
+    if resp is None or not (300 <= resp.status < 400):
+        return None
+    location = (resp.location or "").strip()
+    if not location:
+        return None
+    for v in variants:
+        if v == location:
+            return Extractor(var="", kind="header", name="Location", sample=v)
+    for v in variants:
+        if len(v) >= _MIN_REGEX_VALUE_LEN and v in location:
+            pattern = build_pattern(location, v, allow_ambiguous=is_dynamic_looking(v))
+            if pattern:
+                return Extractor(var="", kind="header", name="Location", pattern=pattern, sample=v)
     return None
 
 
@@ -3499,6 +4932,476 @@ def _text_patterns(idx: _SoupIndex, soup: BeautifulSoup, variants: list[str], v:
             yield sel, pattern
 
 
+# --------------------------------------------------------------------------- values a page put into a form field
+
+#: Field names / ids shorter than this never count as naming the field in a script or a text body.
+_MIN_ANCHOR_LEN = 3
+#: How far (same line) from a value the field's name / id may stand in a text body.
+_ANCHOR_WINDOW = 64
+#: The whole body of a text response, without surrounding white space.
+_WHOLE_BODY_PATTERN = r"(?s)^\s*(.*?)\s*$"
+#: Markup in a body: one without it is plain text whatever its Content-Type says (a JSP / an .ashx that
+#: answers the bare value as text/html).
+_MARKUP_RE = re.compile(r"<[A-Za-z/!?]")
+
+
+def _form_tag(view: _ResponseView, form: FormInfo) -> Optional[Tag]:
+    """The ``<form>`` element of ``view``'s page that ``form`` describes (None when it is not there)."""
+    idx, soup = view.index, view.soup
+    if idx is None or soup is None:
+        return None
+    forms = idx.forms
+    i = next((n for n, known in enumerate(forms) if known is form), None)
+    if i is None:  # the page was parsed again since: the first equal form
+        i = next((n for n, known in enumerate(forms) if known == form), None)
+    tags = getattr(view, "_form_tags", None)
+    if tags is None:
+        tags = view._form_tags = soup.find_all("form")
+    return tags[i] if i is not None and i < len(tags) else None
+
+
+def _form_input_selector(view: _ResponseView, form: FormInfo, name: str, value: str) -> Optional[str]:
+    """A CSS selector for the first ``<input name=..>`` of the submitted form when it holds ``value``,
+    scoped to that form by its id or its name (``registerForm`` may contain a word such as ``register``),
+    and checked on the recorded page (the page's first ``<input>`` of that name may belong to another
+    form).  The form's position among its sibling forms is used only for a run-specific value (a token):
+    for a plain value a form added before it on the next run would be read silently, while the recorded
+    value is right."""
+    soup, tag = view.soup, _form_tag(view, form)
+    if soup is None or tag is None:
+        return None
+    field_sel = f"input[name={_css_quote(name)}]"
+    forbidden = [] if _route_like(value) else [value]
+    try:
+        target = tag.select_one(field_sel)
+        if target is None or target.get("value") != value:
+            return None
+        scopes = [_id_selector(tag["id"])] if _attr_ok(tag.get("id"), forbidden) else []
+        if _attr_ok(tag.get("name"), forbidden):
+            scopes.append(f"form[name={_css_quote(tag['name'])}]")
+        if is_dynamic_looking(value):
+            scopes.append(f"form:nth-of-type({1 + len(tag.find_previous_siblings('form'))})")
+        for scope in scopes:
+            if soup.select_one(f"{scope} {field_sel}") is target:
+                return f"{scope} {field_sel}"
+    except Exception:  # a name a CSS string cannot hold (soupsieve's SelectorSyntaxError)
+        return None
+    return None
+
+
+def _row_forms(view: _ResponseView, form: FormInfo, name: str, value: str) -> bool:
+    """Is ``form`` one of several forms of the page that differ only in their values (one form per row of a
+    list: the same method, action and fields), another of which holds another value in ``name``?  Then the
+    value is the row the user chose, not a default of the page."""
+    idx = view.index
+    if idx is None:
+        return False
+    names = set(form.fields)
+    for other in idx.forms:
+        if other.method != form.method or other.action != form.action or set(other.fields) != names:
+            continue
+        fld = other.fields.get(name)
+        if fld is not None and fld.defaults and value not in fld.defaults:
+            return True
+    return False
+
+
+def _json_at(doc: Any, path: list) -> Any:
+    """The node at ``path`` (object keys / array indexes), ``Ellipsis`` when there is none."""
+    node = doc
+    for key in path:
+        if isinstance(node, dict) and isinstance(key, str) and key in node:
+            node = node[key]
+        elif isinstance(node, list) and isinstance(key, int) and not isinstance(key, bool) and 0 <= key < len(node):
+            node = node[key]
+        else:
+            return Ellipsis
+    return node
+
+
+#: A number as a list shows it (``1200``, ``1,200``, ``-3``, ``12.5``).
+_NUMBER_TEXT_RE = re.compile(r"^[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?$")
+
+
+def _value_kind(text: str) -> str:
+    """The rough kind of a value in a JSON list: ``date``, ``number``, ``code`` (letters with digits) or
+    ``text``.  The rows of a list the user chooses from hold values of one kind; a date next to a price
+    is one record (``{"d": ["2026/10/30", "1,200"]}``)."""
+    if _DATE_RE.match(text):
+        return "date"
+    if _NUMBER_TEXT_RE.match(text):
+        return "number"
+    return "code" if any(ch.isdigit() for ch in text) else "text"
+
+
+def _named_row(rows: list, i: int, field: str, made: frozenset) -> bool:
+    """Does a leaf of row ``i`` (an object) set it apart from the other rows by a name the field shares
+    (a WCF dictionary ``{"Key": "shipDate", "Value": ...}`` for ``txtShipDate``) or by a value the request
+    that answered the list sent (``made``: ``{"item": "B002"}`` created the row holding ``B002``)?"""
+    row = rows[i]
+    if not isinstance(row, dict):
+        return False
+    for key, leaf in row.items():
+        conv = _leaf_as_str(leaf)
+        if conv is None or not ((field and _names_related(conv[0], field)) or conv[0] in made):
+            continue
+        if not any(isinstance(other, dict) and _leaf_as_str(other.get(key)) == conv
+                   for j, other in enumerate(rows) if j != i):
+            return True
+    return False
+
+
+def _list_pick(doc: Any, path: list, field: str = "", others: frozenset = frozenset(),
+               made: frozenset = frozenset()) -> bool:
+    """Is the JSON leaf at ``path`` one row of a list the user chose from (``rows[1].code`` next to other
+    codes)?  Then reading "row 1" again would pick whatever is listed there on the next run.  It is when
+    another row holds, under the same keys, another value of the same kind (``_value_kind``) that the
+    request does not send in another field (``others``: rows that several fields use are one record), and
+    the row is not set apart by its name or by what the answering request sent (``_named_row``)."""
+    own = _leaf_as_str(_json_at(doc, path))
+    if own is None:
+        return False
+    kind = _value_kind(own[0])
+    for i, key in enumerate(path):
+        if not isinstance(key, int) or isinstance(key, bool):
+            continue
+        rows = _json_at(doc, path[:i])
+        if not isinstance(rows, list) or len(rows) < 2 or _named_row(rows, key, field, made):
+            continue
+        for j, row in enumerate(rows):
+            other = _leaf_as_str(_json_at(row, path[i + 1:])) if j != key else None
+            if other is not None and other[0] != own[0] and other[0] not in others and _value_kind(other[0]) == kind:
+                return True
+    return False
+
+
+def _unpicked_json(view: _ResponseView, ext: Extractor, field: str = "",
+                   consumer: Optional[Flow] = None) -> Optional[Extractor]:
+    """``ext`` (a JSON leaf), else a leaf with the same value outside such a list, else None: a value
+    found only as one row of a list (``_list_pick``) is the user's choice, not the response's.  ``field``
+    and ``consumer``: the name of the request value and its request (the values it sends in other fields);
+    a request other than GET that answered the list may have made the row (``_named_row``)."""
+    doc = view.json_doc
+    if doc is None or not ext.path or not any(isinstance(k, int) and not isinstance(k, bool) for k in ext.path):
+        return ext
+    others = frozenset(c.value for c in request_params(consumer) if c.name != field) if consumer else frozenset()
+    answered = view.flow.request
+    made = (frozenset(c.value for c in request_params(view.flow))
+            if (answered.method or "GET").upper() not in ("GET", "HEAD") else frozenset())
+    if not _list_pick(doc, ext.path, field, others, made):
+        return ext
+    for path, leaf in json_leaves(doc):
+        conv = _leaf_as_str(leaf)
+        if conv is not None and conv[0] == ext.sample and not _list_pick(doc, path, field, others, made):
+            return Extractor(var="", kind="json", name=json_dotted(path), path=list(path), sample=ext.sample)
+    return None
+
+
+def _anchor_re(anchor: str) -> re.Pattern:
+    """A field name / id, not as part of a longer identifier."""
+    return re.compile(rf"(?<![\w$-]){re.escape(anchor)}(?![\w$-])")
+
+
+#: What follows a field reference that writes the field: ``getElementById('x').value =``,
+#: ``form1.x.value =``, ``getElementsByName('x')[0].value =``, ``$('#x').val(...`` (``.val()`` reads),
+#: ``.attr('value', ``.
+_FIELD_WRITE_RE = re.compile(r"""(?:['"\])\s]|\[\d+\])*\.(?:(?:value|defaultValue)\s*=(?!=)|val\s*\((?!\s*\))"""
+                             r"""|(?:attr|setAttribute)\s*\(\s*['"]value['"]\s*,)\s*""")
+#: ``var el = <a reference to the field>``: a statement up to the reference (the field is then written as
+#: ``el.value``).
+_ALIAS_RE = re.compile(r"""\s*(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=(?!=)[^;{}\n\r=]*$""")
+#: A character that continues a name / an id (see ``_anchor_re``).
+_NAME_CHAR_RE = re.compile(r"[\w$-]")
+#: The rest of such a statement after the reference: only its closing quotes / brackets.
+_REF_END_RE = re.compile(r"""(?:['"\])\s]|\[\d+\])*(?:;|$|[\n\r}])""")
+#: A variable or a property in a written expression (``SYS_DATE``, ``CONFIG.today``).
+_JS_NAME_PATH_RE = re.compile(r"(?<![\w$.])[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*")
+#: Element properties: ``other.value`` copies another field, it is no variable the page set.
+_DOM_VALUE_PROPS = frozenset({"value", "defaultValue", "text", "innerText", "innerHTML", "textContent"})
+#: An attribute selector naming the field by the end of its id / name (``input[id$='txtDate']``: ASP.NET
+#: master pages) or by a part of it (``*=``); the element part before it keeps the match at a word start.
+_ATTR_SELECTOR_RE = re.compile(r"""[\w-]*\[\s*(?:id|name)\s*([$*])=\s*(['"]?)([^'"\]\s]+)\2\s*\]""")
+
+
+def _field_writes(code: str, anchors: list[str]) -> list[tuple[int, int]]:
+    """Where a script writes one of the fields ``anchors`` name (not only configures it: a date picker's
+    ``minDate``): ``(start of the field reference, start of the written expression)``, directly, through
+    an attribute selector matching the field (``$("input[id$='txtDate']").val(...)``) or through a
+    variable holding the element (``var el = document.getElementById('x'); el.value = ...``, until the
+    variable is set again)."""
+    found: list[tuple[int, int]] = []
+    aliases: list[tuple[str, int]] = []
+    for anchor in anchors:
+        at = code.find(anchor)
+        while at >= 0:  # whole names only (``_anchor_re``), found with str.find: scripts can be long
+            start, end = at, at + len(anchor)
+            at = code.find(anchor, at + 1)
+            if (start and _NAME_CHAR_RE.match(code, start - 1)) or _NAME_CHAR_RE.match(code, end):
+                continue
+            write = _FIELD_WRITE_RE.match(code, end)
+            if write:
+                found.append((start, write.end()))
+                continue
+            lo = max(0, start - 200)
+            stmt = max(code.rfind(c, lo, start) for c in ";{}\n\r")
+            alias = _ALIAS_RE.match(code, stmt + 1, start) if stmt >= 0 or lo == 0 else None
+            if alias and _REF_END_RE.match(code, end):
+                aliases.append((alias.group(1), end))
+    if "$=" in code or "*=" in code:
+        for m in _ATTR_SELECTOR_RE.finditer(code):
+            op, part = m.group(1), m.group(3)
+            if len(part) < _MIN_ANCHOR_LEN or part in anchors:
+                continue  # a whole name is an anchor of its own
+            if any(a.endswith(part) if op == "$" else part in a for a in anchors):
+                write = _FIELD_WRITE_RE.match(code, m.end())
+                if write:
+                    found.append((m.start(), write.end()))
+    for alias, start in aliases:
+        name = re.escape(alias)
+        again = re.compile(rf"(?<![\w$.]){name}\s*=(?!=)").search(code, start)
+        for m in re.compile(rf"(?<![\w$.]){name}(?![\w$])").finditer(code, start, again.start() if again else len(code)):
+            write = _FIELD_WRITE_RE.match(code, m.end())
+            if write:
+                found.append((m.start(), write.end()))
+    return found
+
+
+def _written_expr(code: str, pos: int) -> str:
+    """The expression a field write starting at ``pos`` assigns (up to the end of its statement)."""
+    end = len(code)
+    for stop in (";", "\n", "\r", "}"):
+        k = code.find(stop, pos, end)
+        if k >= 0:
+            end = k
+    return code[pos:end]
+
+
+def _literal_end(code: str, pos: int, value: str) -> Optional[str]:
+    """The character closing the script literal ``value`` at ``code[pos]`` (its quote, or what follows a
+    bare number), None when the value is only part of a literal or a name."""
+    end = pos + len(value)
+    before, after = code[max(0, pos - 1):pos], code[end:end + 1]
+    if before in ("'", '"'):
+        return after if after == before else None
+    bare = re.compile(r"[\w$.'\"]")
+    if re.fullmatch(r"\d+(?:\.\d+)?", value) and after and not bare.match(after) and not bare.match(before or " "):
+        return after
+    return None
+
+
+_BRACKET_RE = re.compile(r"[()\[\]{}]")
+
+
+def _list_item(code: str, pos: int) -> bool:
+    """Is the literal at ``code[pos]`` an item of a list in a script (``['L01', 'L02']``,
+    ``new Array('L01', ...)``, ``[{code: 'C-1'}, ...]``)?  Looking back, the innermost open bracket is
+    ``[`` / ``Array(``, or an object ``{`` that is itself such an item."""
+    depth = 0
+    in_object = False
+    lo = max(0, pos - 1999)
+    for m in reversed(list(_BRACKET_RE.finditer(code, lo, pos))):
+        i, ch = m.start(), m.group(0)
+        if ch in ")]}":
+            depth += 1
+        elif ch in "([{":
+            if depth:
+                depth -= 1
+            elif ch == "{" and not in_object:
+                in_object = True
+            else:
+                return ch == "[" or (ch == "(" and code[max(0, i - 5):i] == "Array")
+    return False
+
+
+def _only_captures(text: str, pattern: str, value: str) -> bool:
+    """Does ``pattern`` match ``text`` and capture ``value`` at every match?"""
+    found = False
+    for m, _ in zip(re.finditer(pattern, text), range(_MAX_PATTERN_MATCHES)):
+        if m.group(1) != value:
+            return False
+        found = True
+    return found
+
+
+#: Elements whose event handlers may fill a field in by themselves: the page (``onload=``), buttons (a
+#: 「今日」 button) and form controls.  A handler on a link, a table cell, a list item or a radio button
+#: is a row of a list the user picked from, even when the list has a single row.
+_WRITER_HANDLER_TAGS = frozenset({"body", "frameset", "form", "input", "button", "select", "textarea"})
+#: A script reading an element: ``x.value``, ``$('#x').val()`` / ``.text()`` / ``.html()``, ``innerText`` ...
+_ELEMENT_READ_RE = re.compile(r"\.(?:value|defaultValue|innerText|innerHTML|textContent)\b(?!\s*=[^=])"
+                              r"|\.(?:val|text|html)\s*\(\s*\)")
+#: Names a script may give an element by: identifiers and the words of its strings (``form1.hidToday``,
+#: ``getElementById('hidToday')``, ``$('#lblToday')``).
+_ELEMENT_NAME_RE = re.compile(r"[A-Za-z_$][\w$:.-]*")
+
+
+def _page_codes(view: _ResponseView) -> list[str]:
+    """The page's scripts: ``<script>`` contents and the event handlers of ``_WRITER_HANDLER_TAGS``
+    elements (built once per page)."""
+    codes = getattr(view, "_page_codes", None)
+    if codes is None:
+        soup, idx = view.soup, view.index
+        codes = [s.string for s in soup.find_all("script") if s.string] if soup is not None else []
+        if idx is not None:
+            codes += [val for el, attr, val in idx.attr_items
+                      if attr.startswith("on") and el.name in _WRITER_HANDLER_TAGS
+                      and not (el.name == "input" and str(el.get("type") or "").strip().lower() == "radio")]
+        starts, at = [], 0
+        for code in codes:
+            starts.append(at)
+            at += len(code) + 1
+        view._page_codes, view._page_joined = codes, ("\x00".join(codes), starts)
+    return codes
+
+
+def _codes_with(view: _ResponseView, needles: Iterable[str]) -> list[str]:
+    """The page's scripts (``_page_codes``) containing one of ``needles``, in page order: one search over
+    all of them (a page may have hundreds of handlers)."""
+    from bisect import bisect_right  # stdlib; imported on first use
+
+    codes = _page_codes(view)
+    joined, starts = view._page_joined
+    hits: set[int] = set()
+    for needle in needles:
+        at = joined.find(needle) if needle else -1
+        while at >= 0:
+            k = bisect_right(starts, at) - 1
+            hits.add(k)
+            at = joined.find(needle, starts[k + 1]) if k + 1 < len(starts) else -1
+    return [codes[k] for k in sorted(hits)]
+
+
+def _element_read(view: _ResponseView, expr: str, value: str) -> Optional[Extractor]:
+    """The element of the page a written expression copies (``document.form1.hidToday.value``,
+    ``$('#lblToday').text()``) when the server rendered exactly ``value`` into it (a hidden input, a
+    label): the value is read from that element again."""
+    soup, idx = view.soup, view.index
+    if soup is None or idx is None or not _ELEMENT_READ_RE.search(expr):
+        return None
+    names: list[str] = []
+    for m in _ELEMENT_NAME_RE.finditer(expr):
+        names += [m.group(0)] + m.group(0).split(".")
+    for name in dict.fromkeys(n for n in names if n):
+        for el, attr in idx.attr_index.get(name, []):
+            if attr not in ("id", "name"):
+                continue
+            if el.name == "input":
+                if el.get("value") != value:
+                    continue
+                nm = el.get("name")
+                first = (next((e for e, a in idx.attr_index.get(nm, []) if a == "name" and e.name == "input"), None)
+                         if isinstance(nm, str) and nm else None)
+                if first is el:
+                    return Extractor(var="", kind="html_input", name=nm, sample=value)
+                sel = _selector_for(el, soup, [value], exclude_attr="value")
+                if sel:
+                    return Extractor(var="", kind="html_attr", selector=sel, attr="value", sample=value)
+            elif el.name not in ("select", "textarea", "option", "script", "style") and el.get_text(strip=True) == value:
+                sel = _selector_for(el, soup, [value])
+                if sel:
+                    return Extractor(var="", kind="html_text", selector=sel, sample=value)
+    return None
+
+
+def _page_script_source(view: _ResponseView, value: str, anchors: list[str]) -> Optional[Extractor]:
+    """Where the form page's own scripts (``_page_codes``) got the value they write into the field
+    (``_field_writes``): the written literal (``getElementById('txtDate').value = '...'``), an element of
+    the page the written expression copies (``_element_read``), or a variable / property the expression
+    uses and the scripts set to it (``var SYS_DATE = '...'`` ... ``.value = SYS_DATE``).  A literal is read
+    with a regex verified to capture only that value on the page: never an item of a list or one of
+    several handlers writing other values (a choice), never a value that merely stands in a script naming
+    the field (a date picker's ``minDate``)."""
+    if not anchors or view.soup is None:
+        return None
+    writes = [(code, ref, pos) for code in _codes_with(view, list(anchors) + ["$=", "*="])
+              for ref, pos in _field_writes(code, anchors)]
+    if not writes:
+        return None
+    holding = [] if _REGEX_UNSAFE_RE.search(value) else _codes_with(view, [value])
+    literal = bool(holding)
+    for code, ref, pos in writes:
+        expr = _written_expr(code, pos)
+        spots = [(code, ref, pos + k) for k in range(len(expr)) if expr.startswith(value, k)] if literal else []
+        if not spots:
+            copied = _element_read(view, expr, value)
+            if copied is not None:
+                return copied
+        names = [] if spots or not literal else [(m.group(0).rsplit(".", 1)[-1], expr[m.end():].lstrip())
+                                                 for m in _JS_NAME_PATH_RE.finditer(expr)]
+        for name, rest in names:
+            if name in _DOM_VALUE_PROPS or rest.startswith("("):
+                continue  # another field's value, a function call
+            assign = re.compile(rf"(?<![\w$]){re.escape(name)}['\"]?\s*[:=](?!=)\s*['\"]?{re.escape(value)}")
+            spots += [(other, a.start(), a.end() - len(value)) for other in holding for a in assign.finditer(other)]
+        for where, start, at in spots:
+            close = _literal_end(where, at, value)
+            if close is None or _list_item(where, at):
+                continue
+            pattern = (r"(?<![\w$])" + re.escape(where[start:at]) + _capture_group(value, greedy=False)
+                       + re.escape(close))
+            if _only_captures(view.text, pattern, value):
+                return Extractor(var="", kind="regex", pattern=pattern, sample=value)
+    return None
+
+
+def _anchored_pattern(text: str, value: str, anchors: list[str]) -> Optional[str]:
+    """A verified regex for ``value`` whose context reaches the field's name or id on the same line, at
+    most ``_ANCHOR_WINDOW`` characters away (``name="txtShipDate" type="text" value="..."``), with no
+    list, object or other element between them."""
+    if not anchors or _REGEX_UNSAFE_RE.search(value):
+        return None
+    start = 0
+    for _ in range(12):
+        idx = text.find(value, start)
+        if idx < 0:
+            break
+        start, end = idx + 1, idx + len(value)
+        line_start = max(text.rfind("\n", 0, idx), text.rfind("\r", 0, idx)) + 1
+        line_end = min([p for p in (text.find("\n", end), text.find("\r", end)) if p >= 0], default=len(text))
+        for anchor in anchors:
+            rx = _anchor_re(anchor)
+            # whole names only: the lookahead sees the end of the window as the end of the text
+            spans = [m.span() for lo, hi in ((max(line_start, idx - _ANCHOR_WINDOW), idx),
+                                             (end, min(line_end, end + _ANCHOR_WINDOW)))
+                     for m in rx.finditer(text, lo, hi) if not re.match(r"[\w$-]", text[m.end():m.end() + 1])]
+            before = [s for s, e in spans if e <= idx]
+            after = [e for s, e in spans if s >= end]
+            # the other side: only the punctuation next to the value (the capture group stops at quotes)
+            if before:
+                quote = text[idx - 1:idx] if idx and text[idx - 1] in "'\"" and text[end:end + 1] == text[idx - 1] else ""
+                prefix, suffix = text[before[-1]:idx], quote or re.match(r"\W{0,4}", text[end:line_end]).group(0)
+                between, (kept, _) = prefix, _stable_context(prefix, "")
+            elif after:
+                prefix, suffix = re.search(r"\W{0,4}$", text[line_start:idx]).group(0), text[end:after[0]]
+                between, (_, kept) = suffix, _stable_context("", suffix)
+            else:
+                continue
+            if value in between or kept != between or any(c in between for c in "[]{}<") or ">" in between[:-1]:
+                continue  # another value, a run-specific token, a list or another element in between
+            pattern = _verified_pattern(text, value, prefix, suffix, allow_ambiguous=False)
+            if pattern:
+                return pattern
+    return None
+
+
+def _text_body_source(view: _ResponseView, value: str, anchors: list[str]) -> Optional[Extractor]:
+    """A text response without markup (a text/plain XHR, an UpdatePanel delta, JavaScript, a bare value
+    answered as text/html) the page's script copied the value from: its whole body (never a bare number),
+    or a value whose context names the field (``_anchored_pattern``; also its HTML-escaped spelling in a
+    delta's markup).  A value merely somewhere in the text is not enough."""
+    if not view.textual or (view.is_htmlish and _MARKUP_RE.search(view.text)):
+        return None
+    text = view.text
+    if text.strip() == value:
+        return None if value.isdigit() else Extractor(var="", kind="regex", pattern=_WHOLE_BODY_PATTERN, sample=value)
+    escaped = value.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+    for spelling in dict.fromkeys((value, escaped)):
+        pattern = _anchored_pattern(text, spelling, anchors)
+        if pattern:
+            return Extractor(var="", kind="regex", pattern=pattern, sample=spelling)
+    return None
+
+
 def _locate_regex(text: str, variants: list[str]) -> Optional[Extractor]:
     for v in variants:
         if len(v) < _MIN_REGEX_VALUE_LEN or v not in text:
@@ -3510,7 +5413,12 @@ def _locate_regex(text: str, variants: list[str]) -> Optional[Extractor]:
 
 
 def _locate_url(flow: Flow, variants: list[str]) -> Optional[Extractor]:
+    """A value in the redirect target of a 3xx response: read at run time from ``resp.url`` (the
+    URL requests ends up at after following the redirect).  A ``Location`` of any other status is a
+    plain header (``_locate_header``)."""
     resp = flow.response
+    if not (300 <= resp.status < 400):
+        return None
     location = (resp.location or "").strip()
     if not location:
         return None
@@ -3551,8 +5459,10 @@ def locate_value_kinds(value: str, source: Flow, kinds: Optional[frozenset] = No
                     return ext
             text = view.text
             present = [v for v in variants if v in text]
-            non_ascii = any(ord(ch) > 127 for ch in value)
-            if present or (non_ascii and "&" in text):
+            # values written with character references (``&#x3D;``, ``&amp;``) are only visible once
+            # the parser has unescaped them
+            escaped = not present and "&" in text and any(v in view.unescaped for v in variants)
+            if present or escaped:
                 if view.soup is not None:
                     # the parser unescapes entities, so every spelling must be tried here
                     ext = _locate_html(view, variants, allow)
@@ -3564,6 +5474,10 @@ def locate_value_kinds(value: str, source: Flow, kinds: Optional[frozenset] = No
                         return ext
     if allow("url"):
         ext = _locate_url(source, variants)
+        if ext:
+            return ext
+    if allow("location"):
+        ext = _locate_location(source, variants)
         if ext:
             return ext
     return None
@@ -3581,22 +5495,24 @@ def locate_value(value: str, source: Flow) -> Optional[Extractor]:
 
 def find_cookie(value: str, earlier: list[Flow]) -> Optional[tuple[str, str]]:
     """``(cookie_name, recorded_cookie_value)`` of the latest earlier ``Set-Cookie`` whose value
-    equals ``value`` or one of its spellings, else None."""
+    equals ``value`` or one of its spellings, else None.  Deletions (``Max-Age=0`` or an
+    ``Expires`` date in the past, RFC 6265) are never a source.
+
+    The plan builder does not use this name-only lookup: it asks ``CookieTimeline`` which cookie
+    (name, domain, path) held the value when the request was sent."""
     if not value:
         return None
     variants = set(value_variants(value))
     for flow in reversed(earlier):
         if flow.response is None:
             continue
-        for raw in reversed(flow.response.set_cookies):
-            parsed = parse_set_cookie(raw)
-            if not parsed:
+        for raw in reversed(set_cookie_lines(flow.response)):
+            info = parse_set_cookie_attrs(raw, flow.request.url, flow.started_at or None)
+            if info is None or info.deletion or not info.value:
                 continue
-            name, cval = parsed
-            if not cval or cval.lower() == "deleted":
-                continue
+            cval = info.value
             if cval in variants or cval.strip('"') in variants:
-                return name, cval
+                return info.name, cval
     return None
 
 
@@ -3675,6 +5591,25 @@ def _numeric_range(values: list[str]) -> Optional[tuple[int, int]]:
     return None
 
 
+def _credential_parameter(groups: list[list[Flow]], first: int, location: str, name: str) -> bool:
+    """Is the parameter a run of requests varies a credential: a credential-like name (``password``,
+    ``txtPW``, ``pin``), or a password control of the form the run's first request submits (on the page
+    its ``Referer`` names, else the page before)?  Such a run is never folded into a loop: each value
+    stays its own 入力値 (read from the environment with ``--redact``) and no progress line shows it."""
+    leaf = name.rsplit(".", 1)[-1].split("[", 1)[0] if location == "json" else name
+    if looks_like_secret_name(leaf) or _looks_like_password_name(leaf):
+        return True
+    pages = [g[-1] for g in groups[:first] if g]
+    if location not in ("query", "form") or not pages:
+        return False
+    referer = groups[first][0].request.header("referer")
+    page = next((f for f in reversed(pages) if _same_page(f.request.url, referer)), pages[-1])
+    view = _view(page)
+    index = view.index if view.is_htmlish else None
+    return index is not None and any(
+        form.fields[name].control == "password" for form in index.forms if name in form.fields)
+
+
 def detect_loops(groups: list[list[Flow]], opts: PlanOptions) -> list[LoopGroup]:
     """Find runs of >= 3 consecutive groups differing in exactly one parameter value."""
     sigs = [_signature(g[0]) if g else None for g in groups]
@@ -3705,8 +5640,10 @@ def detect_loops(groups: list[list[Flow]], opts: PlanOptions) -> list[LoopGroup]
             values = [sigs[k].values[pos] for k in range(i, j)]
             # Hash-like values (cursors, ids from a listing) are each traceable to an earlier
             # response; folding them into a literal list would break that chain, so only
-            # counter-like / word-like values are folded.
-            if location in _LOOPABLE_LOCATIONS and not any(is_dynamic_looking(v) for v in values):
+            # counter-like / word-like values are folded.  Credentials (a mistyped password retried)
+            # never are: the loop would print them and write them into the script.
+            if (location in _LOOPABLE_LOCATIONS and not any(is_dynamic_looking(v) for v in values)
+                    and not _credential_parameter(groups, i, location, name)):
                 out.append(LoopGroup(
                     groups=list(groups[i:j]),
                     location=location,
@@ -3733,6 +5670,10 @@ _CODEGEN_NAMES = frozenset({
     "TIMEOUT", "DELAY", "BASE_HEADERS", "INITIAL_COOKIES", "main", "session", "resp", "soup", "ctx",
     "results", "data", "step", "requests", "re", "json", "os", "sys", "time", "unquote", "urljoin",
     "BeautifulSoup", "_soup", "_check", "_regex", "_json_path", "_attr", "_text",
+    "DEBUG", "DEPENDENCIES", "SESSION_SWITCHES", "urlencode", "urlsplit",
+    "_debug", "_mask_url", "_mask_text", "_cookie", "_cookie_keys", "_set_cookie", "_need", "_hop",
+    "_host_cookie_hook",
+    "_cookie_attr_hook", "_ie_cookie_hook", "_Session", "functools", "warnings",
 })
 _GENERIC_JSON_KEYS = frozenset({"id", "value", "token", "code", "key", "name", "data", "result"})
 _WORD_RE = re.compile(r"^[A-Za-z][A-Za-z_-]*$")
@@ -3819,8 +5760,8 @@ def _route_like(value: str) -> bool:
 #: Locators that read markup or match a pattern.  A route-like path segment (``Login.aspx``) found
 #: there is a coincidence (``action="Login.aspx"``), never the source of the value.
 _MARKUP_KINDS = frozenset({"html_attr", "html_text", "regex", "url"})
-#: What a route-like path segment may still be traced to: exact structural matches (an all-uppercase
-#: session key ``/s/QZVBNMWRTYPXSDFKHJ/`` can be a JSON leaf or a header of an earlier response).
+#: What a route-like path segment may still be traced to: exact structural matches (a short letters
+#: session key ``/s/QZVBNMWRT/`` can be a JSON leaf or a header of an earlier response).
 _ROUTE_SEGMENT_KINDS = frozenset({"header", "json", "html_input", "html_meta"})
 
 
@@ -3902,25 +5843,35 @@ def _referer_with_fresh_values(value: str, refs: dict, secrets: Optional[dict[st
     each either verbatim or in its percent-encoded spelling.  ``scheme://host`` and the fragment
     stay literal, and a value is never replaced inside a longer token.  Only non-literal refs in
     ``refs`` (this step's first, then the earlier steps' extractor variables) whose recorded value
-    has at least ``_REFERER_MIN_VALUE`` characters are used; anything else stays literal.
+    has at least ``_REFERER_MIN_VALUE`` characters are used; anything else stays literal - except a
+    traced path segment, ``;name=`` path parameter or query value (not a number), which is replaced at
+    the same place of the Referer (the same path index, parameter name, query name) whatever its length
+    (a short session key: ``/oms/s/XRLDNXD/menu``, ``menu.do;sid=XRLDNXD``, ``menu.do?sid=XRLDNXD``).
 
     ``secrets`` (recorded value -> Ref of a secret constant) is used, whatever the value's length,
     for query items whose name looks like a credential (``Login.aspx?pw=abc`` as the previous
     page), so a password never reaches the script through the Referer."""
     swaps: dict[str, Ref] = {}
-    for (_loc, _name, raw), ref in refs.items():
-        if ref is None or ref.is_literal or not isinstance(raw, str) or len(raw) < _REFERER_MIN_VALUE:
+    place_swaps: dict[tuple[str, str, str], Ref] = {}  # (candidate location, name, value) -> Ref
+    for (loc, name, raw), ref in refs.items():
+        if ref is None or ref.is_literal or not isinstance(raw, str):
+            continue
+        if loc in ("path", "path_param", "query") and raw and not raw.isdigit():
+            place_swaps.setdefault((loc, name, raw), ref)
+        if len(raw) < _REFERER_MIN_VALUE:
             continue
         swaps.setdefault(raw, ref)
     secrets = {raw: ref for raw, ref in (secrets or {}).items() if raw and ref is not None and not ref.is_literal}
-    m = _ABS_URL_RE.match(value) if swaps or secrets else None
+    m = _ABS_URL_RE.match(value) if swaps or secrets or place_swaps else None
     if m is None:
         return Ref.lit(value)
     head, path, query, fragment = m.groups()
     pieces: list[tuple[bool, str]] = [(False, head)]  # (is_expr, text)
 
-    def token(text: str, plus: bool, name: str = "") -> None:
+    def token(text: str, plus: bool, name: str = "", place: Optional[tuple[str, str, str]] = None) -> None:
         expr = _referer_token(text, swaps, plus) if text else None
+        if expr is None and place in place_swaps:
+            expr = f"str({place_swaps[place].value})"
         if expr is None and text and secrets and looks_like_secret_name(unquote(name.replace("+", " "))):
             expr = _referer_token(text, secrets, plus)
         pieces.append((True, expr) if expr is not None else (False, text))
@@ -3929,13 +5880,13 @@ def _referer_with_fresh_values(value: str, refs: dict, secrets: Optional[dict[st
         if i:
             pieces.append((False, "/"))
         first, *params = segment.split(";")
-        token(first, False)
+        token(first, False, place=("path", str(i - 1), first))  # i - 1: the index after the leading "/"
         for param in params:
             pieces.append((False, ";"))
             pname, eq, pvalue = param.partition("=")
             if eq:
                 pieces.append((False, pname + "="))
-                token(pvalue, False)
+                token(pvalue, False, place=("path_param", f"{i - 1};{pname}", pvalue))
             else:
                 token(param, False)
     if query is not None:
@@ -3946,7 +5897,7 @@ def _referer_with_fresh_values(value: str, refs: dict, secrets: Optional[dict[st
             qname, eq, qvalue = item.partition("=")
             if eq:
                 pieces.append((False, qname + "="))
-                token(qvalue, True, qname)
+                token(qvalue, True, qname, place=("query", qname, qvalue))
             else:
                 token(item, True)
     if fragment is not None:
@@ -4042,6 +5993,151 @@ class _Built:
     extractors: dict[tuple, Extractor] = field(default_factory=dict)
 
 
+def describe_extractor(ext: Extractor) -> str:
+    """Plain-Japanese, value-free description of where an extractor reads its value (the script's
+    dependency table, comments and debug output)."""
+    kind = ext.kind
+    hop = f"リダイレクト中の {ext.hop + 1} 番目の応答の" if ext.hop is not None else ""
+    regex = "（正規表現で抽出）" if ext.pattern else ""
+    if kind == "cookie":
+        return f"Cookie {ext.name}（domain={ext.cookie_domain or '-'}, path={ext.cookie_path or '/'}）"
+    if kind == "header":
+        return f"{hop}レスポンスヘッダー {ext.name}{regex}"
+    if kind == "json":
+        return f"レスポンス JSON の {json_dotted(list(ext.path or [])) or '(全体)'}"
+    if kind == "html_input":
+        return f'HTML の <input name="{ext.name}"> の value'
+    if kind == "html_meta":
+        return f'HTML の <meta name="{ext.name}"> の content'
+    if kind == "html_attr":
+        return f"HTML の要素 {ext.selector} の属性 {ext.attr}{regex}"
+    if kind == "html_text":
+        return f"HTML の要素 {ext.selector} のテキスト{regex}"
+    if kind == "regex":
+        return "レスポンス本文（スクリプト内の値を含む）を正規表現で検索"
+    if kind == "url":
+        return "リダイレクト先の URL"
+    return str(kind)
+
+
+def describe_cookie(ver: CookieVersion, issued_step: Optional[int] = None) -> str:
+    """``Cookie NAME（domain=..., path=...、ステップ 2 の Set-Cookie で発行）`` (never the value)."""
+    if ver.origin == "server":
+        how = f"ステップ {issued_step} の Set-Cookie で発行" if issued_step else "Set-Cookie で発行"
+    elif ver.external_kind == "pre-existing":
+        how = "記録を始める前からブラウザにあった Cookie"
+    else:
+        how = "画面のスクリプトが設定した Cookie"
+    return f"Cookie {ver.name}（domain={ver.domain}, path={ver.jar_path}、{how}）"
+
+
+@dataclass
+class _Resolution:
+    """How one request value was resolved (feeds ``Step.bindings``)."""
+
+    value_class: str
+    source: str = ""
+    source_step: Optional[int] = None
+    source_kind: str = ""
+    var: Optional[str] = None
+    cookie: Optional[CookieVersion] = None
+    note: str = ""
+
+
+#: Dropped-flow reasons whose flows may be put back as producers (``PlanOptions.include_producers``);
+#: never "excluded by user", host filters, trackers (internet hosts a LAN PC may not reach), missing
+#: responses, preflights or streams.
+_PRODUCER_REASON_PREFIXES = ("static asset", "304 not modified")
+#: Untraced literals at least this long are looked up in dropped flows.
+_PRODUCER_MIN_VALUE = 6
+#: Credential-like names whose values may look random and are still user input (passwords).
+_PASSWORD_NAME_RE = re.compile(r"pass|pwd|secret", re.I)
+
+
+#: Locators that find a value exactly (no pattern): what "the field was filled by script" needs.
+_EXACT_KINDS = frozenset({"header", "json", "html_input", "html_meta", "html_attr", "html_text"})
+_NAME_TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+#: Name parts of a password field (``txtPW``, ``j_password``, ``userPwd``); used only to keep such values
+#: out of the request code (an 入力値 constant), never to decide where a value comes from.
+_PASSWORD_TOKENS = frozenset({"pass", "password", "passwd", "pwd", "pw", "passphrase", "pin"})
+
+
+def _looks_like_password_name(name: str) -> bool:
+    """Does a field name have a password-like part (``txtPW``, ``userPwd``; not ``passengerName``)?"""
+    return any(tok.lower() in _PASSWORD_TOKENS for tok in _NAME_TOKEN_RE.findall(name or ""))
+
+
+def _names_related(a: str, b: str) -> bool:
+    """Two names that share a run of at least 4 letters / digits (``slipNo`` / ``txtSlipNo``,
+    ``XSRF-TOKEN`` / ``X-XSRF-TOKEN``): a coincidence guard, never a source by itself."""
+    x = re.sub(r"[^a-z0-9]", "", (a or "").lower())
+    y = re.sub(r"[^a-z0-9]", "", (b or "").lower())
+    short, long_ = sorted((x, y), key=len)
+    return len(short) >= 4 and short in long_
+
+
+def _names_alike(a: str, b: str) -> bool:
+    """Names of one field in two places (a form field and the JSON key / query name the page's script
+    sends it under): related (``dateFrom`` / ``txtDateFrom``), or the words of one end the other
+    (``to`` / ``txtTo``, ``no`` / ``txtNo``)."""
+    if _names_related(a, b):
+        return True
+    x = [t.lower() for t in _NAME_TOKEN_RE.findall(a or "")]
+    y = [t.lower() for t in _NAME_TOKEN_RE.findall(b or "")]
+    short, long_ = sorted((x, y), key=len)
+    return bool(short) and long_[len(long_) - len(short):] == short
+
+
+def _token_shaped(value: str) -> bool:
+    """At least 6 characters mixing letters with digits or ``|%_-.~+/=`` - a token, not a date, a word
+    or a number (``xsrf|AbC123``, ``S3SS10N``)."""
+    v = value or ""
+    if len(v) < 6 or v.isdigit() or _DATE_RE.match(v) or _PLAIN_WORDS_RE.match(v):
+        return False
+    return any(c.isalpha() for c in v) and any(c.isdigit() or c in "|%_-.~+/=" for c in v)
+
+
+def _submitted_fields(req: RecordedRequest) -> list[tuple[str, str, str]]:
+    """``(location, name, value)`` of the query and form / multipart text fields, in request order."""
+    out = [("query", name, value) for name, value in parse_form_bytes(query_bytes(req.query))]
+    kind, parsed = classify_body(req)
+    if kind == "form":
+        out.extend(("form", name, value) for name, value in parsed)
+    elif kind == "multipart":
+        out.extend(("multipart", fld.name, fld.text()) for fld in parsed if not fld.is_file)
+    return out
+
+
+def _field_key(location: str, name: str) -> str:
+    """A form / query / JSON field across locations: its (last) name, lower-cased (``username`` in a login
+    form and in a later JSON body are the same field)."""
+    name = str(name or "")
+    if location == "json":
+        name = name.rsplit(".", 1)[-1].split("[", 1)[0]
+    return name.lower()
+
+
+def _ref_name(ref: Ref) -> str:
+    """The constant / variable a Ref reads (``NAME`` of ``NAME.encode('cp932')``)."""
+    return str(ref.value).split(".", 1)[0] if ref.kind == "expr" else str(ref.value)
+
+
+def _same_page(a: Optional[str], b: Optional[str]) -> bool:
+    """The same URL apart from the fragment and the case of scheme / host."""
+    if not a or not b:
+        return False
+    return _normalise_url(str(a).split("#", 1)[0]) == _normalise_url(str(b).split("#", 1)[0])
+
+
+@dataclass
+class _FormMatch:
+    """The HTML form a request submits: the form, the step whose page holds it and the page charset."""
+
+    form: FormInfo
+    built: "_Built"
+    charset: str = "utf-8"
+
+
 class _Builder:
     """Stateful plan construction (one instance per ``build_plan`` call)."""
 
@@ -4071,12 +6167,43 @@ class _Builder:
         self.auth_credentials: Optional[tuple[str, str]] = None  # Basic: (user, password) behind Plan.auth
         self.auth_token_units: dict[str, set[int]] = {}  # session-auth tokens sent by several steps
         self.auth_header_warned: set[tuple[str, str]] = set()
+        # --- dependency analysis (DESIGN.md §14) ---
+        self.timeline: Optional[CookieTimeline] = None
+        self.kept_ids: set[int] = set()
+        self.flow_step: dict[int, int] = {}  # id(flow) -> step index of every kept flow
+        #: the text of each 入力値 (user input, B) -> ``(field name, Ref)`` of every field typed with it, in
+        #: order (a later request that sends the text again - an XHR JSON body, a query the page's script
+        #: builds - stays that user input: ``_typed_elsewhere``)
+        self.input_refs: dict[str, list[tuple[str, Ref]]] = {}
+        #: per step: the recorded bytes of each query / form value (``(location, name, value)``) and the
+        #: charset the request body declares - they decide whether a value was sent in a legacy charset
+        self._raw_fields: dict[tuple[str, str, str], bytes] = {}
+        self._raw_charset: Optional[str] = None
+        #: dropped flows a kept request needs (flow id -> what it provides), put back by build_plan
+        self.needed_producers: dict[str, list[str]] = {}
+        self.dropped_by_id: dict[str, Dropped] = {}
+        self.dropped_flows: list[Flow] = []
+        #: per step: cookie lookups / cookie sets / value resolutions (reset by _build_step)
+        self._lookups: dict[tuple, CookieLookup] = {}
+        self._meta: dict[tuple, _Resolution] = {}
+        self._last_meta = _Resolution("A")
+        self.cookie_first_use: set[int] = set()  # server cookie versions already listed as a binding
+        #: (location, field name) -> (sent value, Ref, step, resolution) of the fields that were user input
+        self.input_fields: dict[str, tuple[str, Ref, int, _Resolution]] = {}
+        self._short_metas: dict[tuple[str, str, str], _Resolution] = {}
+        self.loop_spans: list[tuple[int, int]] = []  # timeline positions of the folded loops' requests
+        self._warned_values: set[str] = set()
+        #: external cookie versions already set by an earlier step (or INITIAL_COOKIES)
+        self.external_done: set[int] = set()
+        self.initial_cookies: list[InitialCookie] = []
 
     # ------------------------------------------------------------------ naming
 
     def _cand_base_name(self, cand: Candidate, flow: Flow) -> str:
         if cand.location == "json":
             return _json_leaf_name(cand.json_path)
+        if cand.location == "path_param":
+            return cand.name.split(";", 1)[-1] or "path_param"
         if cand.location == "path":
             try:
                 return _path_seg_name(_path_segments(flow.request.url), int(cand.name))
@@ -4117,7 +6244,8 @@ class _Builder:
         return unique_name(safe_identifier(base, default="page"), self.taken)
 
     def _func_name(self, index: int, flow: Flow, dynamic_segments: set[int]) -> str:
-        segments = _path_segments(flow.request.url)
+        # path parameters (``;jsessionid=...``) never become part of a name
+        segments = [split_path_segment(s)[0] for s in _path_segments(flow.request.url)]
         parts = [s for i, s in enumerate(segments) if s and i not in dynamic_segments and not s.isdigit()]
         slug_src = "_".join(parts[-2:]) if parts else flow.request.host
         slug = safe_identifier(slug_src, default="root")[:_MAX_SLUG_LEN].strip("_") or "root"
@@ -4130,21 +6258,35 @@ class _Builder:
         """Is ``name`` a field whose value must be read from the environment (DESIGN.md §7)?"""
         return bool(self.opts.redact_secrets and looks_like_secret_name(name))
 
-    def _constant(self, cand: Candidate, value: str, flow: Flow, step_no: int, force_secret: bool = False) -> Ref:
+    def _constant(self, cand: Candidate, value: str, flow: Flow, step_no: int, force_secret: bool = False,
+                  kind: str = "shared") -> Ref:
         """The shared ``Constant`` for ``value`` (created on first use).
 
         A secret use (``force_secret`` or a credential-like name, when ``redact_secrets``) only ever
         reuses a *secret* constant: a password equal to the user id gets its own environment variable
         instead of turning the user id's constant into one.  A plain use reuses any constant of the
-        value (a form field carrying the Basic password reuses ``AUTH_PASSWORD`` rather than leaking it)."""
+        value (a form field carrying the Basic password reuses ``AUTH_PASSWORD`` rather than leaking it).
+        ``kind="input"`` marks the constant as user input (class B: the script's 入力値 section): one per
+        field, never found by value (another field or a later value with the same text gets its own); it
+        shares only a constant read from the environment (never written out) or, for a password, an
+        earlier password with the same value (a confirmation field)."""
         secret = self.opts.redact_secrets and (force_secret or looks_like_secret_name(cand.name))
         const = self.secret_by_value.get(value) if secret else self.const_by_value.get(value)
+        if kind == "input" and not secret:
+            if const is not None and not const.secret:
+                const = None
+            if const is None and force_secret:
+                const = next((c for c in self.constants if c.kind == "input" and c.sensitive and c.value == value), None)
+        if const is not None and kind == "input" and const.kind == "shared":
+            const.kind = "input"
         if const is None:
             base = safe_identifier(self._cand_base_name(cand, flow), default="value").upper()
             name = unique_name(base, self.taken)
-            const = Constant(name=name, value=value, secret=secret, env_var=f"REQREC_{name}" if secret else None)
+            const = Constant(name=name, value=value, secret=secret, env_var=f"REQREC_{name}" if secret else None,
+                             kind=kind)
             self.constants.append(const)
-            self.const_by_value.setdefault(value, const)
+            if kind != "input" or secret:
+                self.const_by_value.setdefault(value, const)
             if secret:
                 self.secret_by_value[value] = const
             self.const_uses[name] = []
@@ -4272,21 +6414,82 @@ class _Builder:
 
     # ------------------------------------------------------------------ legacy-charset forms (DESIGN.md §13.4)
 
-    @staticmethod
-    def _legacy_form_hint(body: Optional[bytes], form: list[tuple[str, Ref]]) -> list[tuple[str, Ref]]:
-        """``form`` pairs for a body replayed as raw bytes: traced values keep their Ref, values
-        that are not UTF-8 become bytes literals (``requests`` percent-encodes bytes verbatim)."""
-        raw_pairs = form_pairs_bytes(body)
+    def _legacy_form_hint(self, body: Optional[bytes], form: list[tuple[str, Ref]], charset: Optional[str] = None,
+                          keep: Iterable[str] = (), raws: Optional[list[bytes]] = None
+                          ) -> tuple[list[tuple[str, Ref]], list[str]]:
+        """``form`` pairs for a body (or query) replayed in its recorded legacy charset (``charset``: the one
+        the request declares), and the names of the pairs sent as the recorded bytes.  ``raws``: the
+        recorded values instead of ``body`` (multipart text parts).
+
+        A pair whose recorded bytes are UTF-8 keeps its Ref.  For the others (IE on a Shift_JIS page): a
+        constant holding the text (an 入力値) is sent as ``NAME.encode(charset)``, a value read from a
+        response or a cookie is converted the same way or from its percent-encoded spelling, the loop
+        variable in ``keep`` (it already gives the bytes) and a password read from the environment (sent as
+        typed, UTF-8) stay, and anything else becomes the recorded bytes (``requests`` percent-encodes
+        bytes verbatim and sends them as they are in a multipart part)."""
+        if raws is None:
+            raws = [value for _name, value in form_pairs_bytes(body)]
+            texts = [value for _name, value in parse_form_bytes(body, charset)]
+        else:
+            texts = [_form_text(raw, charset) for raw in raws]
+        by_name = {c.name: c for c in self.constants}
+        keep = set(keep)
         out: list[tuple[str, Ref]] = []
+        kept: list[str] = []
         for i, (name, ref) in enumerate(form):
-            raw_value = raw_pairs[i][1] if i < len(raw_pairs) else b""
+            raw_value = raws[i] if i < len(raws) else b""
+            if is_utf8(raw_value) or (not ref.is_literal and _ref_name(ref) in keep):
+                out.append((name, ref))
+                continue
+            text = texts[i] if i < len(texts) else ""
+            const = by_name.get(ref.value) if ref.kind == "var" else None
+            sent: Optional[Ref] = None
+            if const is not None:
+                encoding = const.encoding or charset
+                if const.secret or isinstance(const.value, (bytes, bytearray)):
+                    sent = ref
+                elif _encodes_to(const.value, encoding, raw_value):
+                    sent = Ref.expr(f"{const.name}.encode({encoding!r})")
+            elif not ref.is_literal:
+                src = ref.value if ref.kind == "var" else f"({ref.value})"
+                if unquote_to_bytes(text) == raw_value:  # the source holds the percent-encoded spelling
+                    sent = Ref.expr(f"unquote({src}.replace('+', ' '), 'latin-1').encode('latin-1')")
+                elif _encodes_to(text, charset, raw_value):
+                    sent = Ref.expr(f"{src}.encode({charset!r})")
+            if sent is None:
+                sent = Ref.expr(repr(raw_value))
+                kept.append(name)
+            out.append((name, sent))
+        return out, kept
+
+    def _escaped_hint(self, body: Optional[bytes], pairs: list[tuple[str, Ref]], charset: Optional[str]
+                      ) -> tuple[list[tuple[str, Ref]], list[str]]:
+        """``pairs`` of a query / form body whose values an old page script built with ``escape()``
+        (``%uXXXX``), and their names.  ``requests`` cannot send that spelling (it percent-encodes the
+        ``%``), so such a value (its Ref holds the text, ``js_unescape``) is sent in the page's ``charset``
+        instead: IIS / ASP.NET decode both spellings to the same text."""
+        by_name = {c.name: c for c in self.constants}
+        out = list(pairs)
+        names: list[str] = []
+        for i, segment in enumerate(split_form_segments(body)[:len(pairs)]):
+            text = js_unescape(segment.partition(b"=")[2])
+            if text is None:
+                continue
+            name, ref = pairs[i]
+            names.append(name)
+            if not charset or charset == "utf-8" or _legacy_text(text.encode(charset, "replace"), charset) != text:
+                continue  # sent as UTF-8 like any str (also a text the page's charset cannot hold)
+            const = by_name.get(ref.value) if ref.kind == "var" else None
             if ref.is_literal:
-                try:
-                    raw_value.decode("utf-8")
-                except UnicodeDecodeError:
-                    ref = Ref.expr(repr(raw_value))
-            out.append((name, ref))
-        return out
+                out[i] = (name, Ref.expr(f"{_lit(ref.value)}.encode({charset!r})"))
+                continue
+            if const is not None and not isinstance(const.value, str):
+                continue  # recorded bytes already
+            if const is not None and not const.secret:
+                const.encoding = const.encoding or charset  # its comment then says it is converted
+            src = ref.value if ref.kind == "var" else f"({ref.value})"
+            out[i] = (name, Ref.expr(f"{src}.encode({charset!r})"))
+        return out, names
 
     # ------------------------------------------------------------------ manual overrides (DESIGN.md §13.1)
 
@@ -4311,18 +6514,111 @@ class _Builder:
             self.warnings.append(f"結果に指定したフロー {wanted} はステップになっていません。最後のステップの結果を表示します")
         return None
 
-    # ------------------------------------------------------------------ resolution
+    # ------------------------------------------------------------------ resolution (DESIGN.md §14)
+    #
+    # A request value is resolved in this order (the first source that explains it wins).  Per form
+    # field (``_field_decision``, never shared with other fields):
+    #
+    # 1. the same field was user input in an earlier step with this value -> the same 入力値 (B);
+    # 2. the field's own default on the form page (an <input> the server filled in) -> that page (C);
+    # 3. an editable field an XHR / popup response filled exactly -> that response (C);
+    # 4. a visible control the user changed (typed / chosen / password) -> 入力値 constant (B).
+    #
+    # Per value (cached within a step):
+    #
+    # 5. a cookie the browser held at that moment, by its identity (name, domain, path) -> jar lookup (D);
+    # 6. an earlier response, latest step first: a cookie renewed since (D, read right after that step),
+    #    the final response (every locator), the redirect responses (headers / Location) (C);
+    # 7. (a dropped request holding it is put back by build_plan);  8. the clock (E);
+    # 9. a value typed into another field earlier, a credential-like name, a visible input the user changed
+    #    (B);  10. a value several steps send (A, shared constant);  11. an existing constant;
+    # 12. the recorded literal (A; warned when it looks dynamic).
 
     @staticmethod
-    def _cookie_ref(name: str, cookie_value: str, value: str) -> Ref:
-        get = f"session.cookies.get({json.dumps(name)})"
+    def _cookie_transform(cookie_value: str, value: str) -> Optional[str]:
+        """How a request value is spelled relative to a cookie value: ``""`` (as is), ``"unquote"``,
+        ``"strip"`` (surrounding quotes removed), or None when the two are unrelated."""
+        if not cookie_value:
+            return None
         if cookie_value == value:
-            return Ref.expr(get)
+            return ""
         if unquote(cookie_value) == value:
-            return Ref.expr(f"unquote({get})")
+            return "unquote"
         if cookie_value.strip('"') == value:
-            return Ref.expr(f"{get}.strip('\"')")
-        return Ref.expr(get)  # value is an encoded spelling of the cookie: requests encodes it again
+            return "strip"
+        if cookie_value in value_variants(value):
+            return ""  # the request carried an encoded spelling: requests encodes the value again
+        return None
+
+    @staticmethod
+    def _transformed(var: str, transform: str) -> Ref:
+        if transform == "unquote":
+            return Ref.expr(f"unquote({var})")
+        if transform == "strip":
+            return Ref.expr(f"{var}.strip('\"')")
+        return Ref.var(var)
+
+    def _replayable(self, ver: CookieVersion) -> bool:
+        """Will the script's jar hold this cookie?  Cookies set by replayed responses and the cookies
+        the script sets itself (external ones, and those of dropped responses that a replayed request
+        sends) - not cookies only a dropped response knew about."""
+        if ver.origin == "external" or (ver.flow is not None and id(ver.flow) in self.kept_ids):
+            return True
+        return any(id(f) in self.kept_ids for f in ver.sent_by)
+
+    def _cookie_source(self, value: str, flow: Flow, exclude: Optional[CookieVersion] = None,
+                       field_name: str = "") -> Optional[tuple[CookieVersion, str, bool]]:
+        """The cookie that held ``value`` when ``flow``'s request was sent: ``(version, transform,
+        sent_by_this_request)``.  Cookies the request itself sent come first (header order: longest
+        path first), then the rest of the jar (latest first).  Coincidence guards: a short number only
+        matches a cookie the request sent (or one named like the field); a cookie the request did not
+        send (a token the page copied from another host's cookie) only matches a server cookie when the
+        value is token-shaped or the names are related.  For a cookie the script sets itself
+        (``exclude``) only cookies of replayed responses count: another cookie the script sets itself
+        (pre-existing, written by the page, or from a response it does not replay) has no server behind
+        it, and is read before it is set (two such cookies with one value would read each other)."""
+        timeline = self.timeline
+        if timeline is None or not value:
+            return None
+        sent = [ver for _n, _v, ver in timeline.sent_with(flow)]
+        others = sorted((v for v in timeline.live_at(flow) if all(v is not s for s in sent)), key=lambda v: -v.seq)
+        for is_sent, pool in ((True, sent), (False, others)):
+            for ver in pool:
+                if exclude is not None and (ver.origin != "server" or ver.flow is None or id(ver.flow) not in self.kept_ids):
+                    continue  # a cookie the script sets itself: never read from another one it sets (circular)
+                if not self._replayable(ver):
+                    continue
+                transform = self._cookie_transform(ver.value, value)
+                if transform is None:
+                    continue
+                related = _names_related(ver.name, field_name)
+                if is_sent:
+                    if value.isdigit() and len(value) < 8 and not related:
+                        continue
+                elif ver.origin != "server" or not (is_dynamic_looking(value) or _token_shaped(value) or related):
+                    continue
+                return ver, transform, is_sent
+        return None
+
+    def _lookup_ref(self, ver: CookieVersion, transform: str, flow: Flow, sent: bool) -> tuple[Ref, CookieLookup]:
+        """The step's ``_cookie(...)`` lookup of ``ver``'s identity (one per identity and scope URL)
+        and the Ref of the request value.  The scope URL is the request's own origin when the request
+        sent the cookie (the cookie that goes to this request), else the origin that set it (a cookie of
+        another host or path whose value the page copied, e.g. a CSRF token sent as a header to an API
+        host)."""
+        base = flow.request.url if sent or ver.flow is None else ver.flow.request.url
+        url = cookie_scope_url(base, ver.jar_path)
+        key = (ver.name, ver.domain, ver.jar_path, url)
+        lookup = self._lookups.get(key)
+        if lookup is None:
+            issued = self.flow_step.get(id(ver.flow)) if ver.origin == "server" and ver.flow is not None else None
+            lookup = CookieLookup(
+                var=unique_name(safe_identifier(ver.name, default="cookie"), self.taken),
+                name=ver.name, url=url, path=ver.jar_path, domain=ver.domain, note=describe_cookie(ver, issued),
+            )
+            self._lookups[key] = lookup
+            _note_traced(ver.value)
+        return self._transformed(lookup.var, transform), lookup
 
     @staticmethod
     def _adapt(ext: Extractor, value: str) -> Ref:
@@ -4336,10 +6632,17 @@ class _Builder:
         if sample == value.replace("/", "\\/"):
             escaped_slash = repr("\\/")  # outside the f-string: Python < 3.12 forbids backslashes in its expressions
             return Ref.expr(f"{var}.replace({escaped_slash}, '/')")
+        if sample.strip('"') == value:
+            return Ref.expr(f"{var}.strip('\"')")
+        if sample == value.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;"):
+            # the HTML-escaped spelling (``value_variants``) a regex read from markup: undo the escaping
+            undo = (("&quot;", '"'), ("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
+            return Ref.expr(var + "".join(f".replace({ent!r}, {ch!r})" for ent, ch in undo))
         return Ref.var(var)
 
     def _extractor_key(self, ext: Extractor) -> tuple:
-        return (ext.kind, ext.name, tuple(ext.path) if ext.path else None, ext.selector, ext.attr, ext.pattern)
+        return (ext.kind, ext.name, tuple(ext.path) if ext.path else None, ext.selector, ext.attr, ext.pattern,
+                ext.hop, ext.cookie_url, ext.cookie_path, ext.cookie_domain)
 
     def _register(self, built: _Built, ext: Extractor, cand: Candidate, flow: Flow, step_no: int,
                   note: Optional[str] = None) -> Extractor:
@@ -4354,6 +6657,7 @@ class _Builder:
         ext.note = f"used by {use}" + (f"; {note}" if note else "")
         built.extractors[key] = ext
         built.step.extractors.append(ext)
+        _note_traced(ext.sample)  # read afresh from now on: no context for later patterns
         return ext
 
     def _structural_only(self, value: str) -> bool:
@@ -4374,76 +6678,609 @@ class _Builder:
             return None
         return ext
 
-    def _trace(self, value: str, cand: Candidate, flow: Flow, step_no: int) -> Optional[Ref]:
-        """Search earlier steps' responses, latest first."""
-        route_segment = is_structural_path_segment(cand)
-        for built in reversed(self.built):
-            chain = built.unit.response_chain
-            if route_segment:
-                ext = self._accept(locate_value_kinds(value, chain[-1], _ROUTE_SEGMENT_KINDS), value, cand)
-            else:
-                ext = self._accept(locate_value(value, chain[-1]), value, cand)
-            note = None
-            if ext is None:
-                for k in range(len(chain) - 2, -1, -1):
-                    kinds = frozenset({"header", "url"}) if k == len(chain) - 2 else frozenset({"header"})
-                    if route_segment:
-                        kinds = kinds & _ROUTE_SEGMENT_KINDS
-                    ext = self._accept(locate_value_kinds(value, chain[k], kinds), value, cand)
-                    if ext is not None:
-                        if ext.kind == "header":
-                            note = f"from an intermediate redirect response ({chain[k].id}); check resp.history"
-                        break
-            if ext is None:
-                continue
-            ext = self._register(built, ext, cand, flow, step_no, note)
-            return self._adapt(ext, value)
+    def _snapshot_cookie(self, built: _Built, value: str, consumer: Flow) -> Optional[Extractor]:
+        """A cookie that the step's responses set to ``value`` but that the jar no longer holds when the
+        value is used (it was renewed or deleted in between): the script reads it right after that step
+        (``Extractor`` kind ``cookie``).  A cookie still held is the jar lookup's business."""
+        timeline = self.timeline
+        if timeline is None or (value.isdigit() and len(value) < 8):
+            return None
+        live = timeline.live_at(consumer)
+        for f in reversed(built.unit.all_flows):
+            for ver in reversed(timeline.stored_by(f)):
+                if self._cookie_transform(ver.value, value) is None or any(ver is v for v in live):
+                    continue
+                return Extractor(var="", kind="cookie", name=ver.name, sample=ver.value,
+                                 cookie_url=ver.scope_url(), cookie_path=ver.jar_path, cookie_domain=ver.domain)
         return None
 
-    def _resolve(self, cand: Candidate, unit: _Unit, step_no: int, cache: dict[tuple[str, bool], Ref]) -> Ref:
-        value = cand.value
-        secret_name = self._secret_field(cand.name)
-        # keyed by secrecy too: ``txtUserId=tanaka01&txtPassword=tanaka01`` must not hand the user
-        # id's literal to the password
-        cache_key = (value, secret_name)
-        if cache_key in cache:
-            return cache[cache_key]
-        flow = unit.first_flow
-        ref: Optional[Ref] = None
-        ts = looks_like_timestamp(value, around=flow.started_at)
-        if ts:
-            expr = "int(time.time()*1000)" if ts == "ms" else "int(time.time())"
-            ref = Ref.expr(expr if cand.numeric else f"str({expr})")
-        if ref is None:
-            hit = find_cookie(value, self.earlier_flows)
-            if hit:
-                ref = self._cookie_ref(hit[0], hit[1], value)
-        if ref is None:
-            ref = self._trace(value, cand, flow, step_no)
+    def _issued_by_redirect(self, value: str, cand: Candidate, flow: Flow, hop: Flow) -> bool:
+        """A route-like value that is a key by behaviour: the same path segment (not the request's last
+        one), ``;name=`` path parameter or query value (``?sid=<key>``) of ``hop``'s redirect ``Location``
+        (the login answers ``302 /s/<key>/menu``), in no request URL up to that redirect, and not spelled
+        like words (``_spelled_as_words``).  It may be read from that ``Location`` (or the final URL)
+        although route-like values are otherwise traced exactly."""
+        resp = hop.response
+        if (cand.location not in ("path", "path_param", "query") or resp is None or not resp.is_redirect
+                or self.timeline is None):
+            return False
+        try:
+            target = urljoin(hop.request.url, (resp.location or "").strip())
+            if cand.location == "query":
+                same = (cand.name, value) in parse_query(urlsplit(target).query)
+            else:
+                index = int(cand.name.split(";", 1)[0])
+                segments = _path_segments(target)
+                base, params = split_path_segment(segments[index]) if index < len(segments) else ("", [])
+                same = (base == value and index < len(_path_segments(flow.request.url)) - 1 if cand.location == "path"
+                        else (cand.name.split(";", 1)[1], value) in params)
+        except ValueError:
+            return False
+        if not same or _spelled_as_words(value):
+            return False
+        upto = self.timeline.position(hop)
+        return upto >= 0 and not any(value in f.request.url for f in self.timeline.flows[:upto + 1])
+
+    def _trace(self, value: str, cand: Candidate, flow: Flow, step_no: int) -> Optional[tuple[Ref, _Resolution]]:
+        """Search earlier steps, latest first.  Per step: a cookie its responses set that has been
+        renewed since (``_snapshot_cookie``), then its final response (every locator; a step that does
+        not follow redirects has no final URL to read), then its redirect responses latest first
+        (headers and ``Location``, read from that response of ``resp.history``; the last ``Location``
+        as the final URL).  Route-like values are traced only exactly (``_accept``; a route-like path
+        segment never through markup), unless a redirect handed them out (``_issued_by_redirect``): then
+        also from that ``Location`` / the final URL."""
         route_segment = is_structural_path_segment(cand)
-        if ref is None and len(self.value_units.get(value, ())) >= 2 and not route_segment:
-            # a repeated literal becomes a shared Constant - except route names in the path
-            # (``GET /Default.aspx`` then ``POST /Default.aspx``), which stay part of the URL
-            ref = self._constant(cand, value, flow, step_no)
-        if ref is None and value in self.const_by_value and not route_segment:
-            # the same value already has a Constant (e.g. AUTH_USERNAME from the Basic handshake)
-            ref = self._constant(cand, value, flow, step_no)
+        exact_only = self._structural_only(value)
+        for built in reversed(self.built):
+            chain = built.unit.response_chain
+            ext = self._snapshot_cookie(built, value, flow)
+            if ext is None:
+                if route_segment:
+                    kinds: Optional[frozenset] = _ROUTE_SEGMENT_KINDS
+                else:
+                    kinds = None if built.step.allow_redirects else _ALL_KINDS - {"url"}
+                ext = self._accept(locate_value_kinds(value, chain[-1], kinds), value, cand)
+                if ext is None and exact_only and self._issued_by_redirect(value, cand, flow, chain[-1]):
+                    ext = locate_value_kinds(value, chain[-1], frozenset({"location"}))  # a redirect not followed
+            if ext is None:
+                for k in range(len(chain) - 2, -1, -1):
+                    hop_kinds = {"header", "location"} | ({"url"} if k == len(chain) - 2 else set())
+                    if route_segment:
+                        hop_kinds &= _ROUTE_SEGMENT_KINDS
+                    ext = self._accept(locate_value_kinds(value, chain[k], frozenset(hop_kinds)), value, cand)
+                    if ext is None and exact_only and self._issued_by_redirect(value, cand, flow, chain[k]):
+                        # a key the redirect handed out: its Location, the last one as the final URL
+                        ext = locate_value_kinds(value, chain[k], frozenset({"location", "url"} if k == len(chain) - 2
+                                                                            else {"location"}))
+                    if ext is not None:
+                        if ext.kind == "header":
+                            ext.hop = k
+                        break
+            if ext is not None and ext.kind == "json" and not is_dynamic_looking(value):
+                ext = _unpicked_json(_view(chain[-1]), ext, cand.name, flow)  # one row of a list was chosen, not "row n"
+            if ext is None:
+                continue
+            ext = self._register(built, ext, cand, flow, step_no)
+            src_step = built.step.index
+            if ext.kind == "cookie":
+                res = _Resolution("D", source=f"ステップ {src_step} の直後に取得した {describe_extractor(ext)}",
+                                  source_step=src_step, source_kind="set-cookie", var=ext.var)
+            else:
+                res = _Resolution("C", source=f"ステップ {src_step} のレスポンス: {describe_extractor(ext)}",
+                                  source_step=src_step, source_kind=ext.kind, var=ext.var)
+            return self._adapt(ext, value), res
+        return None
+
+    def _in_loop_span(self, flow: Flow) -> bool:
+        """Does a (dropped) flow lie between the first and the last request of a folded loop?"""
+        pos = self.timeline.position(flow) if self.timeline is not None else -1
+        return any(first < pos < last for first, last in self.loop_spans)
+
+    def _find_dropped_producer(self, value: str, flow: Flow, cand: Candidate) -> None:
+        """A request the noise filter dropped (static file, tracker, 304) whose response carries
+        ``value``: build_plan puts it back as a step (``PlanOptions.include_producers``)."""
+        if self.timeline is None:
+            return
+        pos = self.timeline.position(flow)
+        for dropped_flow in reversed(self.dropped_flows):
+            if self.timeline.position(dropped_flow) >= pos or dropped_flow.response is None:
+                continue
+            if self._in_loop_span(dropped_flow):
+                continue  # putting it back would split the repeated requests of a loop
+            ext = locate_value(value, dropped_flow)
+            if ext is None or (ext.pattern and self._structural_only(value)):
+                continue
+            self.needed_producers.setdefault(dropped_flow.id, []).append(f"{cand.location} `{cand.name}`")
+            return
+
+    def _input_constant(self, cand: Candidate, value: str, flow: Flow, step_no: int, *, secret: bool, why: str,
+                        encoding: Optional[str] = None) -> tuple[Ref, _Resolution]:
+        """The 入力値 constant (class B) for a value the user typed or chose.  ``encoding``: the value was
+        sent in a legacy charset - the constant holds the text, and a request pair sent in that charset
+        sends its bytes (``_legacy_form_hint``; the Ref itself stays the plain constant, so a later JSON /
+        UTF-8 use gets the text).  A legacy value whose charset is unknown is held as the recorded bytes."""
+        raw = self._raw_fields.get((cand.location, cand.name, cand.value))
+        if encoding is None and raw is not None and not is_utf8(raw):
+            if cand.location == "form" and _encodes_to(value, self._raw_charset, raw):
+                encoding = self._raw_charset
+            else:
+                value = raw
+        ref = self._constant(cand, value, flow, step_no, force_secret=secret, kind="input")
+        const = next((c for c in self.constants if c.name == ref.value), None)
+        if const is not None:
+            if secret:
+                const.sensitive = True
+            if encoding and not const.secret:
+                const.encoding = encoding
+        meta = _Resolution("B", source=f"入力値 {ref.value}（{why}）", source_kind="input", var=ref.value)
+        if not secret and isinstance(value, str):
+            # a password is never the source of another field that happens to hold the same text
+            holders = self.input_refs.setdefault(value, [])
+            if (cand.name, ref) not in holders:
+                holders.append((cand.name, ref))
+        self.input_fields[_field_key(cand.location, cand.name)] = (cand.value, ref, step_no, meta)
+        return ref, meta
+
+    def _holds(self, ref: Ref, location: str, name: str, value: str) -> bool:
+        """Is a recorded value the text of the 入力値 behind ``ref``: that text sent as UTF-8 (or in a JSON
+        body), or the bytes it gives in the 入力値's legacy charset (typed on a Shift_JIS page)?"""
+        const = next((c for c in self.constants if c.name == _ref_name(ref)), None)
+        if const is None or const.secret or not isinstance(const.value, str):
+            return False
+        raw = self._raw_fields.get((location, name, value))
+        if raw is None or is_utf8(raw):
+            return const.value == value
+        return _encodes_to(const.value, const.encoding, raw)
+
+    def _typed_elsewhere(self, cand: Candidate, value: str) -> Optional[Ref]:
+        """The 入力値 of another field that an untraced value repeats (the page's script sends a typed value
+        again: an XHR JSON body, a query it builds): the one field named like this one that holds it
+        (``dateFrom`` / ``txtDateFrom``, dates and numbers too), else the first field that holds it when the
+        value is too long to match by coincidence (6 bytes or more in UTF-8 - ``山田`` but not ``12`` or
+        ``abc`` - and not a number, a date or a token).  Fields typed with the same short value (``txtFrom``
+        / ``txtTo`` of a one-day range) and a typed quantity and an order id stay apart."""
+        raw = self._raw_fields.get((cand.location, cand.name, value))
+        if raw is None or is_utf8(raw):
+            text: Optional[str] = value
+        else:  # sent in a legacy charset: the text of an 入力値 that gives these bytes
+            text = next((c.value for c in self.constants
+                         if c.kind == "input" and c.encoding and _encodes_to(c.value, c.encoding, raw)), None)
+        holders = [(n, r) for n, r in self.input_refs.get(text, []) if self._holds(r, cand.location, cand.name, value)] if text else []
+        if not holders:
+            return None
+        own = "" if cand.location in ("path", "path_param") else str(cand.name)
+        if cand.location == "json":
+            own = own.rsplit(".", 1)[-1].split("[", 1)[0]  # the last key (``cond.dateFrom`` -> ``dateFrom``)
+        alike = list(dict.fromkeys(r for n, r in holders if own and _names_alike(own, n)))
+        if len(alike) == 1:
+            return alike[0]
+        if (len(text.encode("utf-8")) >= 6 and not text.isdigit() and not _DATE_RE.match(text)
+                and not is_dynamic_looking(text)):
+            return holders[0][1]
+        return None
+
+    def _note_use(self, ref: Ref, cand: Candidate, step_no: int) -> None:
+        """Record that a step reuses an 入力値 constant (its comment lists the uses)."""
+        uses = self.const_uses.get(_ref_name(ref))
+        if uses is not None:
+            uses.append(f"step {step_no} ({cand.location} `{cand.name}`)")
+
+    # ------------------------------------------------------------------ field-level decisions (forms)
+
+    def _field_text(self, location: str, name: str, value: str,
+                    match: "_FormMatch") -> Optional[tuple[str, Optional[str]]]:
+        """``(text, encoding)`` of a submitted form value, decided by its recorded bytes: bytes that are
+        UTF-8 are the text as sent (a typed ``%AB%`` stays ``%AB%``, ``encoding`` None); other bytes were
+        sent in a legacy charset (IE on a Shift_JIS page) and stand for their text in the charset the
+        request declares, else the page's (``encoding``).  None when no charset gives back those bytes."""
+        raw = self._raw_fields.get((location, name, value))
+        if raw is None or is_utf8(raw):
+            return value, None
+        for charset in (self._raw_charset if location == "form" else None, match.charset):
+            text = _legacy_text(raw, charset)
+            if text is not None:
+                return text, charset
+        return None
+
+    def _referer_charset(self, req: RecordedRequest) -> Optional[str]:
+        """The charset of the page the request's ``Referer`` names (the page its link / form was on)."""
+        referer = req.header("referer")
+        for built in reversed(self.built):
+            page = built.unit.response_chain[-1]
+            if page.response is not None and _same_page(page.request.url, referer):
+                return detect_charset(page.response.body or b"", page.response.header("content-type"))
+        return None
+
+    @staticmethod
+    def _is_default(fld: FormField, text: str) -> bool:
+        """Does the submitted text equal what the form sends untouched (browser rules: a textarea loses
+        one leading line break and sends CRLF)?"""
+        for default in fld.defaults:
+            if fld.control == "textarea":
+                default = default[1:] if default.startswith("\n") else default
+                if default.replace("\r\n", "\n") == text.replace("\r\n", "\n"):
+                    return True
+            elif default == text:
+                return True
+        return False
+
+    def _seen_in_responses(self, value: str) -> bool:
+        for built in self.built:
+            view = _view(built.unit.response_chain[-1])
+            if view.textual and value in view.text:
+                return True
+        return False
+
+    def _script_source(self, cand: Candidate, value: str, flow: Flow, step_no: int,
+                       match: "_FormMatch") -> Optional[tuple[Ref, _Resolution]]:
+        """A source of the value the page's script wrote into the field (it was not typed), latest first:
+        a response between the form page and this request that holds it exactly (an XHR, a popup; never
+        one row of a JSON list - a choice), a text response (text/plain, UpdatePanel delta, JavaScript,
+        a bare value) that is the value or names the field next to it, else the form page itself when its
+        scripts write the field (by its name or id: a literal, a variable, a hidden input / a label they
+        copy).  A response to a request that sent the value itself (a check of a typed code) only echoes
+        it."""
+        page = _view(match.built.unit.response_chain[-1])
+        tag = _form_tag(page, match.form)
+        named = page.index.attr_index.get(cand.name, []) if tag is not None and page.index is not None else []
+        ids = [el.get("id") for el, attr in named if attr == "name" and any(p is tag for p in el.parents)]
+        anchors = [a for a in dict.fromkeys([cand.name] + ids) if isinstance(a, str) and len(a) >= _MIN_ANCHOR_LEN]
+        found: Optional[tuple[_Built, Extractor]] = None
+        for built in reversed([b for b in self.built if b.step.index > match.built.step.index]):
+            source = built.unit.response_chain[-1]
+            ext = locate_value_kinds(value, source, _EXACT_KINDS)
+            if ext is not None and ext.kind == "json" and not is_dynamic_looking(value):
+                ext = _unpicked_json(_view(source), ext, cand.name, flow)  # a row chosen from a list (B), not "row n"
+            if ext is None or ext.pattern:
+                ext = _text_body_source(_view(source), value, anchors)
+            elif value.isdigit() and not _names_related(ext.name or ext.attr or json_dotted(list(ext.path or [])),
+                                                        cand.name):
+                ext = None  # a bare number equals many things: only a source named like the field
+            if ext is not None and any(c.value == value for c in request_params(built.unit.response_chain[0])):
+                ext = None  # an echo of what the request sent (a check of a typed code)
+            if ext is not None:
+                found = (built, ext)
+                break
+        if found is None:
+            ext = _page_script_source(page, value, anchors)
+            if ext is None:
+                return None
+            found = (match.built, ext)
+        built, ext = found
+        ext = self._register(built, ext, cand, flow, step_no)
+        src = built.step.index
+        return self._adapt(ext, value), _Resolution(
+            "C", source=f"ステップ {src} のレスポンス: {describe_extractor(ext)}（画面のスクリプトが入力欄に入れた値）",
+            source_step=src, source_kind=ext.kind, var=ext.var)
+
+    @staticmethod
+    def _own_input(match: "_FormMatch", name: str, value: str) -> Optional[Extractor]:
+        """How to read a field's own default from its page: ``<input name=..>`` when the page's first
+        input of that name holds it, else that input of the submitted form (``_form_input_selector``);
+        None when neither is safe (another input of that name in the same form holds it)."""
+        view = _view(match.built.unit.response_chain[-1])
+        named = view.index.attr_index.get(name, []) if view.index is not None else []
+        first = next((el for el, attr in named if attr == "name" and el.name == "input"), None)
+        if first is not None and first.get("value") == value:
+            return Extractor(var="", kind="html_input", name=name, sample=value)
+        selector = _form_input_selector(view, match.form, name, value)
+        return Extractor(var="", kind="html_attr", selector=selector, attr="value", sample=value) if selector else None
+
+    def _field_decision(self, cand: Candidate, value: str, flow: Flow, step_no: int,
+                        match: Optional["_FormMatch"]) -> Optional[tuple[Ref, _Resolution]]:
+        """Decisions that belong to one form field, never shared with other fields through the cache:
+
+        1. the same field was user input in an earlier step with this value -> the same 入力値 (B);
+        2. the value is the field's own default on the form page (an ``<input>``) -> read it from that
+           input of the submitted form (C) - the server filled it in (a date, a remembered id), so it is
+           fetched again (``_own_input``); but a form of one row of a list (``_row_forms``) holds the row
+           the user chose -> the recorded value (A);
+        3. an editable field the page's script filled in (``_script_source``: an XHR / popup response,
+           a text response naming the field, the page's own scripts) -> that response (C);
+        4. a visible editable control the user changed (typed, chose, a password) -> 入力値 (B)."""
+        if cand.location not in ("form", "multipart", "query", "json"):
+            return None
+        prev = self.input_fields.get(_field_key(cand.location, cand.name))
+        if (prev is not None and (prev[0] == value or self._holds(prev[1], cand.location, cand.name, value))
+                and prev[2] < step_no and not is_dynamic_looking(value)):
+            meta = replace(prev[3], source=prev[3].source.split("（", 1)[0] + "（前の手順で同じ欄に入力した値）")
+            self._note_use(prev[1], cand, step_no)
+            return prev[1], meta
+        if match is None or cand.location == "json":
+            return None
+        fld = match.form.fields.get(cand.name)
+        if fld is None:
+            return None
+        text, encoding = self._field_text(cand.location, cand.name, value, match) or (None, None)
+        if text is None:
+            return None  # a legacy-charset value of unknown charset: keep the recorded bytes
+        if self._is_default(fld, text):
+            if fld.control in ("text", "hidden", "password") and text == value and is_candidate_value(value, self.opts):
+                if not is_dynamic_looking(value) and _row_forms(_view(match.built.unit.response_chain[-1]), match.form,
+                                                                 cand.name, value):
+                    return Ref.lit(value), _Resolution("A", source="記録時の値（一覧の行ごとのフォームで選んだ行）",
+                                                       source_kind="literal")
+                own = self._own_input(match, cand.name, value)
+                if own is not None:  # else traced like any other value (``_resolve``)
+                    ext = self._register(match.built, own, cand, flow, step_no)
+                    src = match.built.step.index
+                    return self._adapt(ext, value), _Resolution(
+                        "C", source=f"ステップ {src} のレスポンス: {describe_extractor(ext)}（画面にあらかじめ入っていた値）",
+                        source_step=src, source_kind=ext.kind, var=ext.var)
+            return None
+        if not fld.editable:
+            return None
+        hit = self._script_source(cand, value, flow, step_no, match)
+        if hit is not None:
+            return hit
+        password = fld.control == "password"
+        if password or not is_dynamic_looking(text) or not self._seen_in_responses(value):
+            label = {"password": "パスワード欄", "select": "選択欄", "radio": "選択ボタン", "checkbox": "チェックボックス"}.get(
+                fld.control, "入力欄")
+            return self._input_constant(cand, text, flow, step_no, secret=password,
+                                        why=f"画面の{label} {cand.name} に入力・選択した値",
+                                        encoding=encoding)
+        return None
+
+    # ------------------------------------------------------------------ value resolution
+
+    def _resolve(self, cand: Candidate, unit: _Unit, step_no: int, cache: dict, form: Optional["_FormMatch"] = None,
+                 exclude: Optional[CookieVersion] = None) -> Ref:
+        value = cand.value
+        flow = unit.first_flow
+        decided = self._field_decision(cand, value, flow, step_no, form)
+        if decided is not None:
+            self._last_meta = decided[1]
+            return decided[0]
+        secret_name = self._secret_field(cand.name)
+        credential = looks_like_secret_name(cand.name) or _looks_like_password_name(cand.name)
+        fld = form.form.fields.get(cand.name) if form is not None and cand.location in ("form", "multipart", "query") else None
+        # keyed by secrecy too: ``txtUserId=tanaka01&txtPassword=tanaka01`` must not hand the user
+        # id's literal to the password; and by the field (the cookie guard compares names)
+        cache_key = (value, secret_name, credential, cand.location == "cookie", cand.name)
+        if cache_key in cache:
+            self._last_meta = self._meta.get(cache_key) or _Resolution("A")
+            return cache[cache_key]
+        ref: Optional[Ref] = None
+        meta = _Resolution("A", source="記録時の値", source_kind="literal")
+        route_segment = is_structural_path_segment(cand)
+        is_cookie = cand.location == "cookie"
+        # sent in a legacy charset (a Shift_JIS page): never a shared constant, its pair sends the bytes
+        legacy = not is_utf8(self._raw_fields.get((cand.location, cand.name, value), b""))
+        # a cookie the browser held when the request was sent (read from the jar by identity)
+        hit = self._cookie_source(value, flow, exclude, cand.name)
+        if hit is not None:
+            ver, transform, sent = hit
+            ref, lookup = self._lookup_ref(ver, transform, flow, sent)
+            issued = self.flow_step.get(id(ver.flow)) if ver.origin == "server" and ver.flow is not None else None
+            meta = _Resolution("D", source=lookup.note, source_step=issued, source_kind="cookie-jar",
+                               var=lookup.var, cookie=ver)
+        # an earlier response
+        if ref is None:
+            hit2 = self._trace(value, cand, flow, step_no)
+            if hit2 is not None:
+                ref, meta = hit2
+        # a request the noise filter dropped may hold it (build_plan then keeps that request)
+        epoch = looks_like_timestamp(value, around=flow.started_at)
+        if ref is None and self.opts.include_producers and (is_dynamic_looking(value) or epoch):
+            self._find_dropped_producer(value, flow, cand)
+        # the clock: a cache-buster / client timestamp nothing else explains
+        if ref is None and epoch:
+            expr = "int(time.time()*1000)" if epoch == "ms" else "int(time.time())"
+            ref = Ref.expr(expr if cand.numeric else f"str({expr})")
+            meta = _Resolution("E", source="実行時の時刻（ミリ秒）" if epoch == "ms" else "実行時の時刻（秒）", source_kind="time")
+        # a value the user typed into another field earlier (one named like it, else a long text)
+        typed = self._typed_elsewhere(cand, value) if ref is None and not is_cookie and not credential else None
+        if typed is not None:
+            ref = typed
+            meta = _Resolution("B", source=f"入力値 {_ref_name(ref)}（前の手順で入力した値）", source_kind="input",
+                               var=_ref_name(ref))
+            self._note_use(ref, cand, step_no)
+        # a credential-like field (a password sent by a scripted / JSON login), never a hidden one
+        if (ref is None and not is_cookie and value and credential and not (fld is not None and fld.control == "hidden")
+                and (not is_dynamic_looking(value) or _PASSWORD_NAME_RE.search(cand.name))):
+            ref, meta = self._input_constant(cand, value, flow, step_no, secret=True, why="パスワードなどの値")
+        # a visible input the user changed whose (token-like) value no response explains: typed / scanned
+        if ref is None and fld is not None and fld.editable and is_dynamic_looking(value):
+            text, encoding = self._field_text(cand.location, cand.name, value, form) or (None, None)
+            if text is not None and not self._is_default(fld, text):
+                ref, meta = self._input_constant(cand, text, flow, step_no, secret=fld.control == "password",
+                                                 why=f"画面の入力欄 {cand.name} に入力した値",
+                                                 encoding=encoding)
+        # --redact: a field whose name looks like a credential is read from the environment
         if ref is None and secret_name:
-            ref = self._constant(cand, value, flow, step_no, force_secret=True)
+            ref, meta = self._input_constant(cand, value, flow, step_no, secret=True, why="パスワードなどの値")
+        # a value several steps send: one shared constant (route names in the path stay in the URL)
+        if ref is None and not is_cookie and len(self.value_units.get(value, ())) >= 2 and not route_segment and not legacy:
+            ref = self._constant(cand, value, flow, step_no)
+            meta = _Resolution("A", source=f"定数 {ref.value}（複数の手順で同じ値）", source_kind="constant", var=ref.value)
+            if is_dynamic_looking(value) and not credential:
+                meta.note = "dynamic"
+                self._warn_untraced(cand, step_no)
+        # the value already has a constant (e.g. AUTH_USERNAME from the Basic handshake)
+        if ref is None and not is_cookie and value in self.const_by_value and not route_segment and not legacy:
+            ref = self._constant(cand, value, flow, step_no)
+            const = self.const_by_value[value]
+            meta = _Resolution("B" if const.kind in ("input", "auth") else "A", source=f"定数 {ref.value}",
+                               source_kind="constant", var=ref.value)
+        # the recorded literal
         if ref is None:
             # a password written into the script as recorded (no redaction) is meant to be replayed
             # as it is: no "looks dynamic" warning for it
-            if is_dynamic_looking(value) and not looks_like_secret_name(cand.name):
-                label = f"path segment {cand.name}" if cand.location == "path" else cand.name
-                self.warnings.append(
-                    f"step {step_no}: value of `{label}` looks dynamic but could not be traced to any earlier "
-                    f"response; replaying the recorded literal may fail"
-                )
+            if is_dynamic_looking(value) and not credential:
+                meta.note = "dynamic"
+                self._warn_untraced(cand, step_no)
             ref = Ref.lit(value)
         cache[cache_key] = ref
+        self._meta[cache_key] = meta
+        self._last_meta = meta
         return ref
 
+    def _short_field_ref(self, location: str, name: str, value: str, flow: Flow, step_no: int,
+                         match: Optional["_FormMatch"]) -> Optional[Ref]:
+        """A form field too short / word-like to be a trace candidate (``tanaka``, ``01``): still user
+        input when it is a visible control the user changed (the 入力値 section lists every input)."""
+        if location not in ("form", "multipart", "query") or not value:
+            return None
+        cand = Candidate(location, name, value)
+        prev = self.input_fields.get(_field_key(location, name))
+        if prev is not None and (prev[0] == value or self._holds(prev[1], location, name, value)) and prev[2] < step_no:
+            self._short_metas[(location, name, value)] = prev[3]
+            self._note_use(prev[1], cand, step_no)
+            return prev[1]
+        if match is None:
+            return None
+        fld = match.form.fields.get(name)
+        if fld is None or not fld.editable:
+            return None
+        text, encoding = self._field_text(location, name, value, match) or (None, None)
+        if text is None or self._is_default(fld, text):
+            return None
+        label = {"password": "パスワード欄", "select": "選択欄", "radio": "選択ボタン", "checkbox": "チェックボックス"}.get(
+            fld.control, "入力欄")
+        ref, meta = self._input_constant(cand, text, flow, step_no, secret=fld.control == "password",
+                                         why=f"画面の{label} {name} に入力・選択した値",
+                                         encoding=encoding)
+        self._short_metas[(location, name, value)] = meta
+        return ref
+
+    def _warn_untraced(self, cand: Candidate, step_no: int) -> None:
+        if cand.value in self._warned_values:
+            return  # one warning per value, at its first step
+        self._warned_values.add(cand.value)
+        if cand.location == "path":
+            label = f"path segment {cand.name}"
+        elif cand.location == "path_param":
+            label = ";" + cand.name.split(";", 1)[-1]
+        elif cand.location == "cookie":
+            label = f"Cookie {cand.name}"
+        else:
+            label = cand.name
+        text = (f"step {step_no}: value of `{label}` looks dynamic but could not be traced to any earlier "
+                f"response; replaying the recorded literal may fail")
+        if text not in self.warnings:
+            self.warnings.append(text)
+
     # ------------------------------------------------------------------ step construction
+
+    def _submitted_form(self, flow: Flow) -> Optional[_FormMatch]:
+        """The HTML form of an earlier page that this request submits.
+
+        Candidates are the forms of the earlier pages (final responses, latest first) with the request's
+        method that hold at least 60 % of the submitted field names.  Preferred, in this order: a form
+        of the page the request's ``Referer`` names (IE sends it with every submission, script-driven
+        ones and posts from a popup to its opener included); a form whose action (resolved against its
+        page, path parameters ignored) is the request URL; a form holding at least 80 % of the fields and
+        one of them visible (a script changed the action)."""
+        req = flow.request
+        kind, parsed = classify_body(req)
+        if kind == "form":
+            names = {name for name, _value in parsed}
+        elif kind == "multipart":
+            names = {fld.name for fld in parsed}
+        elif (req.method or "").upper() == "GET":
+            names = {name for name, _value in parse_query(req.query)}
+        else:
+            names = set()
+        if not names:
+            return None
+        method = (req.method or "GET").upper()
+        target = _form_target(req.url)
+        referer = req.header("referer")
+        by_referer = by_action = loose = None
+        for built in reversed(self.built):
+            page = built.unit.response_chain[-1]
+            view = _view(page)
+            index = view.index if view.is_htmlish else None
+            if index is None:
+                continue
+            charset = detect_charset(page.response.body or b"", page.response.header("content-type")) if page.response else "utf-8"
+            for form in index.forms:
+                if form.method != method:
+                    continue
+                shared = names & set(form.fields)
+                if not shared or len(shared) * 5 < len(names) * 3:
+                    continue
+                match = _FormMatch(form=form, built=built, charset=charset)
+                if by_referer is None and _same_page(page.request.url, referer):
+                    by_referer = match
+                try:
+                    action = urljoin(page.request.url, form.action or page.request.url)
+                except ValueError:
+                    action = ""
+                if by_action is None and _form_target(action) == target:
+                    by_action = match
+                visible = any(form.fields[n].control not in ("hidden", "button") for n in shared)
+                if loose is None and visible and len(shared) * 5 >= len(names) * 4:
+                    loose = match
+            if by_referer is not None:
+                break
+        return by_referer or by_action or loose
+
+    def _cookie_bindings(self, unit: _Unit, step_no: int, cache: dict) -> tuple[list[CookieSet], list[Binding]]:
+        """The cookies this step's requests send that the script's jar would not hold by itself: those
+        the page's script wrote (or the browser had before the recording) and those set by a response
+        the script does not replay.  Returns the cookies to set before the request and the bindings
+        (a server cookie is listed once, at its first use)."""
+        sets: list[CookieSet] = []
+        bindings: list[Binding] = []
+        timeline = self.timeline
+        if timeline is None:
+            return sets, bindings
+        for f in unit.all_flows:
+            for name, value, ver in timeline.sent_with(f):
+                if ver.origin == "server" and ver.flow is not None and id(ver.flow) in self.kept_ids:
+                    if id(ver) not in self.cookie_first_use:
+                        self.cookie_first_use.add(id(ver))
+                        issued = self.flow_step.get(id(ver.flow))
+                        bindings.append(Binding(
+                            location="cookie", name=name, value_class="D",
+                            source=describe_cookie(ver, issued) + "。requests.Session が自動で送ります",
+                            source_step=issued, source_kind="set-cookie", cookie=name,
+                            cookie_domain=ver.domain, cookie_path=ver.jar_path,
+                        ))
+                    continue
+                if id(ver) in self.external_done:
+                    continue
+                self.external_done.add(id(ver))
+                if ver.origin == "server":
+                    # set by a response the script does not replay (a dropped request)
+                    if ver.previous is not None:
+                        # a later value of a cookie the script's jar already holds (a load balancer
+                        # refreshing it on an image): the jar keeps whatever the server gives it
+                        continue
+                    if ver.flow is not None and not self._in_loop_span(ver.flow):
+                        self.needed_producers.setdefault(ver.flow.id, []).append(f"Cookie `{name}`")
+                    url, domain = timeline.script_scope(ver, f.request.url)
+                    sets.append(CookieSet(name=name, url=url, value=Ref.lit(value), path=ver.jar_path, domain=domain,
+                                          note="除外したリクエストのレスポンスが設定した Cookie（記録時の値）"))
+                    bindings.append(Binding(location="cookie", name=name, value_class="A",
+                                            source="除外したリクエストが設定した Cookie（記録時の値）", source_kind="literal",
+                                            cookie=name, cookie_domain=ver.domain, cookie_path=ver.jar_path))
+                    continue
+                cand = Candidate("cookie", name, value)
+                if is_candidate_value(value, self.opts):
+                    ref = self._resolve(cand, unit, step_no, cache, None, exclude=ver)
+                    meta = self._last_meta
+                else:
+                    # a short / word-like value (``lang=ja``) is never traced: it would match by coincidence
+                    ref, meta = Ref.lit(value), _Resolution("A", source="記録時の値", source_kind="literal")
+                if ref.is_literal and ver.external_kind == "pre-existing":
+                    self.initial_cookies.append(initial_cookie_for(ver, f, timeline))
+                    bindings.append(Binding(location="cookie", name=name, value_class="A",
+                                            source="記録を始める前からあった Cookie（INITIAL_COOKIES に記録時の値）",
+                                            source_kind="initial-cookie", cookie=name, cookie_domain=ver.domain,
+                                            cookie_path=ver.jar_path))
+                    continue
+                how = "画面のスクリプトが設定した Cookie" if ver.external_kind == "script" else "記録前からあった Cookie"
+                url, domain = timeline.script_scope(ver, f.request.url)
+                sets.append(CookieSet(name=name, url=url, value=ref, path=ver.jar_path, domain=domain,
+                                      note=f"{how}。値: {meta.source}" if meta.value_class != "A" else f"{how}（記録時の値）"))
+                bindings.append(Binding(location="cookie", name=name, value_class=meta.value_class,
+                                        source=f"{how}。値: {meta.source}", source_step=meta.source_step,
+                                        source_kind=meta.source_kind, var=meta.var, cookie=name,
+                                        cookie_domain=ver.domain, cookie_path=ver.jar_path, note=meta.note))
+        return sets, bindings
 
     def _build_step(self, unit: _Unit, index: int) -> Step:
         flow = unit.first_flow
@@ -4451,27 +7288,60 @@ class _Builder:
         last = unit.last_flow
         resp = last.response
         step_no = index
+        self._lookups = {}
+        self._meta = {}
+        self._short_metas = {}
+        self._raw_charset = request_form_charset(req)
+        self._raw_fields = {}
+        for location in ("query", "form", "multipart"):
+            for name, value, raw in recorded_fields(req, location):
+                self._raw_fields.setdefault((location, name, value), raw)
         cands = find_candidates(flow, self.opts)
+        form_info = self._submitted_form(flow)
         loop: Optional[Loop] = None
         loop_key: Optional[tuple[str, str, int]] = None
         loop_first_value: Optional[tuple[str, str, str]] = None
+        loop_ref: Optional[Ref] = None
         if unit.loop is not None:
             lg = unit.loop
             var = self._loop_var(lg, flow)
-            loop = Loop(var=var, values=list(lg.values), numeric_range=lg.numeric_range,
-                        note=f"{len(lg.groups)} iterations of {lg.location} `{lg.name}`: {truncate(', '.join(lg.values), 60)}")
+            values: list = list(lg.values)
+            loop_ref = Ref.var(var)
+            raws = [_field_bytes(g[0].request, lg.location, lg.name, lg.occurrence) for g in lg.groups]
+            if raws and all(r is not None for r in raws) and not all(is_utf8(r) for r in raws):
+                # sent in a legacy charset (a Shift_JIS page): the loop goes over the texts and sends each one
+                # in that charset, or over the recorded bytes when no known charset gives them back exactly
+                values = raws
+                for charset in (self._raw_charset if lg.location == "form" else None,
+                                form_info.charset if form_info is not None else None, self._referer_charset(req)):
+                    texts = [_legacy_text(r, charset) for r in raws]
+                    if all(t is not None for t in texts):
+                        values, loop_ref = texts, Ref.expr(f"{var}.encode({charset!r})")
+                        break
+            shown = ", ".join(_constant_display(v) for v in values)
+            loop = Loop(var=var, values=values, numeric_range=lg.numeric_range,
+                        note=f"{len(lg.groups)} iterations of {lg.location} `{lg.name}`: {truncate(shown, 60)}")
             loop_key = (lg.location, lg.name, lg.occurrence)
             loop_first_value = (lg.location, lg.name, lg.values[0] if lg.values else "")
 
         refs: dict[tuple[str, str, str], Ref] = {}
+        metas: dict[tuple[str, str, str], _Resolution] = {}
         cand_by_key: dict[tuple[str, str, str], Candidate] = {}
-        cache: dict[tuple[str, bool], Ref] = {}
+        cache: dict[tuple, Ref] = {}
+        # fields too short to be trace candidates that the user typed (a login id): decided first, in the
+        # order of the request, so the 入力値 section lists them in the form's order
+        short_refs: dict[tuple[str, str, str], Optional[Ref]] = {}
+        cand_keys = {(c.location, c.name, c.value) for c in cands}
+        for key in _submitted_fields(req):
+            if key not in cand_keys and key not in short_refs:
+                short_refs[key] = self._short_field_ref(*key, flow, step_no, form_info)
         for cand in cands:
             key = (cand.location, cand.name, cand.value)
             cand_by_key.setdefault(key, cand)
             if key in refs or key == loop_first_value:
                 continue
-            refs[key] = self._resolve(cand, unit, step_no, cache)
+            refs[key] = self._resolve(cand, unit, step_no, cache, form_info)
+            metas[key] = self._last_meta
 
         counters: dict[tuple[str, str], int] = {}
         secret_refs: dict[tuple[str, str, str], Optional[Ref]] = {}
@@ -4488,33 +7358,60 @@ class _Builder:
             occ = counters.get((location, name), 0)
             counters[(location, name)] = occ + 1
             if loop is not None and loop_key == (location, name, occ):
-                return Ref.var(loop.var)
+                return loop_ref or Ref.var(loop.var)
             ref = refs.get((location, name, value))
             if ref is None:
-                ref = secret_ref(location, name, value) or Ref.lit(value)
+                ref = secret_ref(location, name, value) or short_refs.get((location, name, value)) or Ref.lit(value)
             return ref
 
-        # URL pieces (path segments may be dynamic)
+        # URL pieces: path segments and their ``;name=value`` parameters may be dynamic
         parts = urlsplit(req.url)
         segments = _path_segments(req.url)
         url: list[Ref] = []
         buf = f"{parts.scheme}://{parts.netloc}"
         dynamic_segments: set[int] = set()
+
+        def emit(piece: Ref) -> None:
+            nonlocal buf
+            if piece.is_literal:
+                buf += piece.value
+                return
+            if buf:
+                url.append(Ref.lit(buf))
+            url.append(piece)
+            buf = ""
+
         for i, seg in enumerate(segments):
             buf += "/"
-            ref = ref_for("path", str(i), seg) if seg else Ref.lit(seg)
-            if ref.is_literal:
-                buf += ref.value
-            else:
-                dynamic_segments.add(i)
-                if buf:
-                    url.append(Ref.lit(buf))
-                url.append(ref)
-                buf = ""
+            if not seg:
+                continue
+            base, seg_params = split_path_segment(seg)
+            if base:
+                piece = ref_for("path", str(i), base)
+                if not piece.is_literal:
+                    dynamic_segments.add(i)
+                emit(piece)
+            for pname, pvalue in seg_params:
+                emit(Ref.lit(";" + pname + ("=" if pvalue is not None else "")))
+                if pvalue:
+                    emit(ref_for("path_param", f"{i};{pname}", pvalue))
         if buf or not url:
             url.append(Ref.lit(buf))
 
-        params = [(name, ref_for("query", name, value)) for name, value in parse_query(req.query)]
+        raw_query = query_bytes(req.query)
+        params = [(name, ref_for("query", name, value)) for name, value in parse_form_bytes(raw_query)]
+        keep = {loop.var} if loop is not None else set()
+        if raw_query and not form_body_is_utf8(raw_query):
+            # a query a Shift_JIS page sent (``?q=%93%FA%96%7B``): its values are sent as those bytes
+            params, kept = self._legacy_form_hint(raw_query, params, keep=keep)
+            if kept:
+                self.warnings.append(
+                    f"step {step_no}: URL のクエリが UTF-8 以外の文字コード（Shift_JIS など）でパーセントエンコードされているため、"
+                    f"{_field_list(kept)} は記録時のバイト列のまま送信します"
+                )
+        # values an old page script built with escape() (``%uXXXX``): sent in the referring page's charset
+        js_charset = self._referer_charset(req) or (form_info.charset if form_info is not None else None)
+        params, escaped = self._escaped_hint(raw_query, params, js_charset)
 
         # body
         body_kind, parsed = classify_body(req)
@@ -4528,18 +7425,22 @@ class _Builder:
                 # Content-Type.  ``form`` stays filled in as the field list: literal pairs plus
                 # bytes literals for the legacy values, so codegen rebuilds the body with fresh
                 # dynamic values (``__VIEWSTATE`` ...) while the legacy bytes stay byte-exact.
-                dynamic = [name for name, ref in form if not ref.is_literal]
-                form = self._legacy_form_hint(req.body, form)
+                constant_names = {c.name for c in self.constants} | keep
+                dynamic = [name for name, ref in form if not ref.is_literal and _ref_name(ref) not in constant_names]
+                form, kept = self._legacy_form_hint(req.body, form, request_form_charset(req), keep)
                 raw_body = req.body
                 body_kind = "raw"
                 note = ""
                 if dynamic:
                     listed = ", ".join(dynamic[:4]) + (" …" if len(dynamic) > 4 else "")
                     note = f"（{listed} は前のステップのレスポンスから取得した値に差し替えます）"
-                self.warnings.append(
-                    f"step {step_no}: フォーム本文が UTF-8 以外の文字コード（Shift_JIS など）でパーセントエンコードされているため、"
-                    f"日本語などの値は記録時のバイト列のまま、Content-Type も記録どおりに送信します{note}"
-                )
+                if kept:
+                    self.warnings.append(
+                        f"step {step_no}: フォーム本文が UTF-8 以外の文字コード（Shift_JIS など）でパーセントエンコードされているため、"
+                        f"{_field_list(kept)} は記録時のバイト列のまま、Content-Type も記録どおりに送信します{note}"
+                    )
+            form, escaped_form = self._escaped_hint(req.body, form, js_charset)
+            escaped += escaped_form
         elif body_kind == "json":
             json_body = self._substitute_json(parsed, [], ref_for)
         elif body_kind == "multipart":
@@ -4550,8 +7451,27 @@ class _Builder:
                                                    content_type=fld.content_type, content=fld.content))
                 else:
                     multipart.append(MultipartPart(name=fld.name, value=ref_for("multipart", fld.name, fld.text())))
+            text_parts = [(part, fld.content) for part, fld in zip(multipart, parsed) if not fld.is_file]
+            if not all(is_utf8(raw) for _part, raw in text_parts):
+                # text parts IE sent in the page's charset (raw cp932 bytes, not percent-encoded): an 入力値 is
+                # sent in that charset, anything else as the recorded bytes
+                sent, kept = self._legacy_form_hint(None, [(p.name, p.value) for p, _raw in text_parts], keep=keep,
+                                                    raws=[raw for _part, raw in text_parts])
+                for (part, _raw), (_name, ref) in zip(text_parts, sent):
+                    part.value = ref
+                if kept:
+                    self.warnings.append(
+                        f"step {step_no}: multipart の本文が UTF-8 以外の文字コード（Shift_JIS など）で送られているため、"
+                        f"{_field_list(kept)} は記録時のバイト列のまま送信します"
+                    )
         elif body_kind == "raw":
             raw_body = req.body
+        if escaped:
+            how = f"画面の文字コード（{js_charset}）" if js_charset and js_charset != "utf-8" else "UTF-8"
+            self.warnings.append(
+                f"step {step_no}: {_field_list(escaped)} は画面のスクリプトが escape() で %uXXXX の形にした値です。"
+                f"この形のままでは送れないため、同じ文字を{how}でパーセントエンコードして送ります（IIS / ASP.NET は同じ値として受け取ります）"
+            )
 
         # headers
         headers: list[tuple[str, Ref]] = []
@@ -4559,6 +7479,7 @@ class _Builder:
         for cand in cands:
             if cand.location == "header":
                 header_cands.setdefault(cand.name, []).append(cand)
+        referer_rebuilt = False
         for name, value in clean_request_headers(req.headers):
             lname = name.lower()
             if (lname, value) in self.base_set:
@@ -4586,15 +7507,54 @@ class _Builder:
                     ref = _with_prefix(prefix, hidden)
             if lname == "referer" and ref.is_literal:
                 secrets = {c.value: Ref.var(c.name) for c in self.secret_by_value.values()}
-                known = dict(refs)  # this step's values first, then those traced for earlier steps
+                # this step's values first (a constant sent in a legacy charset holds its text, not the
+                # spelling the URL shows), then those traced for earlier steps
+                names = {c.name for c in self.constants}
+                known = {k: r for k, r in refs.items() if is_utf8(self._raw_fields.get(k, b"")) or _ref_name(r) not in names}
                 for key, earlier in self.traced_refs.items():
                     known.setdefault(key, earlier)
                 ref = _referer_with_fresh_values(value, known, secrets)
+                referer_rebuilt = not ref.is_literal
             headers.append((name, ref))
         constant_names = {c.name for c in self.constants}
         for key, resolved in refs.items():
-            if resolved is not None and resolved.kind == "var" and resolved.value not in constant_names:
-                self.traced_refs.setdefault(key, resolved)
+            meta = metas.get(key)
+            if resolved is None or meta is None or meta.value_class not in ("C", "D"):
+                continue
+            if resolved.kind == "var" and resolved.value not in constant_names or resolved.kind == "expr":
+                self.traced_refs[key] = resolved  # the latest source of a value wins (the referring page)
+
+        # cookies the script has to set itself, and the dependency records of this request
+        cookie_sets, bindings = self._cookie_bindings(unit, step_no, cache)
+        for key, resolved in refs.items():
+            meta = metas.get(key)
+            if meta is None or (meta.value_class == "A" and meta.note != "dynamic"):
+                continue
+            location, name, _value = key
+            cookie = meta.cookie
+            bindings.append(Binding(
+                location=location, name=name, value_class=meta.value_class, source=meta.source,
+                source_step=meta.source_step, source_kind=meta.source_kind, var=meta.var,
+                cookie=cookie.name if cookie is not None else None,
+                cookie_domain=cookie.domain if cookie is not None else None,
+                cookie_path=cookie.path if cookie is not None else None, note=meta.note,
+            ))
+        for (location, name, _value), meta in self._short_metas.items():
+            bindings.append(Binding(location=location, name=name, value_class=meta.value_class, source=meta.source,
+                                    source_kind=meta.source_kind, var=meta.var))
+        if referer_rebuilt:
+            bindings.append(Binding(location="referer", name="Referer", value_class="C",
+                                    source="前の画面の URL に含まれる動的な値を、今回取得した値に置き換え", source_kind="referer"))
+        if self.auth is not None and unit.auth_hops and not any(b.location == "auth" for s in self.built for b in s.step.bindings):
+            kind = str(self.auth.kind or "").lower()
+            if kind in ("ntlm", "negotiate"):
+                bindings.append(Binding(location="auth", name="session.auth", value_class="E",
+                                        source="実行時の Windows のログインユーザー（統合 Windows 認証、session.auth）",
+                                        source_kind="session-auth"))
+            else:
+                bindings.append(Binding(location="auth", name="session.auth", value_class="B",
+                                        source=f"入力値 {self.auth.username_const} / {self.auth.password_const}（HTTP {kind} 認証、session.auth）",
+                                        source_kind="session-auth"))
 
         status = resp.status if resp else 200
         mime = (resp.mime_type or "") if resp else ""
@@ -4621,7 +7581,12 @@ class _Builder:
             loop=loop,
             source_flow_ids=[f.id for f in unit.all_flows],
             comment=comment,
-            allow_redirects=True,
+            # a step whose recorded answer is itself a redirect (its target was not recorded or not
+            # kept) does not follow it either
+            allow_redirects=not (resp is not None and resp.is_redirect),
+            lookups=list(self._lookups.values()),
+            cookie_sets=cookie_sets,
+            bindings=bindings,
         )
 
     def _substitute_json(self, doc: Any, path: list, ref_for) -> Any:
@@ -4681,7 +7646,22 @@ class _Builder:
                                            reason="beyond --max-steps"))
             kept = [f for unit in units for f in unit.all_flows]
 
-        initial_cookies, _managed = classify_cookies(kept)
+        # the browser's cookie jar over the whole recording (kept and dropped requests: a dropped response
+        # still set its cookies in the browser), and where each kept request ends up in the plan
+        self.kept_ids = {id(f) for unit in units for f in unit.all_flows}
+        for idx, unit in enumerate(units, start=1):
+            for f in unit.all_flows:
+                self.flow_step[id(f)] = idx
+        self.cookie_profile = cookie_profile_for(self.recording)
+        self.timeline = CookieTimeline(self.recording.flows, self.cookie_profile)
+        self.host_only_hosts = self._host_only_cookie_hosts(kept)  # before the steps: may widen external cookies
+        self.dropped_by_id = {d.flow_id: d for d in dropped}
+        self.loop_spans = [
+            (self.timeline.position(unit.all_flows[0]), self.timeline.position(unit.all_flows[-1]))
+            for unit in units if unit.loop is not None and unit.all_flows
+        ]
+        producer_ids = {d.flow_id for d in dropped if d.reason.startswith(_PRODUCER_REASON_PREFIXES)}
+        self.dropped_flows = [f for f in self.recording.flows if f.id in producer_ids and id(f) not in self.kept_ids]
         self.base_headers = compute_base_headers(kept)
         self.base_set = {(k.lower(), v) for k, v in self.base_headers}
         self._setup_auth(kept)
@@ -4716,13 +7696,36 @@ class _Builder:
                 const.comment = f"{const.comment}; {text}" if const.comment else text
 
         final_step_index = self._final_step_index(steps, dropped)
-
+        initial_cookies = self.initial_cookies
         if initial_cookies:
             names = ", ".join(sorted({c.name for c in initial_cookies})[:8])
             self.warnings.append(
                 f"{len(initial_cookies)} cookie(s) existed before the recording started ({names}); they are replayed "
                 f"as INITIAL_COOKIES and may have expired"
             )
+        switches = self._session_switches()
+        for sw in switches:
+            what = "新しい値に切り替わり" if sw.kind == "rotation" else "別の場所（domain / path）で新しく発行され"
+            self.warnings.append(
+                f"step {sw.step}: セッション切替を検出しました: Cookie {sw.name}（domain={sw.domain}, path={sw.path}）が"
+                f"{what}、以降の手順はこの Cookie を使います（生成コードは Cookie を domain / path ごとに使い分けます）"
+            )
+        kept_hosts = {_cookie_host(f.request.url) for f in kept}
+        dotless = sorted(h for h in (self.timeline.dotless_domain_hosts if self.timeline else set()) if h in kept_hosts)
+        domain_is_host = sorted(h for h in (self.timeline.domain_is_host_hosts if self.timeline else set()) if h in kept_hosts)
+        # Set-Cookie lines the script's hooks rewrite (attributes browsers ignore, the IE engine's default path)
+        malformed_cookie = sorted(h for h in (self.timeline.malformed_cookie_hosts if self.timeline else set()) if h in kept_hosts)
+        ie_default_path = sorted(h for h in (self.timeline.ie_default_path_hosts if self.timeline else set()) if h in kept_hosts)
+        # IE engine: a sub-domain's Domain=<parent> line is the same cookie as the parent host's own (host-only) one
+        parent_domain = sorted({h for h, key in (self.timeline.parent_domain_lines if self.timeline else []) if h in kept_hosts
+                                and any(v.host_only and v.key == key for v in self.timeline.versions)})
+        for flow in kept:
+            if flow.response is not None and flow.response.status == 401 and set_cookie_lines(flow.response)                     and self.auth is not None and str(self.auth.kind or "").lower() in ("ntlm", "negotiate")                     and any(id(flow) in {id(h) for h in hops} for hops in self.auth_hops.values()):
+                names = ", ".join(dict.fromkeys(p[0] for p in (parse_set_cookie(l) for l in set_cookie_lines(flow.response)) if p))
+                self.warnings.append(
+                    f"統合 Windows 認証の途中の応答（{flow.id}）が Cookie（{names}）を発行しています。認証の途中の Cookie は認証用の"
+                    f"パッケージ（requests_negotiate_sspi / requests_ntlm）が扱うため、記録どおりには送られないことがあります"
+                )
 
         meta = {
             "source": dict(self.recording.meta),
@@ -4743,18 +7746,180 @@ class _Builder:
             meta=meta,
             auth=self.auth,
             final_step_index=final_step_index,
+            cookies=self._cookie_table(switches),
+            session_switches=switches,
+            dotless_domain_hosts=dotless,
+            domain_is_host_hosts=domain_is_host,
+            malformed_cookie_hosts=malformed_cookie,
+            ie_default_path_hosts=ie_default_path,
+            host_only_cookie_hosts=self.host_only_hosts,
+            parent_domain_cookie_hosts=parent_domain,
+            cookie_profile=self.cookie_profile,
         )
+
+    def _session_switches(self) -> list[SessionSwitch]:
+        out: list[SessionSwitch] = []
+        seen: set[tuple] = set()
+        if self.timeline is None:
+            return out
+        for flow, ver, kind, prev in self.timeline.switch_events(self.kept_ids):
+            step = self.flow_step.get(id(flow))
+            key = (step, ver.name, ver.domain, ver.path)
+            if step is None or key in seen:
+                continue
+            seen.add(key)
+            previous = f"domain={prev.domain}, path={prev.path}"
+            out.append(SessionSwitch(step=step, name=ver.name, domain=ver.domain, path=ver.jar_path, kind=kind,
+                                     previous=previous))
+        return out
+
+    def _cookie_table(self, switches: list[SessionSwitch]) -> list[CookieInfo]:
+        """Every cookie identity a replayed request sends or a replayed response sets."""
+        table: dict[tuple[str, str, str], CookieInfo] = {}
+        if self.timeline is None:
+            return []
+        for ver in self.timeline.versions:
+            used = sorted({self.flow_step[id(f)] for f in ver.sent_by if id(f) in self.flow_step})
+            issued = self.flow_step.get(id(ver.flow)) if ver.origin == "server" and ver.flow is not None else None
+            if not used and issued is None:
+                continue
+            if ver.origin == "external":
+                origin = ver.external_kind or "pre-existing"
+            elif issued is None:
+                origin = "dropped"
+            else:
+                origin = "server"
+            key = (ver.name, ver.domain, ver.jar_path)
+            info = table.get(key)
+            if info is None:
+                info = CookieInfo(name=ver.name, domain=ver.domain, path=ver.jar_path, host_only=ver.host_only, origin=origin)
+                table[key] = info
+            if issued is not None and issued not in info.issued_steps:
+                info.issued_steps.append(issued)
+            for s in used:
+                if s not in info.used_steps:
+                    info.used_steps.append(s)
+        for sw in switches:
+            info = table.get((sw.name, sw.domain, sw.path))
+            if info is not None and sw.step not in info.switch_steps:
+                info.switch_steps.append(sw.step)
+        for info in table.values():
+            info.issued_steps.sort()
+            info.used_steps.sort()
+        return list(table.values())
+
+    def _host_only_cookie_hosts(self, kept: list[Flow]) -> list[str]:
+        """RFC 6265 recordings: the hosts whose host-only cookies the browser did not send to a sub-domain a
+        kept request goes to, although the script holds them then and Python's default cookie policy would
+        send them there (domain, path, Secure and lifetime match).  The script then uses ``_Session``,
+        which keeps them on their host like the browser.  The script holds a pre-existing cookie from its
+        start (INITIAL_COOKIES) and one the page wrote from the start of its step, earlier than the
+        request that first sent it: the requests before that count too.
+
+        Called before the steps are built: a pre-existing / script cookie the browser did send to a
+        sub-domain of its host is a domain cookie, so it becomes ``host_only=False`` (the script sets it
+        with ``domain`` and ``_Session`` still sends it there; one it also left off another sub-domain
+        reaches that one too, as with Python's own rule).  When the recording contradicts that (a
+        host-only server cookie sent to a sub-domain, or such a cookie sharing its identity with a server
+        cookie) nothing changes: Python's own rule, as before."""
+        timeline = self.timeline
+        if timeline is None or self.cookie_profile != "rfc6265":
+            return []
+        leaked: dict[int, CookieVersion] = {}
+        for flow in kept:
+            host = _cookie_host(flow.request.url)
+            for _n, _v, ver in timeline.sent_with(flow):
+                if ver.host_only and ver.domain != host:  # the browser sent it to a sub-domain
+                    if ver.origin != "external" or any(v.origin == "server" and v.key == ver.key for v in timeline.versions):
+                        return []
+                    leaked[id(ver)] = ver
+        early: list[tuple[CookieVersion, int, Optional[int]]] = []  # (external, its first request, its step)
+        for ver in timeline.externals:
+            first = next((f for f in ver.sent_by if id(f) in self.kept_ids), None)
+            if first is not None and ver.flow is not None and id(ver) not in leaked:
+                step = None if ver.external_kind == "pre-existing" else self.flow_step.get(id(first))
+                early.append((ver, timeline.position(ver.flow), step))
+        out: set[str] = set()
+        for flow in kept:
+            host = _cookie_host(flow.request.url)
+            try:
+                parts = urlsplit(flow.request.url)
+            except ValueError:
+                continue
+            https = (parts.scheme or "").lower() == "https"
+            sent = {id(ver) for _n, _v, ver in timeline.sent_with(flow)}
+            pos = timeline.position(flow)
+            held = timeline.live_at(flow) + [ver for ver, first, step in early
+                                             if pos < first and step in (None, self.flow_step.get(id(flow)))]
+            for ver in held:
+                if (ver.host_only and id(ver) not in leaked and id(ver) not in sent and ver.domain != host
+                        and cookie_domain_match(host, ver.domain) and (https or not ver.secure)
+                        and cookie_path_match(parts.path or "/", ver.jar_path) and self._replayable(ver)):
+                    out.add(ver.domain)
+        if not out:
+            return []
+        for ver in leaked.values():
+            ver.host_only = False
+        return sorted(out)
+
+
+def _form_target(url: str) -> tuple[str, str, str]:
+    """``(scheme, host[:port], path)`` of a URL, lower-cased scheme / host, ``;params`` dropped from the
+    path: what a form's action and the request it produced are compared on."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ("", "", url)
+    path = "/".join(seg.split(";", 1)[0] for seg in (parts.path or "/").split("/"))
+    return (parts.scheme.lower(), parts.netloc.lower(), path or "/")
+
+
+#: Rounds of putting back dropped producers (each round may reveal the next producer of a chain).
+_PRODUCER_ROUNDS = 3
 
 
 def build_plan(recording: Recording, opts: Optional[PlanOptions] = None) -> Plan:
     """Analyse a ``Recording`` and return the ``Plan`` the code generator turns into a script.
 
-    See DESIGN.md §7 for the algorithm.  Never raises on odd recordings (binary bodies, missing
-    responses, broken encodings); problems surface as ``Plan.warnings`` / ``Plan.dropped``.
+    See DESIGN.md §7 and §14 for the algorithm.  When a request the noise filter dropped (a static
+    file, a tracker, a 304) turns out to set a cookie or to carry a value a kept request needs, the
+    plan is built again with that request kept (``PlanOptions.include_producers``).  Never raises on
+    odd recordings (binary bodies, missing responses, broken encodings); problems surface as
+    ``Plan.warnings`` / ``Plan.dropped``.
     """
+    opts = opts or PlanOptions()
     clear_cache()
     try:
-        return _Builder(recording, opts or PlanOptions()).build()
+        builder = _Builder(recording, opts)
+        plan = builder.build()
+        put_back: list[tuple[str, list[str]]] = []
+        for _round in range(_PRODUCER_ROUNDS):
+            if not opts.include_producers or not builder.needed_producers:
+                break
+            excluded = _flow_id_set(opts.exclude_flow_ids)
+            included = set(opts.include_flow_ids or [])
+            extra = [fid for fid in builder.needed_producers
+                     if fid not in included and fid not in excluded and normalise_flow_id(fid) not in excluded
+                     and fid in builder.dropped_by_id
+                     and builder.dropped_by_id[fid].reason.startswith(_PRODUCER_REASON_PREFIXES)]
+            if not extra:
+                break
+            put_back.extend((fid, builder.needed_producers[fid]) for fid in extra)
+            opts = replace(opts, include_flow_ids=list(opts.include_flow_ids or []) + extra)
+            clear_cache()
+            builder = _Builder(recording, opts)
+            plan = builder.build()
+        for fid, uses in put_back:
+            flow = recording.flow_by_id(fid)
+            step = next((s.index for s in plan.steps if fid in s.source_flow_ids), None)
+            label = f"{flow.request.method} {truncate(flow.request.url_without_query, 80)}" if flow is not None else fid
+            what = ", ".join(dict.fromkeys(uses))
+            plan.warnings.append(
+                f"step {step}: 除外していたリクエスト {fid}（{label}）は、後の手順で使う値（{truncate(what, 80)}）を返しているため、"
+                f"手順に含めました" if step is not None else
+                f"除外していたリクエスト {fid}（{label}）は、後の手順で使う値（{truncate(what, 80)}）を返しているため、手順に含めました"
+            )
+        return plan
     finally:
         clear_cache()
 
@@ -4826,6 +7991,27 @@ _AUTH_FAMILIES: dict[str, frozenset[str]] = {
     "digest": frozenset({"digest"}),
 }
 _AUTH_LABELS = {"ntlm": "NTLM", "negotiate": "Negotiate", "basic": "Basic", "digest": "Digest"}
+
+#: Names the generated script defines itself (functions, globals, helpers, imports): never used for a
+#: step function (constants and variables are kept off them by the plan's ``_CODEGEN_NAMES``).
+_CODEGEN_RESERVED = frozenset({
+    "main", "session", "resp", "soup", "data", "ctx", "results", "out", "requests", "re", "json",
+    "os", "sys", "time", "unquote", "urlencode", "urljoin", "BeautifulSoup", "email", "http", "exc",
+    "traceback", "_mask_values", "_note_issued", "_looks_random",
+    "TIMEOUT", "DELAY", "DEBUG", "BASE_HEADERS", "INITIAL_COOKIES", "DEPENDENCIES", "SESSION_SWITCHES",
+    "_soup", "_check", "_regex", "_json_path", "_select", "_attr", "_elem_text", "_text", "_charset",
+    "_normalise_charset", "final_resp", "final_results", "final_saved", "_STEP", "_step_start", "_step_ok",
+    "_debug", "_mask_url", "_mask_text", "_cookie", "_cookie_keys", "_set_cookie", "_need", "_hop",
+    "_host_cookie_hook", "urlsplit", "HttpNegotiateAuth", "HttpNtlmAuth",
+    "_cookie_attr_hook", "_ie_cookie_hook", "_Session", "functools", "warnings",
+})
+
+#: How the dependency table names the place a value is sent to.
+_LOCATION_LABELS = {
+    "path": "URL のパス", "path_param": "URL のパスパラメーター", "query": "クエリ", "form": "フォーム",
+    "json": "JSON", "multipart": "フォーム（ファイル送信）", "header": "ヘッダー", "cookie": "Cookie",
+    "referer": "ヘッダー", "auth": "認証",
+}
 
 #: Default for ``REQREC_NTLM_USER`` when the recording did not reveal the user (emitted verbatim;
 #: it is our own text, not recorded content).
@@ -4950,6 +8136,24 @@ def _check_identifier(name: Any, what: str) -> str:
     if not name.isidentifier() or keyword.iskeyword(name):
         raise CodegenError(f"{what} is not a valid Python identifier: {name!r}")
     return name
+
+
+_COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_COOKIE_PATH_RE = re.compile(r"^/[^;,\x00-\x1f\x7f]*$")
+_COOKIE_DOMAIN_RE = re.compile(r"^\.?[A-Za-z0-9._:\[\]-]+$")
+
+
+def _cookie_attrs_problem(name: Any, path: Any, domain: Any) -> Optional[str]:
+    """Why a cookie name / path / domain cannot go into a ``Set-Cookie`` line the script builds (it must
+    not be able to add attributes of its own, ``/; Domain=other``), or None: an RFC 6265 token,
+    ``/...`` without ``;`` or ``,``, host-name characters."""
+    if not isinstance(name, str) or not _COOKIE_NAME_RE.match(name):
+        return "名前に使えない文字があります"
+    if path is not None and (not isinstance(path, str) or not _COOKIE_PATH_RE.match(path)):
+        return "path に使えない文字があります"
+    if domain is not None and (not isinstance(domain, str) or not _COOKIE_DOMAIN_RE.match(domain)):
+        return "domain がホスト名ではありません"
+    return None
 
 
 def _check_expr(src: Any) -> str:
@@ -5092,6 +8296,8 @@ class _Generator:
         self.auth_pw_const: Optional[str] = None
         self.extra_constants: list[Constant] = []  # auth constants synthesised when the plan lacks them
         self.needs_urlencode = False
+        self.lookup_vars: set[str] = set()  # cookie values read from the jar before a step's request
+        self.input_names: set[str] = {str(c.name) for c in plan.constants if getattr(c, "kind", "") == "input"}
         self._prepare()
 
     # ------------------------------------------------------------------ preparation
@@ -5114,24 +8320,41 @@ class _Generator:
                 self.loop_vars.add(var)
         self._prepare_auth()
         # unique function names (the plan should already guarantee this; be safe)
-        reserved = set(self.constant_names) | {
-            "main", "session", "resp", "soup", "data", "ctx", "results", "out", "requests", "re", "json",
-            "os", "sys", "time", "unquote", "urlencode", "urljoin", "BeautifulSoup",
-            "TIMEOUT", "DELAY", "BASE_HEADERS", "INITIAL_COOKIES",
-            "_soup", "_check", "_regex", "_json_path", "_select", "_attr", "_elem_text", "_text", "_charset",
-            "_normalise_charset", "final_resp", "final_results", "final_saved", "_STEP", "_step_start", "_step_ok",
-            "HttpNegotiateAuth", "HttpNtlmAuth",
-        } | _DOWNLOAD_HELPER_NAMES
+        reserved = set(self.constant_names) | _CODEGEN_RESERVED | _DOWNLOAD_HELPER_NAMES
         for step in self.plan.steps:
             base = _check_identifier(step.func_name or f"step_{step.index:02d}", "step function name")
             self.func_names.append(unique_name(base, reserved))
         for step, fname in zip(self.plan.steps, self.func_names):
+            for lookup in getattr(step, "lookups", None) or []:
+                var = _check_identifier(lookup.var, "cookie lookup variable")
+                if var in self.constant_names:
+                    raise CodegenError(f"cookie lookup variable {var!r} collides with a constant")
+                self.producer.setdefault(var, fname)
+                self.producer_kind.setdefault(var, "cookie")
+                self.lookup_vars.add(var)
+                self.helpers_needed.add("_cookie")
+            if getattr(step, "cookie_sets", None):
+                self.helpers_needed.add("_set_cookie")
             for ext in step.extractors:
                 self.producer.setdefault(ext.var, fname)
                 self.producer_kind.setdefault(ext.var, ext.kind)
                 self.helpers_needed.update(_helpers_for_extractor(ext))
+            for ref in self._iter_refs(step):
+                if isinstance(ref, Ref) and ref.kind == "expr" and "_cookie(" in str(ref.value):
+                    self.helpers_needed.add("_cookie")
             if self._raw_form(step) is not None:
                 self.needs_urlencode = True
+        if self.plan.initial_cookies:
+            self.helpers_needed.add("_set_cookie")
+        # Set-Cookie lines rewritten before Python's jar sees them, and the browser's cookie policy
+        ie = getattr(self.plan, "cookie_profile", "") == "wininet"
+        if getattr(self.plan, "malformed_cookie_hosts", None):
+            self.helpers_needed.add("_cookie_attr_hook")
+        if getattr(self.plan, "domain_is_host_hosts", None) or (ie and (getattr(self.plan, "ie_default_path_hosts", None)
+                                                                       or getattr(self.plan, "parent_domain_cookie_hosts", None))):
+            self.helpers_needed.add("_ie_cookie_hook" if ie else "_host_cookie_hook")
+        if not ie and getattr(self.plan, "host_only_cookie_hosts", None):
+            self.helpers_needed.add("_Session")
         self.final_step = self._resolve_final_step()
         if self.final_step is not None and self.opts.print_final and self.final_step.response_kind == "html":
             self.helpers_needed.add("_soup")
@@ -5260,13 +8483,19 @@ class _Generator:
         if not self.opts.comments or not isinstance(ref, Ref):
             return None
         if ref.kind == "var":
+            if ref.value in self.lookup_vars:
+                return "Cookie から取得（送り先に合う domain / path のもの）"
             if ref.value in self.producer:
                 return f"{self.producer[ref.value]} で取得"
             if ref.value in self.loop_vars:
                 return "ループ変数"
+            if ref.value in self.input_names:
+                return "入力値"
             return None
         if ref.kind == "expr":
             names = [n for n in _expr_names(_check_expr(ref.value)) if n in self.producer]
+            if any(n in self.lookup_vars for n in names) or "_cookie(" in ref.value:
+                return "Cookie から取得（送り先に合う domain / path のもの）"
             if names:
                 return ", ".join(f"{n} は {self.producer[n]} で取得" for n in names)
             if "time.time" in ref.value:
@@ -5345,7 +8574,11 @@ class _Generator:
     # ------------------------------------------------------------------ step analysis
 
     def _iter_refs(self, step: Step) -> Iterator[Ref]:
-        """Every Ref of a step in the order the request is assembled (URL, params, headers, body)."""
+        """Every Ref of a step in the order the request is assembled (cookies set before it, URL, params,
+        headers, body)."""
+        for cookie in getattr(step, "cookie_sets", None) or []:
+            if isinstance(cookie.value, Ref):
+                yield cookie.value
         for piece in step.url:
             if isinstance(piece, Ref):
                 yield piece
@@ -5388,6 +8621,7 @@ class _Generator:
         """Function parameters after ``session``: the loop var first, then the extractor
         variables the step uses (constants are module globals and are skipped)."""
         known = set(self.producer) | self.loop_vars
+        local = {str(lookup.var) for lookup in getattr(step, "lookups", None) or []}  # read in the step itself
         params: list[str] = []
         loop_var = step.loop.var if step.loop is not None else None
         if loop_var:
@@ -5397,14 +8631,15 @@ class _Generator:
                 continue
             if ref.kind == "var":
                 name = _check_identifier(ref.value, "Ref.var")
-                if name in self.constant_names or name == loop_var or name in params:
+                if name in self.constant_names or name == loop_var or name in params or name in local:
                     continue
                 if name not in known:
                     self._note(f"{step.func_name}: 変数 {name!r} はどのステップでも取得されていません（実行時に KeyError になります）")
                 params.append(name)
             elif ref.kind == "expr":
                 for name in _expr_names(_check_expr(ref.value)):
-                    if name in known and name not in self.constant_names and name != loop_var and name not in params:
+                    if (name in known and name not in self.constant_names and name != loop_var and name not in params
+                            and name not in local):
                         params.append(name)
         return params
 
@@ -5416,6 +8651,7 @@ class _Generator:
         self._emit_imports()
         self._emit_settings()
         self._emit_helpers()
+        self._emit_dependency_table()
         self._emit_steps()
         self._emit_main()
         self.w.blank(2)
@@ -5424,13 +8660,18 @@ class _Generator:
             self.w.line("try:")
             with self.w.indent():
                 self.w.line("main()")
-            self.w.line("except Exception:")
+            self.w.line("except Exception as exc:")
             with self.w.indent():
-                self._c("どの手順で止まったかを表示してから、エラーの詳細を出す")
+                self._c("どの手順で止まったかを「[3/16] ERROR ...」と表示してから、エラーの詳細を出す（URL や Cookie の値は *** で隠す）")
                 self.w.line('if _STEP["no"] and not _STEP["ok"]:')
                 with self.w.indent():
-                    self.w.line('print("[{}/{}] 失敗  {}".format(_STEP["no"], _STEP["total"], _STEP["label"]), file=sys.stderr, flush=True)')
-                self.w.line("raise")
+                    self.w.line('reason = "{}: {}".format(type(exc).__name__, _mask_text(exc))[:300]')
+                    self.w.line('print("[{}/{}] ERROR  {}  ({})".format(_STEP["no"], _STEP["total"], _STEP["label"], reason), file=sys.stderr, flush=True)')
+                self.w.line("import traceback")
+                self.w.line('for line in "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).splitlines():')
+                with self.w.indent():
+                    self.w.line("print(line[:len(line) - len(line.lstrip())] + _mask_text(line), file=sys.stderr)")
+                self.w.line("sys.exit(1)")
         return self.w.text()
 
     def generate(self) -> str:
@@ -5533,12 +8774,22 @@ class _Generator:
     def _emit_imports(self) -> None:
         w = self.w
         w.blank()
+        if "_set_cookie" in self.helpers_needed:
+            w.line("import email.message")
+        if "_ie_cookie_hook" in self.helpers_needed:
+            w.line("import functools")
+        if "_Session" in self.helpers_needed:
+            w.line("import http.cookiejar")
         w.line("import json")
         w.line("import os")
         w.line("import re")
         w.line("import sys")
         w.line("import time")
+        if "_cookie_attr_hook" in self.helpers_needed:
+            w.line("import warnings")
         names = ["unquote", "urljoin"] + (["urlencode"] if self.needs_urlencode else [])
+        if {"_host_cookie_hook", "_ie_cookie_hook"} & self.helpers_needed:
+            names.append("urlsplit")
         w.line("from urllib.parse import " + ", ".join(sorted(names)))
         w.blank()
         w.line("import requests")
@@ -5555,12 +8806,21 @@ class _Generator:
         w.line(f"TIMEOUT = {timeout!r}" + (f"  # {c}" if c else ""))
         c = self._comment("ステップ間の待ち時間（秒）。サーバーに負荷をかけないための配慮")
         w.line(f"DELAY = {delay!r}" + (f"  # {c}" if c else ""))
+        c = self._comment("True にするか、環境変数 REQREC_DEBUG=1 で、動的な値の取得元・送り先・Cookie の domain / path を表示（値そのものは表示しません）")
+        w.line('DEBUG = os.environ.get("REQREC_DEBUG", "") not in ("", "0")' + (f"  # {c}" if c else ""))
 
         constants = self._all_constants()
-        if constants:
+        inputs = [c for c in constants if getattr(c, "kind", "") == "input"]
+        others = [c for c in constants if getattr(c, "kind", "") != "input"]
+        if inputs:
+            w.blank()
+            self._c("===== 入力値（記録したときに画面で入力・選択した値。別の値で実行したいときは書き換えてください） =====")
+            for const in inputs:
+                self._emit_constant(const)
+        if others:
             w.blank()
             self._c("===== 定数（必要に応じて書き換えてください） =====")
-            for const in constants:
+            for const in others:
                 self._emit_constant(const)
 
         w.blank()
@@ -5569,20 +8829,82 @@ class _Generator:
         w.block(_container("{", "}", items, inline_ok=False), prefix="BASE_HEADERS = ")
 
         w.blank()
-        self._c("記録開始時点でブラウザが既に持っていた Cookie（ログイン済みセッションなど）")
+        self._c("記録を始める前からブラウザが持っていた Cookie（url のサーバーが発行したのと同じ扱いで設定します）")
         if self.plan.initial_cookies:
             self._c("期限切れになっている場合は、再度ブラウザから値を取得して書き換えてください")
         items = []
         for ck in self.plan.initial_cookies or []:
-            items.append(([
-                "{" + ", ".join([
-                    f"'name': {_lit(ck.name)}",
-                    f"'value': {_lit(ck.value)}",
-                    f"'domain': {_lit(ck.domain)}",
-                    f"'path': {_lit(ck.path or '/')}",
-                ]) + "}"
-            ], None))
+            url = getattr(ck, "url", "") or f"http://{ck.domain}{ck.path or '/'}"
+            problem = _cookie_attrs_problem(ck.name, ck.path or "/", None if getattr(ck, "host_only", True) else ck.domain)
+            if problem:
+                self._note(f"記録前からあった Cookie を 1 つ設定できません（{problem}）。その Cookie は送りません")
+                continue
+            entry = [
+                f"'name': {_lit(ck.name)}",
+                f"'value': {_lit(ck.value)}",
+                f"'url': {_lit(url)}",
+                f"'path': {_lit(ck.path or '/')}",
+            ]
+            if not getattr(ck, "host_only", True):
+                entry.append(f"'domain': {_lit(ck.domain)}")
+            items.append((["{" + ", ".join(entry) + "}"], None))
         w.block(_container("[", "]", items, inline_ok=False), prefix="INITIAL_COOKIES = ")
+
+    def _binding_rows(self) -> list[tuple[int, str, str, str, str, Optional[str]]]:
+        """``(step, place, name, class, source, variable)`` for every recorded binding (value-free)."""
+        rows = []
+        for step in self.plan.steps:
+            for b in getattr(step, "bindings", None) or []:
+                location = str(b.location)
+                place = _LOCATION_LABELS.get(location, location)
+                name = str(b.name)
+                if location == "path":
+                    try:
+                        name = f"{int(name) + 1} 番目"
+                    except ValueError:
+                        pass
+                elif location == "path_param":
+                    name = ";" + name.split(";", 1)[-1]
+                var = b.var if b.var and str(b.var).isidentifier() else None
+                rows.append((int(step.index), place, name, str(b.value_class), str(b.source or ""), var))
+        return rows
+
+    def _emit_dependency_table(self) -> None:
+        """``DEPENDENCIES`` (what each step sends that is not a fixed value, and where it comes from),
+        ``SESSION_SWITCHES`` and the cookie table as comments.  Never any value: names, steps, kinds and
+        sources only (the DEBUG output prints this table at run time)."""
+        w = self.w
+        rows = self._binding_rows()
+        w.blank()
+        self._c("===== 動的な値の一覧（実行のたびに取り直す値と入力値。値そのものはここには書きません） =====")
+        self._c("種類: A=固定値（記録時の値のまま） B=入力値 C=前のレスポンスから取得 D=Cookie / セッション E=実行時の値（時刻など）")
+        self._c("(手順, 送る場所, 名前, 種類, 取得元, 値が入る変数)")
+        items = []
+        for no, place, name, kind, source, var in rows:
+            items.append(([f"({no}, {_lit(place)}, {_lit(name)}, {_lit(kind)}, {_lit(source)}, {_lit(var) if var else 'None'})"], None))
+        w.block(_container("[", "]", items, inline_ok=False), prefix="DEPENDENCIES = ")
+        switches = sorted({(int(sw.step), str(sw.name)) for sw in getattr(self.plan, "session_switches", None) or []})
+        if switches:
+            self._c("セッション切替（Cookie が新しく発行され、以降の手順はそちらを使う）: (手順, Cookie 名)")
+        w.line("SESSION_SWITCHES = " + ("{" + ", ".join(f"({no}, {_lit(name)})" for no, name in switches) + "}" if switches else "set()"))
+        cookies = getattr(self.plan, "cookies", None) or []
+        if cookies and self.opts.comments:
+            w.blank()
+            self._c("Cookie の一覧（requests.Session が domain / path ごとに管理し、送り先に合うものだけを送ります）")
+            origins = {"server": "", "pre-existing": "記録前からあった Cookie", "script": "画面のスクリプトが設定",
+                       "dropped": "除外したリクエストが設定"}
+            for info in cookies:
+                parts = [f"{info.name}  domain={info.domain}  path={info.path}"]
+                if info.issued_steps:
+                    parts.append(f"手順 {_steps_text(info.issued_steps)} で発行")
+                origin = origins.get(info.origin, "")
+                if origin:
+                    parts.append(origin)
+                if info.switch_steps:
+                    parts.append(f"手順 {_steps_text(info.switch_steps)} でセッション切替")
+                if info.used_steps:
+                    parts.append(f"手順 {_steps_text(info.used_steps)} で送信")
+                self._c("  " + "、".join(parts))
 
     def _emit_constant(self, const: Constant) -> None:
         w = self.w
@@ -5593,7 +8915,13 @@ class _Generator:
             env = _env_name(const)
             self._c(f"記録時の値は安全のため出力していません。環境変数 {env} で指定してください（下の行の '' に直接書いても動きます）")
             w.line(f"{name} = os.environ.get({_lit(env)}, '')")
+        elif isinstance(const.value, (bytes, bytearray)):
+            # a value a Shift_JIS (or other legacy charset) page sent: the recorded bytes
+            self._c(_legacy_bytes_note(bytes(const.value)) + "。書き換えるときは '日本語'.encode('cp932') のように書きます")
+            w.line(f"{name} = {_lit(bytes(const.value))}")
         else:
+            if getattr(const, "encoding", None):
+                self._c(f"画面の文字コード（{const.encoding}）に変換して送ります。日本語のまま書き換えてかまいません")
             w.line(f"{name} = {_lit(const.value)}")
 
     # ------------------------------------------------------------------ helpers
@@ -5619,26 +8947,30 @@ class _Generator:
         w.line("def _check(resp, expected, step):")
         with w.indent():
             if self.opts.strict_status:
-                w.line('"""ステータスコードが記録時と一致することを確認する。"""')
-                w.line("if resp.status_code != expected:")
+                w.line('"""ステータスコードが記録時と一致することを確認する（記録時 304 なら 200 も可。URL の値は *** で隠す）。"""')
+                w.line("if resp.status_code != expected and not (expected == 304 and resp.status_code == 200):")
                 with w.indent():
                     w.line("raise RuntimeError(")
                     with w.indent():
                         w.line('f"{step}: 想定外のステータスコード {resp.status_code} "')
-                        w.line('f"(記録時: {expected}) {resp.request.method} {resp.url}"')
+                        w.line('f"(記録時: {expected}) {resp.request.method} {_mask_url(resp.url)}"')
                     w.line(")")
             else:
-                w.line('"""エラー応答（4xx/5xx）なら例外にし、記録時と違うステータスなら警告を出す。"""')
-                w.line("if resp.status_code != expected:")
+                w.line('"""記録時と違うステータスなら警告を出し、記録時に無かったエラー応答（4xx/5xx）なら例外にする（URL の値は *** で隠す）。"""')
+                w.line("if resp.status_code == expected or (expected == 304 and resp.status_code == 200):")
                 with w.indent():
-                    w.line("print(")
-                    with w.indent():
-                        w.line('f"[警告] {step}: ステータスコード {resp.status_code} (記録時: {expected}) {resp.url}",')
-                        w.line("file=sys.stderr,")
-                    w.line(")")
-                w.line("resp.raise_for_status()")
+                    w.line("return")
+                w.line("print(")
+                with w.indent():
+                    w.line('f"[警告] {step}: ステータスコード {resp.status_code} (記録時: {expected}) {_mask_url(resp.url)}",')
+                    w.line("file=sys.stderr,")
+                w.line(")")
+                w.line("if resp.status_code >= 400:")
+                with w.indent():
+                    w.line('raise requests.HTTPError(f"{step}: HTTP {resp.status_code} {_mask_url(resp.url)}", response=resp)')
 
         self._emit_progress_helpers()
+        self._emit_cookie_helpers()
 
         if "_regex" in self.helpers_needed:
             w.blank(2)
@@ -5710,34 +9042,29 @@ class _Generator:
     def _emit_progress_helpers(self) -> None:
         """``_step_start`` / ``_step_ok``: one line per step on stderr while the script runs, so the
         user sees how far it got ("[2/9] OK  POST /Login.aspx (200)  「メニュー」"); the ``__main__``
-        block adds "[3/9] 失敗 ..." when a step raises.  stderr keeps stdout for the result."""
+        block adds "[3/9] ERROR ..." when a step raises.  stderr keeps stdout for the result.  With
+        ``DEBUG`` they also print the step's ``DEPENDENCIES`` rows and the cookies it received
+        (``[3/9]   ...`` lines; names, domains, paths, kinds and lengths - never values)."""
         w = self.w
         w.blank(2)
         self._c("どこまで進んだかの表示（標準エラー出力に出すので、結果の表示とは混ざらない）")
-        w.line('_STEP = {"no": 0, "total": 0, "label": "", "ok": True}')
-        w.blank(2)
-        w.line("def _step_start(no, total, label):")
-        with w.indent():
-            w.line('"""手順を始める前に呼ぶ（失敗したときに、どの手順で止まったかを表示するため）。"""')
-            w.line("_STEP.update(no=no, total=total, label=label, ok=False)")
-        w.blank(2)
-        w.line("def _step_ok(resp):")
-        with w.indent():
-            w.line('"""手順が成功したら「[2/9] OK ...」と表示する。HTML なら、受け取った画面のタイトルも出す。"""')
-            w.line('_STEP["ok"] = True')
-            w.line('title = ""')
-            w.line('if "html" in resp.headers.get("Content-Type", "").lower():')
-            with w.indent():
-                w.line('m = re.search(r"<title[^>]*>(.*?)</title>", _text(resp), re.I | re.S)')
-                w.line("if m and m.group(1).strip():")
-                with w.indent():
-                    w.line('title = "  「{}」".format(" ".join(m.group(1).split())[:60])')
-            w.line('line = "[{}/{}] OK  {} ({}){}".format(_STEP["no"], _STEP["total"], _STEP["label"], resp.status_code, title)')
-            w.line("print(line, file=sys.stderr, flush=True)")
+        for ln in _PROGRESS_HELPERS_SRC.strip("\n").split("\n"):
+            w.line(ln)
+
+    def _emit_cookie_helpers(self) -> None:
+        """``_cookie`` / ``_set_cookie`` / ``_need`` / ``_hop`` / ``_host_cookie_hook`` when the plan uses them."""
+        w = self.w
+        for name, src in _COOKIE_HELPERS_SRC:
+            if name in self.helpers_needed:
+                w.blank(2)
+                for ln in src.strip("\n").split("\n"):
+                    w.line(ln)
 
     def _progress_label(self, step: Step) -> str:
-        """``"POST /Login.aspx"``: the method and the path of the step's URL (no host, no query)."""
+        """``"POST /Login.aspx"``: the method and the path of the step's URL (no host, no query; the
+        recorded values of ``;name=value`` path parameters are not shown)."""
         path = urlsplit(self._url_display(step.url)).path or "/"
+        path = _PATH_PARAM_VALUE_RE.sub(r"\1…", path)
         return f"{str(step.method).upper()} {path}"
 
     def _emit_encoding_helpers(self) -> None:
@@ -5829,18 +9156,78 @@ class _Generator:
                     doc += ["", "記録時のレスポンス: " + comment.split(" -> ", 1)[1]]
                 else:
                     doc += ["", comment]
+            rows = [r for r in self._binding_rows() if r[0] == int(step.index)]
+            if rows:
+                doc += ["", "送る値の取得元（A=固定 B=入力値 C=前のレスポンス D=Cookie/セッション E=実行時）:"]
+                doc += [f"  {place} {name}: [{kind}] {source}" for _no, place, name, kind, source, _var in rows]
             for ln in _docstring_lines(doc):
                 w.line(ln)
+            lookups = self._emit_pre_request(step)
             self._emit_request(step)
             try:
                 expected = int(step.expected_status)
             except (TypeError, ValueError):
                 expected = 200
             w.line(f"_check(resp, {expected}, {_lit(fname)})")
-            outputs = self._emit_extractors(step, fname)
+            outputs = lookups + [v for v in self._emit_extractors(step, fname) if v not in lookups]
             items = [([f"{_lit(v)}: {v}"], None) for v in outputs]
             w.block(_container("{", "}", items), prefix="return resp, ")
         w.blank(2)
+
+    def _emit_pre_request(self, step: Step) -> list[str]:
+        """Before the request: the cookie lookups the cookies set by this step need, the cookies set
+        (``_set_cookie``), then the remaining lookups (a lookup may read a cookie the step has just set).
+        Returns the lookup variables."""
+        lookups = list(getattr(step, "lookups", None) or [])
+        sets = list(getattr(step, "cookie_sets", None) or [])
+        needed: set[str] = set()
+        for cookie in sets:
+            ref = cookie.value
+            if isinstance(ref, Ref) and ref.kind == "var":
+                needed.add(str(ref.value))
+            elif isinstance(ref, Ref) and ref.kind == "expr":
+                needed.update(_expr_names(_check_expr(ref.value)))
+        first = [lk for lk in lookups if str(lk.var) in needed]
+        rest = [lk for lk in lookups if str(lk.var) not in needed]
+        out = self._emit_lookups(first)
+        self._emit_cookie_sets(step)
+        return out + self._emit_lookups(rest)
+
+    def _emit_lookups(self, lookups: Sequence[CookieLookup]) -> list[str]:
+        """``var = _cookie(session, name, url, path=..., domain=...)`` for every cookie value the request
+        sends (class D): the cookie of that name the jar sends to that URL, read right before the request
+        (so a session switched by an earlier step is picked up).  Returns the variables."""
+        out: list[str] = []
+        for lookup in lookups:
+            var = _check_identifier(lookup.var, "cookie lookup variable")
+            args = ["session", _lit(lookup.name), _lit(lookup.url)]
+            if lookup.path:
+                args.append(f"path={_lit(lookup.path)}")
+            if lookup.domain:
+                args.append(f"domain={_lit(lookup.domain)}")
+            if lookup.note:
+                self._c(f"D: {lookup.note}。送り先に合う domain / path の Cookie を読む")
+            w = self.w
+            w.line(f"{var} = _cookie({', '.join(args)})")
+            out.append(var)
+        return out
+
+    def _emit_cookie_sets(self, step: Step) -> None:
+        """``_set_cookie(session, url, name, value, path=...)`` for the cookies the page's script wrote
+        (or the browser had) before this request, with their value from an earlier response or the jar."""
+        for cookie in getattr(step, "cookie_sets", None) or []:
+            problem = _cookie_attrs_problem(cookie.name, cookie.path, cookie.domain)
+            if problem:
+                self._note(f"{step.func_name}: 画面のスクリプトが設定した Cookie を 1 つ設定できません（{problem}）。その Cookie は送りません")
+                continue
+            args = ["session", _lit(cookie.url), _lit(cookie.name), self._ref(cookie.value)]
+            if cookie.path:
+                args.append(f"path={_lit(cookie.path)}")
+            if cookie.domain:
+                args.append(f"domain={_lit(cookie.domain)}")
+            if cookie.note:
+                self._c(f"Cookie {cookie.name}: {cookie.note}")
+            self.w.line(f"_set_cookie({', '.join(args)})")
 
     def _step_headers(self, step: Step) -> list[tuple[str, Ref]]:
         """Per-step headers to emit: without ``Authorization`` of the scheme ``session.auth`` handles
@@ -5873,11 +9260,15 @@ class _Generator:
         headers = self._step_headers(step)
         if headers:
             kwargs.append(("headers", self._pairs(headers, header=True), None))
-        if self._raw_form(step) is not None:
-            self._note(
-                f"{step.func_name}: UTF-8 以外の文字コードで送られたフォーム本文は、各フィールドの値から URL エンコードして"
-                f"組み直します（取得した値は差し替え、Shift_JIS などの値は記録時のバイト列のまま）"
-            )
+        raw_form = self._raw_form(step)
+        if raw_form is not None:
+            # only the pairs still sent as the recorded bytes are named (an 入力値 is converted, a fetched value replaced)
+            kept = [str(n) for n, r in raw_form if isinstance(r, Ref) and r.kind == "expr" and _bytes_literal_value(r.value) is not None]
+            if kept:
+                self._note(
+                    f"{step.func_name}: UTF-8 以外の文字コードで送られたフォーム本文は、各フィールドの値から URL エンコードして"
+                    f"組み直します（取得した値は差し替え、{_field_list(kept)} は記録時のバイト列のまま）"
+                )
             self._c("フォームの値を記録時の文字コード（バイト列）のまま URL エンコードして送る（Shift_JIS などのサイト）")
         kwargs.extend(self._body_kwargs(step))
         if step.allow_redirects is False:
@@ -5995,7 +9386,12 @@ class _Generator:
             expr, desc = self._extractor_expr(ext, fname)
             if self.opts.comments:
                 note = f"{var}: {desc}"
-                if ext.sample is not None:
+                if ext.sample is not None and (ext.kind == "cookie" or is_dynamic_looking(str(ext.sample))
+                                               or (len(str(ext.sample)) > 6 and not _spelled_as_words(str(ext.sample)))):
+                    # a session id / token (also a key of letters that are no words): only its length
+                    # (it is renewed on every run anyway)
+                    note += f"（記録時は {len(str(ext.sample))} 文字）"
+                elif ext.sample is not None:
                     note += f"（記録時の値: {_lit(truncate(str(ext.sample), _SAMPLE_LEN))}）"
                 if ext.note:
                     note += f" — {ext.note}"
@@ -6012,11 +9408,24 @@ class _Generator:
         if kind == "cookie":
             if ext.name is None:
                 return self._todo(ext, fname, "cookie 名がありません")
-            return f"session.cookies.get({_lit(ext.name)})", f"Cookie {_lit(ext.name)} の値"
+            # the cookie of that name the jar sends to its scope URL (RFC 6265), never a lookup by name only
+            args = ["session", _lit(ext.name), _lit(ext.cookie_url) if ext.cookie_url else "resp.url"]
+            if ext.cookie_path:
+                args.append(f"path={_lit(ext.cookie_path)}")
+            if ext.cookie_domain:
+                args.append(f"domain={_lit(ext.cookie_domain)}")
+            return f"_cookie({', '.join(args)})", f"Cookie {_lit(ext.name)} の値（domain / path で選んだもの）"
         if kind == "header":
             if ext.name is None:
                 return self._todo(ext, fname, "ヘッダー名がありません")
-            return f"resp.headers.get({_lit(ext.name)})", f"レスポンスヘッダー {_lit(ext.name)}"
+            source = "resp" if ext.hop is None else f"_hop(resp, {int(ext.hop)})"
+            where = f"リダイレクト中の {int(ext.hop) + 1} 番目の応答の" if ext.hop is not None else ""
+            expr = f"_need({source}.headers.get({_lit(ext.name)}), {_lit(f'{fname} の{where}レスポンスヘッダー {ext.name}')})"
+            desc = f"{where}レスポンスヘッダー {_lit(ext.name)}"
+            if pattern:
+                expr = f"_regex({expr}, {_lit(pattern)})"
+                desc += " から正規表現で抽出"
+            return expr, desc
         if kind == "json":
             if ext.path is None:
                 return self._todo(ext, fname, "JSON パスがありません")
@@ -6081,12 +9490,33 @@ class _Generator:
                 w.line("if missing:")
                 with w.indent():
                     w.line('sys.exit("環境変数 " + ", ".join(missing) + " が設定されていません（パスワードなど、実行時に入力が必要な値です）")')
-            w.line("session = requests.Session()")
+            if steps:
+                w.line(f'_STEP["total"] = {len(steps)}')
+            if "_Session" in self.helpers_needed:
+                self._c("Cookie の送り先をブラウザと同じにする（Domain 属性なしの Cookie はそのホストにだけ送る）")
+                w.line("session = _Session()")
+            else:
+                w.line("session = requests.Session()")
+            if "_cookie_attr_hook" in self.helpers_needed:
+                self._c("ブラウザが無視する Cookie の属性（空の Domain、数字でない Max-Age など）を外して受け取る")
+                w.line('session.hooks["response"].append(_cookie_attr_hook)')
+                self._c("そのような属性を requests が先に読んだときの Python の内部警告（http.cookiejar bug!）は表示しない"
+                        "（Cookie は上のフックで正しく受け取る）")
+                w.line('warnings.filterwarnings("ignore", message="http.cookiejar bug!")')
+            if "_host_cookie_hook" in self.helpers_needed:
+                self._c("Domain=そのホスト の Cookie を、ブラウザと同じく Domain なしの Cookie と同じものとして扱う")
+                w.line('session.hooks["response"].append(_host_cookie_hook)')
+            if "_ie_cookie_hook" in self.helpers_needed:
+                self._c("Cookie を IE（記録したブラウザ）と同じ Path / Domain で受け取る")
+                w.line('session.hooks["response"].append(functools.partial(_ie_cookie_hook, jar=session.cookies))')
             self._emit_session_auth()
             w.line("session.headers.update(BASE_HEADERS)")
             w.line("for c in INITIAL_COOKIES:")
             with w.indent():
-                w.line("session.cookies.set(c['name'], c['value'], domain=c['domain'], path=c['path'])")
+                if self.plan.initial_cookies:
+                    w.line("_set_cookie(session, c['url'], c['name'], c['value'], path=c['path'], domain=c.get('domain'))")
+                else:
+                    w.line("session.cookies.set(c['name'], c['value'], domain=c['domain'], path=c['path'])")
             w.line("ctx = {}")
             if not steps:
                 w.line('print("記録に再現できるリクエストがありませんでした", file=sys.stderr)')
@@ -6179,28 +9609,42 @@ class _Generator:
         else:
             self._cl(target + "_save_if_attachment(resp)", "ファイル（Excel / CSV など）として返ってきたら保存する")
 
+    def _step_desc(self, step: Step) -> str:
+        """``GET http://h/app/{jsessionid}/list -> 200 text/html``: the step's URL as the script builds it
+        (dynamic pieces as ``{var}``, never a recorded session value) and the recorded response."""
+        desc = f"{str(step.method).upper()} {self._url_display(step.url)}"
+        comment = str(step.comment or "")
+        if " -> " in comment:
+            desc += " -> " + comment.split(" -> ", 1)[1]
+        return desc
+
     def _emit_main_step(self, step: Step, fname: str, *, sleep: bool, final: bool = False,
                         progress: tuple[int, int] = (0, 0)) -> None:
         w = self.w
-        desc = step.comment or f"{str(step.method).upper()} {self._url_display(step.url)}"
+        desc = self._step_desc(step)
         no, total = progress
         label = self._progress_label(step)
         if step.loop is None:
             self._c(f"ステップ {step.index}: {desc}")
-            w.line(f"_step_start({no}, {total}, {_lit(label)})")
+            w.line(f"_step_start({no}, {total}, {_lit(label)}, session, ctx)")
             w.block(self._call(step, fname))
             w.line("ctx.update(out)")
-            w.line("_step_ok(resp)")
             if final:
                 self._cl("final_resp = resp", "このステップの結果を最後に表示する")
-            # a file is saved right after its own request, so a later failing step cannot lose it
+            # a file is saved right after its own request, so a later failing step cannot lose it, and
+            # before _step_ok, so a file that cannot be saved is this step's "[n/N] ERROR"
             self._emit_save(step, target="final_saved = " if final and self._final_needs_saved(step) else "")
+            w.line("_step_ok(resp, session)")
             if sleep:
                 w.line("time.sleep(DELAY)")
             return
         loop = step.loop
         var = _check_identifier(loop.var, "loop variable")
         iterable = self._loop_iterable(loop)
+        shown = f"str({var})"
+        if any(isinstance(v, (bytes, bytearray)) for v in loop.values or []):
+            # recorded legacy-charset bytes (the charset was unknown): the progress line shows their text
+            shown = f"{var}.decode({_lit(_bytes_display_charset(loop.values))}, 'replace')"
         self._c(f"ステップ {step.index}: {desc}")
         if loop.note and str(loop.note) not in desc:
             self._c(f"繰り返し: {loop.note}")
@@ -6209,14 +9653,14 @@ class _Generator:
             w.line("out = {}")
         w.line(f"for {var} in {iterable}:")
         with w.indent():
-            w.line(f"_step_start({no}, {total}, {_lit(label + ' ' + var + '=')} + str({var}))")
+            w.line(f"_step_start({no}, {total}, {_lit(label + ' ' + var + '=')} + {shown}, session, ctx)")
             w.block(self._call(step, fname))
-            w.line("_step_ok(resp)")
             if step.response_kind == "binary":
                 self._cl("results.append(_save_download(resp))", "ファイルを保存し、保存先のパスを結果に入れる")
             else:
                 self._emit_save(step)
                 w.line("results.append(" + ("resp.json()" if step.response_kind == "json" else "_text(resp)") + ")")
+            w.line("_step_ok(resp, session)")
             if sleep:
                 w.line("time.sleep(DELAY)")
         w.line("ctx.update(out)")
@@ -6285,17 +9729,394 @@ class _Generator:
                     w.line("print(_text(final_resp)[:2000])")
             return
         self._c("ファイルとして保存した場合は、上の「保存しました」の表示だけ")
+        # never the response's URL: it can hold the session id / tokens of this run (R9); the step's label
+        # names dynamic parts as {var}, like the "[n/N] OK" line
+        done = _lit(self._progress_label(step))
         w.line("if not final_saved:")
         with w.indent():
             if kind == "html":
                 w.line("soup = _soup(final_resp)")
-                w.line("print(soup.title.get_text(strip=True) if soup.title else final_resp.url)")
+                self._c("タイトルが無い画面は、ステータスと手順を表示する（URL にはセッション ID が入ることがあるので表示しない）")
+                w.line(f'print(soup.title.get_text(strip=True) if soup.title else "{{}} {{}}".format(final_resp.status_code, {done}))')
                 self._c("TODO: 必要なデータを soup から取り出してください（例: soup.select('table tr')）")
             else:  # empty
-                w.line("print(final_resp.status_code, final_resp.url)")
+                self._c("ステータスと手順を表示する（URL にはセッション ID が入ることがあるので表示しない）")
+                w.line(f"print(final_resp.status_code, {done})")
 
 
 # =========================================================================== module-level helpers
+
+#: ``;name=value`` path parameter values in a progress label (the recorded value is not shown).
+_PATH_PARAM_VALUE_RE = re.compile(r"(;[^/;=]+=)(?!\{)[^/;]*")
+
+#: Emitted verbatim into every script: the progress / debug / masking helpers (DESIGN.md §14.4).  Our
+#: own text, no recorded content; no ``#`` comments (``GenOptions(comments=False)`` yields comment-free
+#: code); Python 3.8 syntax (``str.format``).
+_PROGRESS_HELPERS_SRC = r'''
+_STEP = {"no": 0, "total": 0, "label": "", "ok": True, "jar": None, "session": None, "ctx": None, "issued": set()}
+
+
+def _mask_values(text):
+    """この実行で受け取った Cookie の値、リダイレクト先の URL で渡された値（_note_issued）と、手順で取り出した値
+    （6 文字以上）を *** にする（形では見分けられない値も隠すため）。"""
+    values = set(_STEP.get("issued") or ())
+    for value in (_STEP.get("ctx") or {}).values():
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            values.add(str(value).strip())
+    session = _STEP.get("session")
+    for cookie in getattr(session, "cookies", None) or []:
+        values.add((cookie.value or "").strip().strip('"'))
+    text = str(text)
+    for value in sorted(values, key=len, reverse=True):
+        if len(value) >= 6:
+            text = text.replace(value, "***")
+    return text
+
+
+def _looks_random(word):
+    """英字だけの文字列が、単語の並び（CustomerMaintenance、kensaku、TOPMENU、MyPage）ではなく値に見えるか。
+
+    単語に見えるのは、小文字だけ・大文字だけ（16 文字未満）・CamelCase のどれかで、母音（aeiouy）が 4 分の 1 以上あり、
+    子音が 5 文字以上続かないもの。大文字と小文字が不規則に混ざるもの（QviGcsvYKmnn）は値とみなす。
+    """
+    low = word.lower()
+    regular = (word.islower() or (word.isupper() and len(word) < 16)
+               or re.fullmatch(r"[A-Z]?[a-z]+(?:[A-Z][a-z]{2,})*", word))
+    vowels = sum(1 for c in low if c in "aeiouy")
+    cluster = max([len(r) for r in re.findall(r"[^aeiouy]+", low)] or [0])
+    return not (regular and vowels * 4 >= len(low) and cluster < 5)
+
+
+def _mask_url(url):
+    """表示用の URL: クエリと ;パラメーター の値、セッション ID らしいパス、ユーザー名とパスワード、
+    この実行の Cookie の値、リダイレクト先で渡された値と取り出した値を *** にする。
+
+    セッション ID らしいパスは 16 文字以上で、英字と数字が混ざるもの、または英字だけで単語の並びに見えないもの
+    （_looks_random。例: QZVBNMWRTYPXSDFKHJ。CustomerMaintenance や juchukanrimenu はそのまま）。
+    """
+    text = re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/?#@]*@", r"\1***@", _mask_values(url or "")).split("#", 1)[0]
+    path, sep, query = text.partition("?")
+    origin = ""
+    m = re.match(r"[A-Za-z][A-Za-z0-9+.-]*://[^/]*", path)
+    if m:
+        origin, path = m.group(0), path[m.end():]
+    path = re.sub(r"(;[^/;=]*=)[^/;]+", r"\1***", path)
+    path = re.sub(r"(?<=/)(?=[^/;.]*\d)(?=[^/;.]*[A-Za-z])[^/;.]{16,}(?=[/;]|$)", "***", path)
+    path = re.sub(r"(?<=/)[A-Za-z]{16,}(?=[/;]|$)", lambda w: "***" if _looks_random(w.group(0)) else w.group(0), path)
+    if sep:
+        query = re.sub(r"(^|[&;])([^&;=]*=)?([^&;]*)",
+                       lambda q: q.group(1) + (q.group(2) or "") + ("***" if q.group(3) else ""), query)
+    return origin + path + sep + query
+
+
+def _mask_text(text):
+    """エラーメッセージを 1 行にし、この実行の値（_mask_values）と URL の中の値を _mask_url と同じように伏せ字にする。
+
+    URL を囲む引用符やかっこはそのまま残す。
+    """
+    words = []
+    for word in _mask_values(text).split():
+        if "/" in word or "?" in word:
+            m = re.match(r"([\"'(<\[]*)(.*?)([\"')>\],.:]*)$", word)
+            word = m.group(1) + _mask_url(m.group(2)) + m.group(3)
+        words.append(word)
+    return " ".join(words)
+
+
+def _note_issued(resp, *args, **kwargs):
+    """応答の Location（リダイレクト先）にあって、リクエストの URL には無かった値（パスに入ったセッション ID など）を、
+    表示で隠す値として覚える（session の response フック。_step_start が付ける）。
+
+    requests はリダイレクト先へ進む前にこれを呼ぶので、その手順の警告やエラー（リダイレクト先に接続できなかったときも）に
+    値は出ない。対象はパスの部分と「名前=値」の値で、6 文字以上で、数字を含むもの（menu01.do、JU0101_01.aspx のような
+    画面のファイル名は除く）か、英字（と - _）だけで単語の並びに見えないもの（_looks_random。MainMenu や results はそのまま）。
+    """
+    sent = str(getattr(getattr(resp, "request", None), "url", "") or "")
+    location = re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*:)?//[^/?#]*", "", resp.headers.get("Location") or "")
+    for piece in re.split(r"[/;?&#]", location):
+        part = piece.split("=", 1)[-1]
+        if len(part) < 6 or part in sent:
+            continue
+        file_name = re.fullmatch(r"[A-Za-z][A-Za-z_-]*\d{0,4}(?:[_-]\d{1,4})?\.[A-Za-z][A-Za-z0-9]{0,4}", part)
+        letters = re.sub(r"[_-]", "", part)
+        if ((re.search(r"\d", part) and not file_name)
+                or (re.fullmatch(r"[A-Za-z]{6,}", letters) and _looks_random(letters))):
+            _STEP["issued"].add(part)
+    return resp
+
+
+def _debug(text):
+    """DEBUG のときだけ、手順の番号を付けて標準エラー出力に表示する（値そのものは表示しない）。"""
+    if DEBUG:
+        print("[{}/{}]   {}".format(_STEP["no"], _STEP["total"], " ".join(str(text).split())), file=sys.stderr, flush=True)
+
+
+def _cookie_keys(session):
+    """session の Cookie を (名前, domain, path) ごとに。値は変化を調べるためだけに使い、表示しない。"""
+    return {(c.name, c.domain, c.path): c.value for c in session.cookies}
+
+
+def _step_start(no, total, label, session=None, ctx=None):
+    """手順を始める前に呼ぶ（失敗したときに、どの手順で止まったかを表示するため）。
+
+    session と ctx は、表示するメッセージから Cookie の値や取り出した値を隠すために覚えておく（_mask_values）。
+    session には、リダイレクト先で渡された値を覚える _note_issued を一度だけ付ける。
+    DEBUG のときは、この手順が送る動的な値の取得元と種類を DEPENDENCIES から表示する（値そのものは表示しない）。
+    """
+    _STEP.update(no=no, total=total, label=label, ok=False, session=session, ctx=ctx)
+    hooks = (getattr(session, "hooks", None) or {}).get("response")
+    if isinstance(hooks, list) and _note_issued not in hooks:
+        hooks.append(_note_issued)
+    if not DEBUG:
+        return
+    for step, place, name, kind, source, var in DEPENDENCIES:
+        if step == no:
+            size = ""
+            if ctx is not None and var in ctx and kind in ("C", "D") and ctx[var] is not None:
+                size = "（長さ {}）".format(len(str(ctx[var])))
+            _debug("{} {}  [{}] {}{}".format(place, name, kind, source, size))
+    if session is not None:
+        _STEP["jar"] = _cookie_keys(session)
+
+
+def _step_ok(resp, session=None):
+    """手順が成功したら「[2/9] OK ...」と表示する。HTML なら、受け取った画面のタイトルも出す。
+
+    DEBUG のときは、この手順で受け取った Cookie（新規 / 値の変更 / 削除と domain・path。値は表示しない）と、
+    記録時にこの手順で起きたセッション切替が今回も起きたかを表示する。
+    """
+    _STEP["ok"] = True
+    title = ""
+    if "html" in resp.headers.get("Content-Type", "").lower():
+        m = re.search(r"<title[^>]*>(.*?)</title>", _text(resp), re.I | re.S)
+        if m and m.group(1).strip():
+            title = "  「{}」".format(" ".join(m.group(1).split())[:60])
+    line = "[{}/{}] OK  {} ({}){}".format(_STEP["no"], _STEP["total"], _STEP["label"], resp.status_code, title)
+    print(line, file=sys.stderr, flush=True)
+    if not DEBUG or session is None or _STEP.get("jar") is None:
+        return
+    before, after = _STEP["jar"], _cookie_keys(session)
+    for key in after:
+        if key in before and before[key] == after[key]:
+            continue
+        what = "新規" if key not in before else "値が変わりました"
+        _debug("Cookie 受信 {}（domain={}, path={}）{}".format(key[0], key[1], key[2], what))
+    for key in before:
+        if key not in after:
+            _debug("Cookie 削除 {}（domain={}, path={}）".format(key[0], key[1], key[2]))
+    for no, name in SESSION_SWITCHES:
+        if no == _STEP["no"]:
+            changed = any(k[0] == name and before.get(k) != v for k, v in after.items())
+            _debug("記録時はこの手順で Cookie {} が切り替わりました（今回: {}）".format(name, "切り替わりました" if changed else "変化なし"))
+'''
+
+#: Emitted when the plan needs them: ``(helper name, source)`` in emission order.
+_COOKIE_HELPERS_SRC: tuple[tuple[str, str], ...] = (
+    ("_cookie", r'''
+def _cookie(source, name, url, path=None, domain=None):
+    """Cookie name の値を返す（Cookie は名前だけでなく domain と path で区別する: RFC 6265）。
+
+    url へのリクエストで送られる Cookie（domain / path / Secure / 有効期限で選ばれたもの）の中から name のものを
+    選ぶ。同じ名前の Cookie が複数あるとき（ポータルと業務画面がそれぞれ発行した場合など）は、記録時と同じ
+    path・domain のもの、無ければ path が最も長いもの。source は session か、リダイレクト途中の応答（_hop）。
+    見つからなければ、値ではなく名前と送り先を示して止める。
+    """
+    jar = getattr(source, "cookies", source)
+    request = requests.Request("GET", url).prepare()
+    sent = (requests.cookies.get_cookie_header(jar, request) or "").split("; ")
+    found = [c for c in jar if c.name == name and "{}={}".format(c.name, c.value) in sent]
+    if not found:
+        raise RuntimeError(
+            "Cookie {} が見つかりません（送り先 {}、記録時 domain={} path={}）。ログインに失敗したか、"
+            "セッションが切れている可能性があります".format(name, _mask_url(url), domain or "-", path or "/")
+        )
+    found.sort(key=lambda c: len(c.path or ""), reverse=True)
+    wanted = (domain or "").lstrip(".").lower()
+    exact = [
+        c for c in found
+        if (path is None or c.path == path)
+        and (not wanted or (c.domain or "").lstrip(".").lower() in (wanted, wanted + ".local"))
+    ]
+    chosen = (exact or found)[0]
+    _debug("Cookie {} を送り先 {} に合わせて選択: domain={} path={}（同じ名前 {} 件、長さ {}）".format(
+        name, _mask_url(url), chosen.domain, chosen.path, len(found), len(chosen.value or "")))
+    return chosen.value
+'''),
+    ("_set_cookie", r'''
+def _set_cookie(session, url, name, value, path=None, domain=None):
+    """Cookie を、url のサーバーが Set-Cookie で送ってきたのと同じ扱いで session に入れる。
+
+    画面のスクリプトが設定した Cookie や、記録前からあった Cookie を再現するときに使う。domain を指定しなければ
+    url のホストだけに送られる Cookie になる（http://kanri/ のようなドットの無いホスト名でも送られる）。
+    日本語などの値は、ブラウザと同じように UTF-8 のバイト列として送る。
+    """
+    value = "" if value is None else str(value)
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError:
+        value = value.encode("utf-8").decode("latin-1")
+    line = "{}={}".format(name, value)
+    if path:
+        line += "; Path=" + path
+    if domain:
+        line += "; Domain=" + domain
+    headers = email.message.Message()
+    headers["Set-Cookie"] = line
+    request = requests.Request("GET", url).prepare()
+    session.cookies.extract_cookies(requests.cookies.MockResponse(headers), requests.cookies.MockRequest(request))
+    _debug("Cookie {} を設定: {}（path={}{}）".format(name, _mask_url(url), path or "/", ", domain=" + domain if domain else ""))
+'''),
+    ("_need", r'''
+def _need(value, what):
+    """取り出した値が無い（None）ときに、何が無かったかを示して止める（後の手順で分かりにくく失敗しないように）。"""
+    if value is None:
+        raise RuntimeError("{} が見つかりません。記録したときと画面の流れが違う可能性があります".format(what))
+    return value
+'''),
+    ("_hop", r'''
+def _hop(resp, index):
+    """リダイレクトの途中の応答（最初の応答が 0 番目）を返す。"""
+    chain = list(resp.history) + [resp]
+    if index >= len(chain):
+        raise RuntimeError("リダイレクトの {} 番目の応答がありません（今回の応答は {} 個）。記録したときと画面の流れが違う可能性があります"
+                           .format(index + 1, len(chain)))
+    return chain[index]
+'''),
+    ("_host_cookie_hook", r'''
+def _host_cookie_hook(resp, *args, **kwargs):
+    """「Domain なし」と「Domain=そのホスト」の同じ名前・path の Cookie を、ブラウザと同じく 1 つにして受け取る。
+
+    ブラウザはこの 2 つを同じ Cookie として扱い置き換えるが、Python は別の Cookie として両方を持ち、両方を送って
+    しまうため（古い値が先に送られる、ログアウトで消えない）、受け取ったのと違う方を消す（値は変えない）。1 つの
+    応答に同じ Cookie が何度もあれば、ブラウザと同じく最後のものにする。http://kanri/ のようなドットの無い
+    ホスト名の Domain は外す（外さないと Python が送り返さない）。
+    """
+    original = getattr(getattr(resp, "raw", None), "_original_response", None)
+    msg = getattr(original, "msg", None)
+    url = urlsplit(resp.url)
+    host = (url.hostname or "").lower()
+    if msg is None or not host:
+        return resp
+    pattern = r";\s*domain\s*=\s*\.?" + re.escape(host) + r"\.?\s*(?=;|$)"
+    default_path = url.path[:url.path.rfind("/")] or "/"
+    lines = msg.get_all("Set-Cookie") or []
+    last = {}
+    for line in lines:
+        own = re.search(pattern, line, flags=re.I) is not None
+        if "." not in host:
+            line = re.sub(pattern, "", line, flags=re.I)
+        path = re.search(r";\s*path\s*=([^;]*)", line, flags=re.I)
+        domain = re.search(r";\s*domain\s*=([^;]*)", line, flags=re.I)
+        name = line.split(";", 1)[0].split("=", 1)[0].strip()
+        key = (name, path.group(1).strip() if path else default_path, "" if own or not domain else domain.group(1).strip().lstrip(".").lower())
+        last[key] = (line, own, path is not None)
+    fixed = []
+    for (name, path, domain), (line, own, explicit) in last.items():
+        if "." in host and not domain:
+            fixed.append(name + "=" + ("" if own else "; Domain=" + host) + ("; Path=" + path if explicit else "") + "; Max-Age=0")
+        fixed.append(line)
+    if fixed != lines:
+        del msg["Set-Cookie"]
+        for line in fixed:
+            msg["Set-Cookie"] = line
+    return resp
+'''),
+    ("_cookie_attr_hook", r'''
+def _cookie_attr_hook(resp, *args, **kwargs):
+    """Set-Cookie から、ブラウザが無視する属性（空の Domain、整数でない Max-Age、/ で始まらない Path）を外して受け取る。
+
+    ブラウザはその属性だけを無視して Cookie を受け取るが、Python は Cookie ごと捨てたり、送らない場所に置いたり
+    するため（ログインの Cookie が送られない）。
+    """
+    original = getattr(getattr(resp, "raw", None), "_original_response", None)
+    msg = getattr(original, "msg", None)
+    if msg is None:
+        return resp
+    lines = msg.get_all("Set-Cookie") or []
+    pattern = (r";\s*(?:domain\s*(?:=[\s.]*)?|max-age\s*(?:=(?!\s*-?\d+\s*(?:;|$))[^;]*)?"
+               r"|path\s*(?:=\s*[^\s;/][^;]*)?)(?=;|$)")
+    fixed = [re.sub(pattern, "", line, flags=re.I) for line in lines]
+    if fixed != lines:
+        del msg["Set-Cookie"]
+        for line in fixed:
+            msg["Set-Cookie"] = line
+    return resp
+'''),
+    ("_ie_cookie_hook", r'''
+def _ie_cookie_hook(resp, *args, jar=None, **kwargs):
+    """Set-Cookie を、記録したブラウザ（IE モード）と同じ Cookie になるように直してから受け取る（値は変えない）。
+
+    IE は Path のない Cookie をページのフォルダー（末尾の / まで）に置くが、Python は末尾の / を付けないため、同じ
+    Cookie が 2 つになってしまう（古い値が先に送られる）。IE と同じ Path を付ける。また IE は「Domain なし」と
+    「Domain=そのホスト」を同じ Cookie として扱うので、受け取ったのと違う方を消す（ログアウトで消えるように）。
+    サブドメインからの「Domain=親のホスト」も、IE では親のホストの「Domain なし」の Cookie と同じものなので、
+    jar（session.cookies）とこのリクエストの Cookie から親のホストの方を消す（リダイレクトの次のリクエストにも残らない）。
+    1 つの応答に同じ Cookie が何度もあれば、IE と同じく最後のものにする。
+    """
+    original = getattr(getattr(resp, "raw", None), "_original_response", None)
+    msg = getattr(original, "msg", None)
+    url = urlsplit(resp.url)
+    host = (url.hostname or "").lower()
+    if msg is None or not host:
+        return resp
+    folder = url.path[:url.path.rfind("/") + 1] or "/"
+    pattern = r";\s*domain\s*=\s*\.?" + re.escape(host) + r"\.?\s*(?=;|$)"
+    lines = msg.get_all("Set-Cookie") or []
+    last = {}
+    for line in lines:
+        line = re.sub(r";\s*path\s*(?:=(?!\s*/)[^;]*)?(?=;|$)", "", line, flags=re.I)
+        if ";" not in folder and not re.search(r";\s*path\s*=", line, flags=re.I):
+            line += "; Path=" + folder
+        own = "." in host and re.search(pattern, line, flags=re.I) is not None
+        path = re.search(r";\s*path\s*=([^;]*)", line, flags=re.I)
+        domain = re.search(r";\s*domain\s*=([^;]*)", line, flags=re.I)
+        name = line.split(";", 1)[0].split("=", 1)[0].strip()
+        key = (name, path.group(1).strip() if path else folder, "" if own or not domain else domain.group(1).strip().lstrip(".").lower())
+        last[key] = (line, own, path is not None)
+    fixed = []
+    for (name, path, domain), (line, own, explicit) in last.items():
+        if "." in host and not domain:
+            fixed.append(name + "=" + ("" if own else "; Domain=" + host) + ("; Path=" + path if explicit else "") + "; Max-Age=0")
+        elif "." in domain and host.endswith("." + domain):
+            for cookies in (jar, getattr(getattr(resp, "request", None), "_cookies", None)):
+                try:
+                    cookies.clear(domain, path, name)
+                except (AttributeError, KeyError):
+                    pass
+        fixed.append(line)
+    if fixed != lines:
+        del msg["Set-Cookie"]
+        for line in fixed:
+            msg["Set-Cookie"] = line
+    return resp
+'''),
+    ("_Session", r'''
+class _Session(requests.Session):
+    """ブラウザ（Chrome / Edge）と同じ送り先で Cookie を送る requests.Session（リダイレクトの途中も同じ）。
+
+    Domain 属性なしで受け取った Cookie は、そのホストにだけ送る。Python の既定はサブドメインにも送るため、親の
+    ホスト（ポータルなど）とサブドメイン（業務画面など）が同じ名前の Cookie を発行すると、両方が送られてしまう
+    （違う値が先に送られる）。requests がリクエストごとに作る jar にも同じ規則を使う。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.cookies.set_policy(self._policy())
+
+    @staticmethod
+    def _policy():
+        policy = http.cookiejar.DefaultCookiePolicy
+        return policy(strict_ns_domain=policy.DomainStrictNonDomain)
+
+    def prepare_request(self, request):
+        prepared = super().prepare_request(request)
+        jar = requests.cookies.RequestsCookieJar(self._policy())
+        jar.update(prepared._cookies)
+        prepared.headers.pop("Cookie", None)
+        prepared.prepare_cookies(jar)
+        return prepared
+'''),
+)
 
 #: Emitted verbatim (top level) whenever the plan has steps: the DESIGN.md §13.13 download rule.
 #:
@@ -6305,7 +10126,8 @@ class _Generator:
 #:   is the same rule for the GUI.
 #: * ``_download_name``: RFC 6266 ``filename*=``, RFC 2047 encoded words (``=?UTF-8?B?...?=`` from
 #:   .NET), IE-style percent-encoded UTF-8, or raw UTF-8 / Shift_JIS bytes that http.client decoded
-#:   as Latin-1; else the URL's last segment; else ``output`` + an extension from the MIME type.
+#:   as Latin-1; else the URL's last segment without its ``;params`` (``report.xls;jsessionid=...`` ->
+#:   ``report.xls``: no session id in the name); else ``output`` + an extension from the MIME type.
 #:   ``_safe_file_name`` removes path parts and characters Windows forbids, prefixes reserved device
 #:   names (``CON``, ``NUL``, ``COM1`` ... with any extension) with ``_`` and shortens names longer
 #:   than 150 characters keeping the extension.  ``core.download_filename`` mirrors it.
@@ -6385,7 +10207,7 @@ def _safe_file_name(name):
 
 
 def _download_name(resp):
-    """保存するファイル名: Content-Disposition のファイル名 → URL の末尾 → output + 拡張子。
+    """保存するファイル名: Content-Disposition のファイル名 → URL の末尾（;jsessionid=... などは除く） → output + 拡張子。
 
     filename*=UTF-8''...（RFC 6266）、=?UTF-8?B?...?=（RFC 2047）、IE 向けに URL エンコードされた
     UTF-8、Shift_JIS / UTF-8 の生バイト（requests は Latin-1 として読むので元に戻して読み直す）に対応する。
@@ -6417,7 +10239,7 @@ def _download_name(resp):
                         continue
     name = _safe_file_name(name)
     if not name:
-        last = _unquote(urlsplit(resp.url).path.rsplit("/", 1)[-1], "utf-8")
+        last = _unquote(urlsplit(resp.url).path.rsplit("/", 1)[-1].split(";", 1)[0], "utf-8")
         ext = last.rsplit(".", 1)[-1].lower() if "." in last else ""
         name = _safe_file_name(last) if ext and ext not in _PAGE_EXTENSIONS else ""
     if not name:
@@ -6477,6 +10299,20 @@ def _env_name(const: Constant) -> str:
     return env
 
 
+def _steps_text(numbers: Iterable[int]) -> str:
+    """``[1, 2, 3, 5]`` -> ``"1〜3, 5"`` (step numbers for comments)."""
+    nums = sorted({int(n) for n in numbers})
+    parts: list[str] = []
+    i = 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        parts.append(f"{nums[i]}〜{nums[j]}" if j > i + 1 else (f"{nums[i]}, {nums[j]}" if j == i + 1 else str(nums[i])))
+        i = j + 1
+    return ", ".join(parts)
+
+
 def _dotted(path: Sequence[Any]) -> str:
     out = ""
     for p in path:
@@ -6527,6 +10363,19 @@ def _legacy_bytes_note(raw: bytes) -> str:
     return _comment_text(f"記録時の表記: {truncate(spelled, 60)}")
 
 
+def _bytes_display_charset(values: Sequence[Any]) -> str:
+    """The charset (cp932 / EUC-JP) that decodes every recorded legacy-charset value, for display only."""
+    for enc in ("cp932", "euc_jp"):
+        try:
+            for value in values:
+                if isinstance(value, (bytes, bytearray)):
+                    bytes(value).decode(enc)
+            return enc
+        except UnicodeDecodeError:
+            continue
+    return "cp932"
+
+
 def _helpers_for_extractor(ext: Extractor) -> set[str]:
     kind = ext.kind
     need: set[str] = set()
@@ -6536,7 +10385,13 @@ def _helpers_for_extractor(ext: Extractor) -> set[str]:
         need |= {"_soup", "_elem_text"}
     elif kind == "json":
         need.add("_json_path")
-    if kind in ("regex", "url") or (kind in ("html_attr", "html_text") and ext.pattern):
+    elif kind == "cookie":
+        need.add("_cookie")
+    elif kind == "header":
+        need.add("_need")
+        if getattr(ext, "hop", None) is not None:
+            need.add("_hop")
+    if kind in ("regex", "url") or (kind in ("html_attr", "html_text", "header") and ext.pattern):
         need.add("_regex")
     return need
 
@@ -9655,7 +13510,8 @@ def load_sources(paths: list[str]) -> Recording:
 # --------------------------------------------------------------------------- script runner
 
 #: A progress line of a generated script on stderr: ``[2/9] OK  POST /Login.aspx ...``,
-#: ``[3/9] 失敗  ...`` or ``[完了] すべての手順が終わりました（9 手順）`` (codegen ``_emit_progress_helpers``).
+#: ``[3/9] ERROR  ...`` or ``[完了] すべての手順が終わりました（9 手順）`` (codegen ``_emit_progress_helpers``).
+#: With REQREC_DEBUG the dependency lines ``[3/9]   ...`` match too, so they stay in the run console.
 _PROGRESS_LINE_RE = re.compile(r"^\[(?:\d+/\d+|完了)\] ")
 
 
@@ -10230,7 +14086,9 @@ def _body_view(body: Optional[bytes], content_type: Optional[str], mime: Optiona
         text = text[:BODY_LIMIT]
     view: dict[str, Any] = {"kind": kind, "size": size, "text": text, "truncated": truncated, "mime": mime}
     if kind == "form":
-        view["pairs"] = [list(p) for p in parse_form(decode_body(body, content_type))]
+        # byte level: a Shift_JIS form keeps its percent-encoded spelling (never U+FFFD)
+        declared = detect_charset(b"", content_type) if content_type and parse_content_type(content_type)[1].get("charset") else None
+        view["pairs"] = [list(p) for p in parse_form_bytes(body, declared)]
     return view
 
 
@@ -10586,7 +14444,7 @@ def _suggest_script_name(plan: Plan) -> str:
 
 #: Plan / codegen notes that describe what the script does for the user rather than a risk
 #: (Shift_JIS form bodies are re-encoded faithfully): shown as information, not under 「確認してください」.
-_INFO_NOTE_MARKERS = ("UTF-8 以外の文字コード", "looks like a credential")
+_INFO_NOTE_MARKERS = ("UTF-8 以外の文字コード", "looks like a credential", "セッション切替を検出しました", "手順に含めました")
 
 
 def _split_warnings(warnings: list[str]) -> tuple[list[str], list[str]]:
@@ -11975,6 +15833,7 @@ textarea.code-editor[readonly] { opacity: .7; }
   <div class="card" id="detail-run">
     <h2>4. 試しに実行する</h2>
     <div id="detail-env" class="form-grid compact"></div>
+    <label class="check"><input type="checkbox" id="detail-run-debug"><span>詳しい情報も表示する（送る値をどこから取ったか、使った Cookie の domain / path。値そのものは表示しません）</span></label>
     <div class="actions">
       <button type="button" id="detail-run-btn" class="btn primary" disabled>▶ 試しに実行する</button>
       <button type="button" id="detail-run-stop" class="btn danger" disabled>■ 停止</button>
@@ -12523,7 +16382,7 @@ textarea.code-editor[readonly] { opacity: .7; }
       [/ConnectTimeout|Read timed out|timed out/i, 'サイトの応答がありません (タイムアウト)。しばらくしてからもう一度実行してください。'],
       [/CERTIFICATE_VERIFY_FAILED|SSLError|SSLCertVerificationError/i, 'https:// のサイトの証明書を確認できませんでした。このツールが対象とするのは http:// のサイトです。'],
       [/ConnectionRefused|Connection refused|WinError 10061/i, 'サイトに接続できません (接続が拒否されました)。サイトが動いているか確認してください。'],
-      [/\b(401|403) Client Error|Unauthorized for url|Forbidden for url/, 'ログインに失敗したか、権限がありません。パスワードなどの入力値を確認してください。'],
+      [/\b(401|403) Client Error|Unauthorized for url|Forbidden for url|: HTTP (401|403) /, 'ログインに失敗したか、権限がありません。パスワードなどの入力値を確認してください。'],
       [/REQREC_[A-Z_]+ (が|is) /, '実行に必要な入力 (パスワードなど) が足りません。上の入力欄をすべて埋めてください。'],
       [/要素が見つかりません|パターンに一致しませんでした|JSON にパス/, '画面の内容が記録したときと違うため、続きの値を取り出せませんでした。パスワードが正しいか、ログインが拒否されていないかを確認してください。サイトの画面が変わった場合は、もう一度記録してください。'],
       [/ModuleNotFoundError: No module named '(requests_negotiate_sspi|requests_ntlm)'/, 'Windows 統合認証用の部品が入っていません。管理者に pip install "reqrec[sspi]" の実行を依頼してください。'],
@@ -12714,7 +16573,11 @@ textarea.code-editor[readonly] { opacity: .7; }
     Run.bindView('detail', {
       canRun: () => !!S.script,
       onRun: async () => {  // unsaved edits are saved first: the run uses the file
-        if (!dirty() || await save()) await Run.start(S.script, Run.collectEnvFrom($('#detail-env')));
+        if (!dirty() || await save()) {
+          const env = Run.collectEnvFrom($('#detail-env'));
+          if ($('#detail-run-debug').checked) env.REQREC_DEBUG = '1';  // the script's dependency debug lines
+          await Run.start(S.script, env);
+        }
       },
     });
     return { setScript, loadScript, refresh, dirty };
@@ -13834,6 +17697,20 @@ def _auth_label(auth: Optional[dict[str, Any]], constants: Sequence[dict[str, An
     return text
 
 
+def _constant_display(value: Any) -> Any:
+    """A constant's value for reports: the text of a legacy-charset (bytes) value, decoded as cp932 /
+    EUC-JP when possible, else its percent-encoded spelling."""
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+        for enc in ("cp932", "euc_jp"):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return quote_from_bytes(raw, safe="")
+    return value
+
+
 def build_inspect_report(recording: Recording, plan: Plan, source: str = "",
                          inputs: Optional[Sequence[str]] = None) -> dict[str, Any]:
     """Machine-readable summary of a plan (what ``inspect --json`` prints).
@@ -13854,7 +17731,7 @@ def build_inspect_report(recording: Recording, plan: Plan, source: str = "",
             loop = {
                 "var": step.loop.var,
                 "count": len(step.loop.values),
-                "values": list(step.loop.values),
+                "values": [_constant_display(v) for v in step.loop.values],
                 "numeric_range": list(step.loop.numeric_range) if step.loop.numeric_range is not None else None,
             }
         steps.append({
@@ -13906,8 +17783,11 @@ def build_inspect_report(recording: Recording, plan: Plan, source: str = "",
             "name": c.name,
             "secret": bool(c.secret),
             "env_var": c.env_var,
-            "value": None if c.secret else c.value,
+            # passwords are never shown (the script holds them as the user decided)
+            "value": None if c.secret or getattr(c, "sensitive", False) else _constant_display(c.value),
             "comment": c.comment,
+            "kind": getattr(c, "kind", "shared"),
+            "sensitive": bool(getattr(c, "sensitive", False)),
         }
         for c in plan.constants
     ]
@@ -14008,11 +17888,14 @@ def format_inspect_report(report: dict[str, Any]) -> str:
     if constants:
         lines.append(f"定数 ({len(constants)} 件):")
         for c in constants:
+            label = "入力値 " if c.get("kind") == "input" else ""
             if c["secret"]:
                 env = c["env_var"] or "(環境変数名なし)"
-                lines.append(f"  {c['name']}  ← 環境変数 {env}（秘密情報: 実行前に設定してください）")
+                lines.append(f"  {label}{c['name']}  ← 環境変数 {env}（秘密情報: 実行前に設定してください）")
+            elif c.get("sensitive"):
+                lines.append(f"  {label}{c['name']} = （パスワードなどのため表示しません）")
             else:
-                lines.append(f"  {c['name']} = {truncate(repr(c['value']), 60)}")
+                lines.append(f"  {label}{c['name']} = {truncate(repr(c['value']), 60)}")
         lines.append("")
 
     cookies = report.get("initial_cookies") or []
