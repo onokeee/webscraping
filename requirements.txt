@@ -18,5 +18,9 @@ beautifulsoup4==4.15.0
 # 詳細設定の「HTML の読み取り方」で lxml を選ぶ場合
 # lxml==6.1.3
 
+# LAN環境内のサイトが Windows 統合認証（NTLM / Negotiate）で、作ったスクリプトを今 Windows にログインしているユーザーのまま認証させる場合
+# requests_negotiate_sspi>=0.5
+
 # LAN環境内のサイトが Windows 統合認証（NTLM）で、作ったスクリプトにユーザー名とパスワードを渡して認証する場合
+# （requests_negotiate_sspi も入れると、そちらが優先されます）
 # requests_ntlm>=1.2

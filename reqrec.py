@@ -9697,10 +9697,11 @@ class _Generator:
         if kind in ("ntlm", "negotiate"):
             default_user = auth.username or "DOMAIN\\user"
             return [
-                '統合 Windows 認証には追加パッケージが必要です。Windows: pip install "reqrec[sspi]"'
+                "統合 Windows 認証には追加パッケージが必要です。Windows: python -m pip install requests_negotiate_sspi"
                 "（今ログインしているユーザーで認証します）",
-                'Windows 以外 / 別のユーザーで実行する場合: pip install "reqrec[ntlm]" のうえ、環境変数 '
-                f"REQREC_NTLM_USER（例: {default_user}）と REQREC_NTLM_PASSWORD を設定してください",
+                "Windows 以外 / 別のユーザーで実行する場合: python -m pip install requests_ntlm のうえ、環境変数 "
+                f"REQREC_NTLM_USER（例: {default_user}）と REQREC_NTLM_PASSWORD を設定してください"
+                "（requests_negotiate_sspi が入っている PC では、今ログインしているユーザーで認証します）",
             ]
         if kind in ("basic", "digest"):
             pw = next((c for c in self._all_constants() if c.name == self.auth_pw_const), None)
@@ -10617,20 +10618,23 @@ class _Generator:
             w.line("try:")
             with w.indent():
                 self._cl("from requests_negotiate_sspi import HttpNegotiateAuth",
-                         'Windows: 今ログインしているユーザーで認証（pip install "reqrec[sspi]"）')
+                         "Windows: 今ログインしているユーザーで認証（python -m pip install requests_negotiate_sspi）")
                 w.line("session.auth = HttpNegotiateAuth()")
             w.line("except ImportError:")
             with w.indent():
                 w.line("try:")
                 with w.indent():
                     self._cl("from requests_ntlm import HttpNtlmAuth",
-                             '他の OS / 別ユーザーで認証する場合（pip install "reqrec[ntlm]"）')
+                             "他の OS / 別ユーザーで認証する場合（python -m pip install requests_ntlm）")
                 w.line("except ImportError:")
                 with w.indent():
                     w.line("raise SystemExit(")
                     with w.indent():
-                        w.line(_lit('統合 Windows 認証には追加パッケージが必要です: pip install "reqrec[sspi]"（Windows）'
-                                    ' または pip install "reqrec[ntlm]"（他の OS。環境変数 REQREC_NTLM_USER / REQREC_NTLM_PASSWORD も設定）'))
+                        # the GUI's ERROR_HINTS recognise this message by its first sentence
+                        w.line(_lit("統合 Windows 認証には追加パッケージが必要です: "
+                                    "python -m pip install requests_negotiate_sspi（今ログインしているユーザーで認証） または "
+                                    "python -m pip install requests_ntlm（他の OS / 別のユーザー。"
+                                    "環境変数 REQREC_NTLM_USER / REQREC_NTLM_PASSWORD も設定）"))
                     w.line(") from None")
                 user_default = _lit(auth.username) if auth.username else _NTLM_USER_PLACEHOLDER
                 w.line(
@@ -15369,7 +15373,7 @@ def _secrets_of(plan: Plan) -> list[dict[str, Any]]:
     auth = plan.auth
     if auth is not None and str(auth.kind or "").lower() in ("ntlm", "negotiate"):
         # ``auth`` marks the Windows-authentication entries: the easy screen keeps their own
-        # instruction (the logged-in Windows user via reqrec[sspi] needs neither value) instead of
+        # instruction (the logged-in Windows user via requests_negotiate_sspi needs neither value) instead of
         # 「記録したときと同じ値を入れてください」, and does not count the user name (written into the
         # script as its default) among the values 「スクリプトに書き込まれていません」.
         kind = str(auth.kind).lower()
@@ -15380,14 +15384,15 @@ def _secrets_of(plan: Plan) -> list[dict[str, Any]]:
             out.append({
                 "name": f"{label} 認証のユーザー名 (DOMAIN\\user)", "env_var": "REQREC_NTLM_USER", "secret": False,
                 "default": auth.username or "", "auth": kind,
-                "comment": f"{who}。Windows で今ログインしているユーザーのまま認証する場合 (reqrec[sspi]) は空欄のまま (使われません)",
+                "comment": f"{who}。Windows で今ログインしているユーザーのまま認証する場合 "
+                           "(requests_negotiate_sspi を入れた PC) は空欄のまま (使われません)",
             })
         if "REQREC_NTLM_PASSWORD" not in seen:
             seen.add("REQREC_NTLM_PASSWORD")
             out.append({
                 "name": f"{label} 認証のパスワード", "env_var": "REQREC_NTLM_PASSWORD", "secret": True, "auth": kind,
-                "comment": "Windows 以外 / 別のユーザーで実行する場合 (reqrec[ntlm]) に必要。"
-                           "Windows で今ログインしているユーザーのまま認証する場合 (reqrec[sspi]) は空欄のまま",
+                "comment": "Windows 以外 / 別のユーザーで実行する場合 (requests_ntlm を入れた PC) に必要。"
+                           "Windows で今ログインしているユーザーのまま認証する場合 (requests_negotiate_sspi を入れた PC) は空欄のまま",
             })
     return out
 
@@ -17696,7 +17701,7 @@ textarea.code-editor[readonly] { opacity: .7; }
       return field ? `${kind} (入力欄: ${field[1]})` : kind;
     }
     function friendlySecretHint(s) {
-      // Windows authentication keeps its own instruction: with reqrec[sspi] the logged-in Windows user
+      // Windows authentication keeps its own instruction: with requests_negotiate_sspi the logged-in Windows user
       // is used and both fields stay blank; 「記録したときと同じ値」 would be wrong advice there.
       if (s.auth) return s.comment || '';
       return '記録したときと同じ値を入れてください。実行するときだけ使われ、どこにも保存されません。';
@@ -17773,7 +17778,7 @@ textarea.code-editor[readonly] { opacity: .7; }
       [/REQREC_[A-Z_]+ (が|is) /, '実行に必要な入力 (パスワードなど) が足りません。上の入力欄をすべて埋めてください。'],
       [/が選んだ値の行が(ありません|複数あります)/, '記録したときに一覧から選んだ行 (名前などが同じ行) が、今回の一覧に無いか、複数あります。入力値を確認してください。一覧の内容が変わった場合は、もう一度記録してください。'],
       [/要素が見つかりません|パターンに一致しませんでした|JSON にパス/, '画面の内容が記録したときと違うため、続きの値を取り出せませんでした。パスワードが正しいか、ログインが拒否されていないかを確認してください。サイトの画面が変わった場合は、もう一度記録してください。'],
-      [/ModuleNotFoundError: No module named '(requests_negotiate_sspi|requests_ntlm)'/, 'Windows 統合認証用の部品が入っていません。管理者に pip install "reqrec[sspi]" の実行を依頼してください。'],
+      [/ModuleNotFoundError: No module named '(requests_negotiate_sspi|requests_ntlm)'|統合 Windows 認証には追加パッケージが必要です/, 'Windows 統合認証用の部品が入っていません。管理者に python -m pip install requests_negotiate_sspi の実行を依頼してください (別のユーザーで認証する場合は、代わりに python -m pip install requests_ntlm)。'],
       [/ModuleNotFoundError: No module named '([\w.]+)'/, '必要な部品 ($1) が入っていません。管理者に pip install の実行を依頼してください。'],
       [/status (\d{3}) .*expected|想定外のステータス|unexpected status/i, 'サイトの応答が記録したときと違います。サイト側が変わったか、ログインが切れている可能性があります。'],
       [/SyntaxError|IndentationError|TabError/, 'スクリプトの書き方に誤りがあります。詳細設定でコードを書き換えた場合は、エラーメッセージの行を確認してください。'],
@@ -19126,7 +19131,7 @@ def _auth_label(auth: Optional[dict[str, Any]], constants: Sequence[dict[str, An
                 text += f"（パスワードは環境変数 {c['env_var']}）"
                 break
     if kind in ("ntlm", "negotiate"):
-        text += '（pip install "reqrec[sspi]" / "reqrec[ntlm]"）'
+        text += "（追加パッケージが必要: python -m pip install requests_negotiate_sspi または requests_ntlm）"
     return text
 
 
