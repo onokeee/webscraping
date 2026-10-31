@@ -847,6 +847,9 @@ class Plan:
     #: ``_ie_cookie_hook`` removes the parent host's copy
     parent_domain_cookie_hosts: list[str] = field(default_factory=list)
     cookie_profile: str = "rfc6265"  # the recording browser's cookie rules (COOKIE_PROFILES)
+    #: hosts the steps (or their redirects) reach over https:// (only HAR files have them): the script checks
+    #: their certificates with the Windows certificate store too (``_windows_certificates``), as Edge does
+    https_hosts: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- options
@@ -1443,7 +1446,66 @@ def recording_from_har(har: dict[str, Any], source: str = "") -> Recording:
     browser = _creator_string(har_log.get("browser"))
     if browser:
         meta["browser"] = browser
+    if _har_without_sensitive_data(raw_entries, har_log.get("creator")):
+        meta["sensitive_data_removed"] = True
     return Recording(flows=flows, meta=meta)
+
+
+def _har_without_sensitive_data(entries: list[Any], creator: Any) -> bool:
+    """A HAR that the F12 tools of Edge / Chrome (creator ``WebInspector``) saved without the sensitive
+    data - their default "Export HAR (sanitized)": not one Cookie / Set-Cookie / Authorization header and
+    no cookie list anywhere, although one site was asked more than once."""
+    name = str(creator.get("name") or "") if isinstance(creator, dict) else ""
+    if "webinspector" not in name.lower():
+        return False
+    per_host: dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("request"), dict):
+            continue
+        req, resp = entry["request"], entry.get("response")
+        url = str(req.get("url") or "")
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        try:
+            host = (urlsplit(url).hostname or "").lower()
+        except ValueError:
+            continue
+        per_host[host] = per_host.get(host, 0) + 1
+        for part, names in ((req, ("cookie", "authorization")), (resp, ("set-cookie",))):
+            if not isinstance(part, dict):
+                continue
+            if part.get("cookies"):
+                return False
+            for item in part.get("headers") or []:
+                if isinstance(item, dict) and str(item.get("name") or "").strip().lower() in names:
+                    return False
+    return max(per_host.values(), default=0) >= 2
+
+
+def har_sensitive_data_removed(meta: dict[str, Any]) -> bool:
+    """Whether a recording (or one of the files merged into it) is such a HAR."""
+    if meta.get("sensitive_data_removed"):
+        return True
+    return any(isinstance(m, dict) and m.get("sensitive_data_removed") for m in meta.get("sources") or [])
+
+
+#: What a generated script prints under ``[n/N] ERROR`` when an https:// certificate could not be checked
+#: (neither requests' list nor the Windows certificate store knows it: a self-signed certificate ...).
+CERTIFICATE_HINT = (
+    "ヒント: https のサイトの証明書を確認できませんでした。Windows に入っている証明書でも確認できない証明書です"
+    "（自己署名の証明書など）。サイトの管理者から証明書のファイル（Base64 形式の .cer / .pem）をもらい、"
+    "実行する前に「set REQUESTS_CA_BUNDLE=そのファイルの場所」を入力してください"
+    "（例: set REQUESTS_CA_BUNDLE=C:\\reqrec\\site.cer）。"
+)
+
+#: The plan's warning for such a HAR (shown first, under 「確認してください」).
+SANITIZED_HAR_WARNING = (
+    "読み込んだ HAR ファイルには、Cookie とログインの情報（Authorization ヘッダー）が 1 つも入っていません。"
+    "Edge や Chrome の F12 開発者ツールで、機密データを除く形（既定の「Export HAR (sanitized)」）で保存したためと"
+    "思われます。このままでは、ログインのあとの手順が失敗することがあります。F12 の設定（歯車）で「Allow to "
+    "generate HAR with sensitive data」をオンにして、「Export HAR (with sensitive data)」で保存し直してください"
+    "（Cookie を使わないサイトなら、このままで構いません）。"
+)
 
 
 def _extract_log(har: Any) -> dict[str, Any]:
@@ -3055,6 +3117,25 @@ def initial_cookie_for(ver: CookieVersion, first_sender: Optional[Flow] = None,
         url=url, host_only=domain is None,
         origin=ver.external_kind or "pre-existing",
     )
+
+
+def _page_writes_cookie(flow: Flow, name: str, value: str) -> bool:
+    """Whether the response is a page or a script holding ``value`` next to the cookie's name and the
+    word ``cookie`` (a script writing ``document.cookie``), not the value echoed in data."""
+    resp = flow.response
+    if resp is None or not resp.body or not value:
+        return False
+    mime = (resp.mime_type or "").lower()
+    if not (mime in ("text/html", "application/xhtml+xml") or "javascript" in mime or "ecmascript" in mime):
+        return False
+    text = resp.text() or ""
+    at = text.find(value)
+    while at >= 0:
+        around = text[max(0, at - 300):at + len(value) + 300]
+        if name in around and "cookie" in around.lower():
+            return True
+        at = text.find(value, at + 1)
+    return False
 
 
 def classify_cookies(flows: list[Flow], profile: str = "rfc6265") -> tuple[list[InitialCookie], set[str]]:
@@ -5881,7 +5962,7 @@ _CODEGEN_NAMES = frozenset({
     "DEBUG", "DEPENDENCIES", "SESSION_SWITCHES", "ISSUED_PLACES", "urlencode", "urlsplit",
     "_debug", "_mask_url", "_mask_text", "_cookie", "_cookie_keys", "_set_cookie", "_need", "_hop",
     "_host_cookie_hook",
-    "_cookie_attr_hook", "_ie_cookie_hook", "_Session", "functools", "warnings",
+    "_cookie_attr_hook", "_ie_cookie_hook", "_Session", "functools", "warnings", "_windows_certificates",
 })
 _GENERIC_JSON_KEYS = frozenset({"id", "value", "token", "code", "key", "name", "data", "result"})
 _WORD_RE = re.compile(r"^[A-Za-z][A-Za-z_-]*$")
@@ -6528,6 +6609,10 @@ class _Builder:
         self._first_sent: dict[str, int] = {}  # per value: position of the first request URL holding it
         #: external cookie versions already set by an earlier step (or INITIAL_COOKIES)
         self.external_done: set[int] = set()
+        #: per page-written cookie version: the steps that do not send it although the browser did (the page
+        #: that writes it answers later - see ``_written_by_a_later_page``)
+        self.cookie_unsent: dict[int, set[int]] = {}
+        self.plan_units: list[_Unit] = []  # the steps' units in order (set by ``build``)
         self.initial_cookies: list[InitialCookie] = []
 
     # ------------------------------------------------------------------ naming
@@ -7970,6 +8055,22 @@ class _Builder:
                           (request_form_charset(req), match.charset))
         return match if row is match.form else _FormMatch(form=row, built=match.built, charset=match.charset)
 
+    def _written_by_a_later_page(self, ver: CookieVersion, flow: Flow, step_no: int) -> bool:
+        """``ver`` - a cookie the page's script wrote, its value in no earlier response - is first sent by
+        ``flow`` (step ``step_no``): whether a page or script the steps fetch from that request on, before
+        the step that sends the cookie next, writes that value (the reloaded page itself answers ``flow``).
+        The page's first load is then missing from the recording, as when a popup's F12 window opened
+        after it; the later steps can read the value from the page that is recorded."""
+        later = sorted(s for s in (self.flow_step.get(id(g)) for g in ver.sent_by) if s is not None and s > step_no)
+        if not later or self.timeline is None:
+            return False
+        start = self.timeline.position(flow)
+        for unit in self.plan_units[step_no - 1:later[0] - 1]:
+            for g in unit.all_flows:
+                if self.timeline.position(g) >= start and _page_writes_cookie(g, ver.name, ver.value):
+                    return True
+        return False
+
     def _cookie_bindings(self, unit: _Unit, step_no: int, cache: dict) -> tuple[list[CookieSet], list[Binding]]:
         """The cookies this step's requests send that the script's jar would not hold by itself: those
         the page's script wrote (or the browser had before the recording) and those set by a response
@@ -8015,8 +8116,20 @@ class _Builder:
                     continue
                 cand = Candidate("cookie", name, value)
                 if is_candidate_value(value, self.opts):
+                    warnings_before, warned_before = len(self.warnings), value in self._warned_values
                     ref = self._resolve(cand, unit, step_no, cache, None, exclude=ver)
                     meta = self._last_meta
+                    if ref.is_literal and ver.external_kind == "script" and self._written_by_a_later_page(ver, f, step_no):
+                        # the page that writes the value answers this request or a later one (the person reloaded
+                        # it, or its first load is not in the recording: a popup's F12 window opened late).  This
+                        # step goes without the cookie, as a fresh browser's would; a later step sets it from that page
+                        prefix = f"step {step_no}: value of `Cookie {name}`"
+                        self.warnings[warnings_before:] = [w for w in self.warnings[warnings_before:] if not w.startswith(prefix)]
+                        if not warned_before:
+                            self._warned_values.discard(value)
+                        self.external_done.discard(id(ver))
+                        self.cookie_unsent.setdefault(id(ver), set()).add(step_no)
+                        continue
                 else:
                     # a short / word-like value (``lang=ja``) is never traced: it would match by coincidence
                     ref, meta = Ref.lit(value), _Resolution("A", source="記録時の値", source_kind="literal")
@@ -8370,6 +8483,8 @@ class _Builder:
 
     def build(self) -> Plan:
         opts = self.opts
+        if har_sensitive_data_removed(self.recording.meta):
+            self.warnings.append(SANITIZED_HAR_WARNING)
         kept, dropped = filter_flows(self.recording, opts)
         # §13.2: fold 401 handshakes first; the final attempt represents each handshake from here on
         if opts.detect_auth:
@@ -8410,6 +8525,7 @@ class _Builder:
         # the browser's cookie jar over the whole recording (kept and dropped requests: a dropped response
         # still set its cookies in the browser), and where each kept request ends up in the plan
         self.kept_ids = {id(f) for unit in units for f in unit.all_flows}
+        self.plan_units = list(units)
         for idx, unit in enumerate(units, start=1):
             for f in unit.all_flows:
                 self.flow_step[id(f)] = idx
@@ -8524,6 +8640,7 @@ class _Builder:
             same_name_cookie_hosts=same_name,
             parent_domain_cookie_hosts=parent_domain,
             cookie_profile=self.cookie_profile,
+            https_hosts=sorted({_cookie_host(f.request.url) for f in kept if f.request.url.lower().startswith("https:")}),
         )
 
     def _session_switches(self) -> list[SessionSwitch]:
@@ -8578,7 +8695,8 @@ class _Builder:
         if self.timeline is None:
             return []
         for ver in self.timeline.versions:
-            used = sorted({self.flow_step[id(f)] for f in ver.sent_by if id(f) in self.flow_step})
+            used = sorted({self.flow_step[id(f)] for f in ver.sent_by if id(f) in self.flow_step}
+                          - self.cookie_unsent.get(id(ver), set()))
             issued = self.flow_step.get(id(ver.flow)) if ver.origin == "server" and ver.flow is not None else None
             if not used and issued is None:
                 continue
@@ -8805,7 +8923,7 @@ _CODEGEN_RESERVED = frozenset({
     "_normalise_charset", "final_resp", "final_results", "final_saved", "_STEP", "_step_start", "_step_ok",
     "_debug", "_mask_url", "_mask_text", "_cookie", "_cookie_keys", "_set_cookie", "_need", "_hop",
     "_host_cookie_hook", "_cookies_in_order", "urlsplit", "HttpNegotiateAuth", "HttpNtlmAuth",
-    "_cookie_attr_hook", "_ie_cookie_hook", "_Session", "functools", "warnings",
+    "_cookie_attr_hook", "_ie_cookie_hook", "_Session", "functools", "warnings", "_windows_certificates",
 })
 
 #: How the dependency table names the place a value is sent to.
@@ -9161,6 +9279,8 @@ class _Generator:
             self.helpers_needed.add("_Session")
         if getattr(self.plan, "same_name_cookie_hosts", None):  # two cookies of one name: keep the browser's order
             self.helpers_needed.add("_cookies_in_order")
+        if getattr(self.plan, "https_hosts", None):  # https:// sites (HAR files): Windows' certificates too, as in Edge
+            self.helpers_needed.add("_windows_certificates")
         self.final_step = self._resolve_final_step()
         if self.final_step is not None and self.opts.print_final and self.final_step.response_kind == "html":
             self.helpers_needed.add("_soup")
@@ -9480,6 +9600,10 @@ class _Generator:
                 with self.w.indent():
                     self.w.line('reason = "{}: {}".format(type(exc).__name__, _mask_text(exc))[:300]')
                     self.w.line('print("[{}/{}] ERROR  {}  ({})".format(_STEP["no"], _STEP["total"], _STEP["label"], reason), file=sys.stderr, flush=True)')
+                if "_windows_certificates" in self.helpers_needed:
+                    self.w.line('if "CERTIFICATE_VERIFY_FAILED" in str(exc):')
+                    with self.w.indent():
+                        self.w.line(f"print({_lit(CERTIFICATE_HINT)}, file=sys.stderr, flush=True)")
                 self.w.line("import traceback")
                 self.w.line('for line in "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).splitlines():')
                 with self.w.indent():
@@ -9793,6 +9917,8 @@ class _Generator:
 
         self._emit_progress_helpers()
         self._emit_cookie_helpers()
+        if "_windows_certificates" in self.helpers_needed:
+            self._emit_certificate_helper()
 
         if "_regex" in self.helpers_needed:
             w.blank(2)
@@ -9898,6 +10024,52 @@ class _Generator:
         self._c("どこまで進んだかの表示（標準エラー出力に出すので、結果の表示とは混ざらない）")
         for ln in _PROGRESS_HELPERS_SRC.strip("\n").split("\n"):
             w.line(ln)
+
+    def _emit_certificate_helper(self) -> None:
+        """``_windows_certificates(session)``: https:// certificates are checked with requests' own list
+        (certifi) and the Windows certificate store (an organisation's CA that Edge trusts).  Standard
+        library only: ``SSLContext.load_default_certs`` reads the Windows stores; elsewhere it reads the
+        system's.  Any failure, or a transport adapter someone else mounted (a test's), leaves the session
+        as it was."""
+        w = self.w
+        w.blank(2)
+        w.line("def _windows_certificates(session):")
+        with w.indent():
+            w.line('"""https のサイトの証明書を、requests の証明書リストに加えて、Windows に入っている証明書')
+            w.line("（信頼されたルート証明機関など。Edge が使うもの）でも確かめる。使えないときは requests の標準のまま。")
+            w.line('"""')
+            w.line("try:")
+            with w.indent():
+                w.line("import warnings")
+                w.line("from requests.adapters import HTTPAdapter")
+                w.line("from requests.certs import where")
+                w.line("from urllib3.util.ssl_ import create_urllib3_context")
+                w.line("if type(session.get_adapter(\"https://\")) is not HTTPAdapter:")
+                with w.indent():
+                    self._cl("return", "ほかの通信の部品が入れてあるときは、そのまま使う")
+                w.line("context = create_urllib3_context()")
+                w.line("with warnings.catch_warnings():")
+                with w.indent():
+                    self._cl('warnings.simplefilter("ignore")', "読めない証明書が Windows にあっても警告は出さない")
+                    self._cl("context.load_default_certs()", "Windows では Windows の証明書ストアを読む")
+                self._cl("context.load_verify_locations(where())", "requests の証明書リスト")
+            w.line("except Exception:")
+            with w.indent():
+                w.line("return")
+            w.blank()
+            w.line("class _Adapter(HTTPAdapter):")
+            with w.indent():
+                w.line("def init_poolmanager(self, *args, **kwargs):")
+                with w.indent():
+                    w.line('kwargs["ssl_context"] = context')
+                    w.line("return super().init_poolmanager(*args, **kwargs)")
+                w.blank()
+                w.line("def proxy_manager_for(self, proxy, **kwargs):")
+                with w.indent():
+                    w.line('kwargs.setdefault("ssl_context", context)')
+                    w.line("return super().proxy_manager_for(proxy, **kwargs)")
+            w.blank()
+            w.line('session.mount("https://", _Adapter())')
 
     def _emit_cookie_helpers(self) -> None:
         """``_cookie`` / ``_set_cookie`` / ``_need`` / ``_hop`` / ``_host_cookie_hook`` when the plan uses them."""
@@ -10376,6 +10548,9 @@ class _Generator:
                 w.line("session = _Session()")
             else:
                 w.line("session = requests.Session()")
+            if "_windows_certificates" in self.helpers_needed:
+                self._c("https のサイトの証明書を、Windows に入っている証明書でも確かめる（Edge と同じく、組織の認証局の証明書も信頼する）")
+                w.line("_windows_certificates(session)")
             if "_cookie_attr_hook" in self.helpers_needed:
                 self._c("ブラウザが無視する Cookie の属性（空の Domain、数字でない Max-Age など）を外して受け取る")
                 w.line('session.hooks["response"].append(_cookie_attr_hook)')
@@ -15854,8 +16029,8 @@ def easy_build() -> Response:
         plan = _rebuild_plan(state, plan_opts)
         if not plan.steps:
             raise ApiError(
-                "スクリプトにできる通信が記録にありませんでした。http:// のサイトの画面を開いた操作が"
-                "記録（HAR ファイル）に入っているかを確認してください。",
+                "スクリプトにできる通信が記録にありませんでした。サイトの画面を開いた操作が記録（HAR ファイル）に"
+                "入っているかを確認してください（HAR ファイルは、F12 の「Preserve log」にチェックを入れて操作してから保存します）。",
                 status=400,
             )
         try:
@@ -16705,6 +16880,10 @@ body.easy-mode .content { max-width: 960px; }
 .easy-ready li.bad { color: #7a1e14; }
 #easy-emulation + .hint { margin-top: .25rem; }
 .easy-har-hint { text-align: center; margin-top: 0; }
+.easy-har-help { margin-top: .75rem; text-align: left; }
+.easy-har-help summary { cursor: pointer; text-align: center; }
+.easy-har-help ol { margin: .4rem 0 .4rem 1.4rem; padding: 0; }
+.easy-har-help p { margin: .4rem 0; }
 
 /* ------------------------------------------------------------------ 詳細設定 (スクリプトの詳細と変更) */
 .detail-settings h3:first-child { margin-top: 0; }
@@ -16759,10 +16938,10 @@ textarea.code-editor[readonly] { opacity: .7; }
     {% else %}
     <div class="easy-hero">
       <h1 id="h-easy">HAR ファイルから、自動取得スクリプトを作ります</h1>
-      <p class="lead">サイトを操作したときの通信を IE の F12 開発者ツールで HAR ファイルに保存して、ここで選ぶだけです。</p>
+      <p class="lead">サイトを操作したときの通信をブラウザの F12 開発者ツールで HAR ファイルに保存して、ここで選ぶだけです。https:// のサイトにも使えます。</p>
       <ol class="easy-flow">
-        <li><span class="easy-flow-num">1</span><div><strong>F12 開発者ツールを開く</strong><br><span class="hint">Edge の IE モードでサイトを開き、IEChooser.exe でそのタブを選んで「ネットワーク」の記録を始めます</span></div></li>
-        <li><span class="easy-flow-num">2</span><div><strong>いつもどおりサイトを操作する</strong><br><span class="hint">ログイン → 欲しいデータの画面まで。終わったら「HAR としてエクスポート」で保存します</span></div></li>
+        <li><span class="easy-flow-num">1</span><div><strong>F12 開発者ツールを開く</strong><br><span class="hint">ふだんの Edge は F12 を押して「Network」を開き、「Preserve log」にチェックを入れます。IE モードのサイトは IEChooser.exe でそのタブを選んで「ネットワーク」の記録を始めます</span></div></li>
+        <li><span class="easy-flow-num">2</span><div><strong>いつもどおりサイトを操作する</strong><br><span class="hint">ログイン → 欲しいデータの画面まで。終わったら HAR ファイルに保存します (ふだんの Edge は機密データを含む形で。下の「HAR ファイルの保存のしかた」)</span></div></li>
         <li><span class="easy-flow-num">3</span><div><strong>HAR ファイルを選ぶ</strong> を押す<br><span class="hint">保存したファイルを選ぶと、スクリプトが自動でできあがります</span></div></li>
       </ol>
     </div>
@@ -16778,7 +16957,7 @@ textarea.code-editor[readonly] { opacity: .7; }
             <option value="ie"{% if not can_record_ie %} disabled{% endif %}>IE モード (記録用ブラウザ)</option>
             <option value="edge"{% if not can_record_edge %} disabled{% endif %}>Edge</option>
           </select>
-          <div class="hint">Edge の IE モードで開くサイトは「IE モード」、ふだんの Edge で開くサイトは「Edge」を選びます。「Edge」では記録専用の Edge の窓が開きます (ふだんの Edge の設定やログイン状態には触れません)。どちらも http:// のサイトだけを記録します。選んだブラウザは次回も使われます。</div></div>
+          <div class="hint">Edge の IE モードで開くサイトは「IE モード」、ふだんの Edge で開くサイトは「Edge」を選びます。「Edge」では記録専用の Edge の窓が開きます (ふだんの Edge の設定やログイン状態には触れません)。どちらも http:// のサイトだけを記録します (https:// のサイトは、下の「HAR ファイルから作る」を使います)。選んだブラウザは次回も使われます。</div></div>
         <label for="easy-emulation" data-ie-only>表示モード</label>
         <div data-ie-only><select id="easy-emulation" class="w-m">
             <option value="default">既定 (IE7 互換表示)</option>
@@ -16806,10 +16985,23 @@ textarea.code-editor[readonly] { opacity: .7; }
       </div>
       {% if can_record %}
       <div class="easy-loaded" id="easy-har">
-        <span class="hint">IE の F12 開発者ツールで保存した HAR ファイルからも作れます:</span>
+        <span class="hint">F12 開発者ツールで保存した HAR ファイルからも作れます (https:// のサイトはこちら):</span>
         <button type="button" id="easy-har-pick" class="btn">HAR ファイルから作る…</button>
       </div>
       {% endif %}
+      <details class="hint easy-har-help" id="easy-har-help">
+        <summary>HAR ファイルの保存のしかた (https:// のサイトも、この方法で作れます)</summary>
+        <p><strong>ふだんの Edge</strong> (F12 の表示は英語のことがあります。名前は Edge の版で少し違うことがあります)</p>
+        <ol>
+          <li>InPrivate ウィンドウ (Ctrl+Shift+N) でサイトを開きます (ログインしていない状態から始めるため)。</li>
+          <li>F12 を押し、「Network」(ネットワーク) で「Preserve log」(ログを保持) にチェックを入れます。入れないと、画面が変わるたびに記録が消えます。</li>
+          <li>最初の 1 回だけ: F12 の設定 (歯車) の「Preferences」→「Network」で「Allow to generate HAR with sensitive data」をオンにします。オフのままだと Cookie が消えた HAR になり、スクリプトが動きません。</li>
+          <li>ログイン画面から、いつもどおり操作します。</li>
+          <li>「Network」の書き出しボタン (下向きの矢印) で「Export HAR (with sensitive data)」を選んで保存します。</li>
+        </ol>
+        <p>別ウィンドウ (ポップアップ) で開く画面があるときは、手順 3 の設定の「Preferences」→「Global」で「Auto-open DevTools for popups」もオンにします。ポップアップが開いたら、その窓で F5 を押して読み直してから操作を続け、両方の窓の HAR を保存して、まとめて選びます。</p>
+        <p><strong>Edge の IE モード</strong>: <code>C:\Windows\System32\F12\IEChooser.exe</code> でそのタブを選び、「ネットワーク」で ▶ を押して記録を始めて操作し、「HAR としてエクスポート」で保存します。</p>
+      </details>
       <input id="easy-har-input" type="file" multiple accept=".har,.json" hidden>
     </div>
   </div>
@@ -16826,8 +17018,8 @@ textarea.code-editor[readonly] { opacity: .7; }
         <button type="button" id="easy-stop" class="btn danger xl">■ 記録をおわる</button>
         <button type="button" id="easy-cancel" class="btn ghost">やめる (記録を破棄)</button>
       </div>
-      <p class="hint" data-for-browser="ie">件数が増えないときは、記録用のブラウザ (タイトルに「記録中」と付いた窓) でサイトを開いているか確認してください。https:// のページは記録されません。</p>
-      <p class="hint" data-for-browser="edge" hidden>件数が増えないときは、記録用に開いた Edge の窓 (ふだんの Edge とは別の窓) でサイトを開いているか確認してください。https:// のページは記録されません。Edge で開いても IE モードに切り替わるサイトは記録されないので、「IE モード」で記録してください。</p>
+      <p class="hint" data-for-browser="ie">件数が増えないときは、記録用のブラウザ (タイトルに「記録中」と付いた窓) でサイトを開いているか確認してください。https:// のページは記録されません (https:// のサイトは HAR ファイルから作れます)。</p>
+      <p class="hint" data-for-browser="edge" hidden>件数が増えないときは、記録用に開いた Edge の窓 (ふだんの Edge とは別の窓) でサイトを開いているか確認してください。https:// のページは記録されません (https:// のサイトは HAR ファイルから作れます)。Edge で開いても IE モードに切り替わるサイトは記録されないので、「IE モード」で記録してください。</p>
     </div>
   </div>
 
@@ -17574,7 +17766,8 @@ textarea.code-editor[readonly] { opacity: .7; }
     const ERROR_HINTS = [
       [/getaddrinfo failed|Name or service not known|NameResolutionError|nodename nor servname/i, 'サイトに接続できません (アドレスが見つかりません)。LAN環境内のネットワークに接続しているか、VPN が必要なサイトではないか確認してください。'],
       [/ConnectTimeout|Read timed out|timed out/i, 'サイトの応答がありません (タイムアウト)。しばらくしてからもう一度実行してください。'],
-      [/CERTIFICATE_VERIFY_FAILED|SSLError|SSLCertVerificationError/i, 'https:// のサイトの証明書を確認できませんでした。このツールが対象とするのは http:// のサイトです。'],
+      [/CERTIFICATE_VERIFY_FAILED|SSLCertVerificationError/i, 'https:// のサイトの証明書を確認できませんでした (Windows にも入っていない、自己署名などの証明書です)。サイトの管理者から証明書のファイル (Base64 形式の .cer / .pem) をもらい、コマンドプロンプトで「set REQUESTS_CA_BUNDLE=そのファイルの場所」を入力してから、同じコマンドプロンプトで python reqrec.py を起動し直してください。'],
+      [/SSLError/i, 'https:// のサイトと暗号化した接続を始められませんでした。サイトが古い方式 (TLS 1.0 / 1.1 など) にしか対応していない可能性があります。サイトの管理者に確認してください。'],
       [/ConnectionRefused|Connection refused|WinError 10061/i, 'サイトに接続できません (接続が拒否されました)。サイトが動いているか確認してください。'],
       [/\b(401|403) Client Error|Unauthorized for url|Forbidden for url|: HTTP (401|403) /, 'ログインに失敗したか、権限がありません。パスワードなどの入力値を確認してください。'],
       [/REQREC_[A-Z_]+ (が|is) /, '実行に必要な入力 (パスワードなど) が足りません。上の入力欄をすべて埋めてください。'],
